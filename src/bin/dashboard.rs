@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use std::env;
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,10 +17,13 @@ struct Dashboard {
 #[derive(Debug, Default)]
 struct Snapshot {
     market_event_count: i64,
+    market_events_last_hour: i64,
     order_count: i64,
+    db_size_bytes: u64,
     latest_market_event: Option<MarketEventRow>,
     heartbeat: Option<HeartbeatRow>,
     portfolio: Option<PortfolioRow>,
+    recent_prices: Vec<MarketEventRow>,
     latest_orders: Vec<OrderRow>,
 }
 
@@ -132,10 +136,13 @@ impl Dashboard {
 
         Ok(Snapshot {
             market_event_count: count_rows(&connection, "market_events")?,
+            market_events_last_hour: recent_market_event_count(&connection, now_ms()?)?,
             order_count: count_rows(&connection, "orders")?,
+            db_size_bytes: sqlite_file_size(&self.db_path),
             latest_market_event: latest_market_event(&connection)?,
             heartbeat: heartbeat(&connection)?,
             portfolio: portfolio(&connection)?,
+            recent_prices: recent_prices(&connection)?,
             latest_orders: latest_orders(&connection)?,
         })
     }
@@ -166,6 +173,36 @@ fn latest_market_event(connection: &Connection) -> rusqlite::Result<Option<Marke
             },
         )
         .optional()
+}
+
+fn recent_market_event_count(connection: &Connection, now_ms: i64) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "SELECT COUNT(*) FROM market_events WHERE recorded_at_ms >= ?1",
+        [now_ms - 3_600_000],
+        |row| row.get(0),
+    )
+}
+
+fn recent_prices(connection: &Connection) -> rusqlite::Result<Vec<MarketEventRow>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT recorded_at_ms, symbol, price_micro_units
+        FROM market_events
+        ORDER BY id DESC
+        LIMIT 100
+        ",
+    )?;
+    let mut rows = statement
+        .query_map([], |row| {
+            Ok(MarketEventRow {
+                recorded_at_ms: row.get(0)?,
+                symbol: row.get(1)?,
+                price_micro_units: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.reverse();
+    Ok(rows)
 }
 
 fn heartbeat(connection: &Connection) -> rusqlite::Result<Option<HeartbeatRow>> {
@@ -270,15 +307,31 @@ h2 {{ margin: 28px 0 12px; font-size: 18px; }}
 .muted {{ color: #9aa0a6; font-size: 13px; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 20px; }}
 .tile {{ border: 1px solid #30363d; border-radius: 8px; padding: 14px; background: #161b22; }}
+.tile.ok {{ border-color: #2f8f46; }}
+.tile.warn {{ border-color: #b88722; }}
+.tile.bad {{ border-color: #b94b4b; }}
 .label {{ color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
 .value {{ margin-top: 6px; font-size: 22px; font-weight: 650; overflow-wrap: anywhere; }}
+.subgrid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }}
+.spark {{ width: 100%; height: 150px; display: block; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }}
 table {{ width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }}
 th, td {{ border-bottom: 1px solid #30363d; padding: 10px; text-align: left; font-size: 14px; vertical-align: top; }}
 th {{ color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
 tr:last-child td {{ border-bottom: 0; }}
 .status {{ display: inline-block; padding: 3px 7px; border-radius: 999px; background: #243b2a; color: #9ee493; font-size: 12px; }}
-@media (max-width: 720px) {{ main {{ padding: 16px; }} table {{ display: block; overflow-x: auto; }} }}
+@media (max-width: 720px) {{ main {{ padding: 16px; }} table {{ display: block; overflow-x: auto; }} .subgrid {{ grid-template-columns: 1fr; }} }}
 </style>
+<script>
+function formatTimes() {{
+  document.querySelectorAll("[data-ms]").forEach((node) => {{
+    const ms = Number(node.dataset.ms);
+    if (Number.isFinite(ms) && ms > 0) {{
+      node.textContent = new Date(ms).toLocaleString();
+    }}
+  }});
+}}
+window.addEventListener("DOMContentLoaded", formatTimes);
+</script>
 </head>
 <body>
 <main>
@@ -289,6 +342,7 @@ tr:last-child td {{ border-bottom: 0; }}
     );
 
     render_summary(&mut html, snapshot);
+    render_price_chart(&mut html, &snapshot.recent_prices);
     render_orders(&mut html, &snapshot.latest_orders);
 
     html.push_str("</main></body></html>");
@@ -296,6 +350,10 @@ tr:last-child td {{ border-bottom: 0; }}
 }
 
 fn render_summary(html: &mut String, snapshot: &Snapshot) {
+    let latest_price_micro_units = snapshot
+        .latest_market_event
+        .as_ref()
+        .map(|event| event.price_micro_units);
     let latest_price = snapshot
         .latest_market_event
         .as_ref()
@@ -307,26 +365,38 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
             )
         })
         .unwrap_or_else(|| "n/a".to_string());
-    let latest_price_time = snapshot
+    let latest_price_time_ms = snapshot
         .latest_market_event
         .as_ref()
-        .map(|event| format_time(event.recorded_at_ms))
-        .unwrap_or_else(|| "n/a".to_string());
-    let heartbeat = snapshot
+        .map(|event| event.recorded_at_ms);
+    let heartbeat_time_ms = snapshot
         .heartbeat
         .as_ref()
-        .map(|heartbeat| format_time(heartbeat.updated_at_ms))
-        .unwrap_or_else(|| "n/a".to_string());
-    let heartbeat_age = snapshot
+        .map(|heartbeat| heartbeat.updated_at_ms);
+    let heartbeat_age_seconds = snapshot
         .heartbeat
         .as_ref()
-        .map(|heartbeat| format!("{}s ago", age_seconds(heartbeat.updated_at_ms)))
+        .map(|heartbeat| age_seconds(heartbeat.updated_at_ms));
+    let heartbeat_age = heartbeat_age_seconds
+        .map(|age| format!("{age}s ago"))
         .unwrap_or_else(|| "n/a".to_string());
+    let heartbeat_class = match heartbeat_age_seconds {
+        Some(age) if age <= 20 => "ok",
+        Some(age) if age <= 60 => "warn",
+        Some(_) => "bad",
+        None => "bad",
+    };
     let run_id = snapshot
         .heartbeat
         .as_ref()
         .map(|heartbeat| heartbeat.run_id.as_str())
         .unwrap_or("n/a");
+    let run_uptime = snapshot
+        .heartbeat
+        .as_ref()
+        .and_then(|heartbeat| run_start_ms(&heartbeat.run_id))
+        .map(|started_at_ms| format_duration(age_seconds(started_at_ms)))
+        .unwrap_or_else(|| "n/a".to_string());
     let portfolio = snapshot
         .portfolio
         .as_ref()
@@ -340,31 +410,107 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
             )
         })
         .unwrap_or_else(|| "n/a".to_string());
-    let portfolio_time = snapshot
+    let portfolio_time_ms = snapshot
         .portfolio
         .as_ref()
-        .map(|portfolio| format_time(portfolio.updated_at_ms))
+        .map(|portfolio| portfolio.updated_at_ms);
+    let marked_value = snapshot
+        .portfolio
+        .as_ref()
+        .zip(latest_price_micro_units)
+        .map(|(portfolio, price)| {
+            format_micro_units(
+                portfolio.quote_balance_micro_units
+                    + scaled_product(portfolio.base_balance_micro_units, price),
+            )
+        })
         .unwrap_or_else(|| "n/a".to_string());
 
     let _ = write!(
         html,
         r#"<section class="grid">
 <div class="tile"><div class="label">Market Events</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Events Last Hour</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Orders</div><div class="value">{}</div></div>
-<div class="tile"><div class="label">Latest Price</div><div class="value">{}</div><div class="muted">{}</div></div>
-<div class="tile"><div class="label">Heartbeat</div><div class="value">{}</div><div class="muted">{}</div></div>
-<div class="tile"><div class="label">Run ID</div><div class="value">{}</div></div>
-<div class="tile"><div class="label">Portfolio</div><div class="value">{}</div><div class="muted">{}</div></div>
+<div class="tile"><div class="label">DB Size</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Latest Price</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
+<div class="tile {}"><div class="label">Heartbeat</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
+<div class="tile"><div class="label">Run Uptime</div><div class="value">{}</div><div class="muted">{}</div></div>
+<div class="tile"><div class="label">Portfolio</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
+<div class="tile"><div class="label">Marked Value</div><div class="value">{}</div></div>
 </section>"#,
         snapshot.market_event_count,
+        snapshot.market_events_last_hour,
         snapshot.order_count,
+        escape_html(&format_bytes(snapshot.db_size_bytes)),
         escape_html(&latest_price),
-        escape_html(&latest_price_time),
-        escape_html(&heartbeat),
+        latest_price_time_ms.unwrap_or_default(),
+        escape_html(&time_fallback(latest_price_time_ms)),
+        heartbeat_class,
         escape_html(&heartbeat_age),
+        heartbeat_time_ms.unwrap_or_default(),
+        escape_html(&time_fallback(heartbeat_time_ms)),
+        escape_html(&run_uptime),
         escape_html(run_id),
         escape_html(&portfolio),
-        escape_html(&portfolio_time),
+        portfolio_time_ms.unwrap_or_default(),
+        escape_html(&time_fallback(portfolio_time_ms)),
+        escape_html(&marked_value),
+    );
+}
+
+fn render_price_chart(html: &mut String, prices: &[MarketEventRow]) {
+    html.push_str(r#"<h2>Recent Price</h2>"#);
+
+    if prices.len() < 2 {
+        html.push_str(r#"<div class="tile muted">Not enough price history yet.</div>"#);
+        return;
+    }
+
+    let min_price = prices
+        .iter()
+        .map(|price| price.price_micro_units)
+        .min()
+        .unwrap_or(0);
+    let max_price = prices
+        .iter()
+        .map(|price| price.price_micro_units)
+        .max()
+        .unwrap_or(0);
+    let range = (max_price - min_price).max(1);
+    let last_price = prices
+        .last()
+        .map(|price| format_micro_units(price.price_micro_units))
+        .unwrap_or_else(|| "n/a".to_string());
+
+    let mut points = String::new();
+    for (index, price) in prices.iter().enumerate() {
+        let x = if prices.len() == 1 {
+            0.0
+        } else {
+            index as f64 / (prices.len() - 1) as f64 * 100.0
+        };
+        let normalized = (price.price_micro_units - min_price) as f64 / range as f64;
+        let y = 90.0 - (normalized * 80.0);
+        let _ = write!(points, "{x:.2},{y:.2} ");
+    }
+
+    let _ = write!(
+        html,
+        r##"<svg class="spark" viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Recent price sparkline">
+<polyline points="{}" fill="none" stroke="#58a6ff" stroke-width="2" vector-effect="non-scaling-stroke"></polyline>
+</svg>
+<div class="subgrid">
+<div class="tile"><div class="label">Chart Samples</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Last Chart Price</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Chart Low</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Chart High</div><div class="value">{}</div></div>
+</div>"##,
+        escape_html(points.trim()),
+        prices.len(),
+        escape_html(&last_price),
+        escape_html(&format_micro_units(min_price)),
+        escape_html(&format_micro_units(max_price))
     );
 }
 
@@ -407,7 +553,11 @@ fn render_orders(html: &mut String, orders: &[OrderRow]) {
 <td>{}</td>
 <td>{}</td>
 </tr>"#,
-                escape_html(&format_time(order.recorded_at_ms)),
+                format!(
+                    r#"<span data-ms="{}">{}</span>"#,
+                    order.recorded_at_ms,
+                    escape_html(&time_fallback(Some(order.recorded_at_ms)))
+                ),
                 order.bot_order_id,
                 escape_html(&order.status),
                 escape_html(&order.symbol),
@@ -442,10 +592,71 @@ fn format_micro_units(value: i64) -> String {
     }
 }
 
-fn format_time(ms: i64) -> String {
-    let seconds = ms / 1000;
-    let remainder_ms = ms.rem_euclid(1000);
-    format!("{seconds}.{remainder_ms:03}")
+fn time_fallback(ms: Option<i64>) -> String {
+    ms.map(|value| format!("{}s", value / 1000))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
+fn format_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn run_start_ms(run_id: &str) -> Option<i64> {
+    run_id.strip_prefix("run-")?.split('-').next()?.parse().ok()
+}
+
+fn scaled_product(lhs_micro_units: i64, rhs_micro_units: i64) -> i64 {
+    ((lhs_micro_units as i128 * rhs_micro_units as i128) / 1_000_000_i128) as i64
+}
+
+fn sqlite_file_size(db_path: &str) -> u64 {
+    [
+        db_path.to_string(),
+        format!("{db_path}-wal"),
+        format!("{db_path}-shm"),
+    ]
+    .into_iter()
+    .filter_map(|path| fs::metadata(path).ok())
+    .map(|metadata| metadata.len())
+    .sum()
+}
+
+fn now_ms() -> rusqlite::Result<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 fn age_seconds(ms: i64) -> i64 {
