@@ -73,6 +73,7 @@ struct StrategyResearchRunRow {
     symbol: String,
     runnable_count: i64,
     skipped_under_warmed_count: i64,
+    train_split_bps: i64,
 }
 
 #[derive(Debug)]
@@ -80,19 +81,29 @@ struct StrategyResearchResultRow {
     rank: i64,
     interval_seconds: i64,
     candle_count: i64,
+    train_candle_count: i64,
+    test_candle_count: i64,
     fast_window: i64,
     slow_window: i64,
     quantity_base_micro_units: i64,
-    pnl_micro_units: i64,
-    return_pct: f64,
-    buy_and_hold_delta_micro_units: i64,
-    max_drawdown_pct: f64,
-    filled_order_count: i64,
-    rejected_order_count: i64,
-    buy_count: i64,
-    sell_count: i64,
-    exposure_pct: f64,
-    final_base_micro_units: i64,
+    train_pnl_micro_units: i64,
+    train_return_pct: f64,
+    train_buy_and_hold_delta_micro_units: i64,
+    train_max_drawdown_pct: f64,
+    train_filled_order_count: i64,
+    train_rejected_order_count: i64,
+    train_buy_count: i64,
+    train_sell_count: i64,
+    train_exposure_pct: f64,
+    test_pnl_micro_units: i64,
+    test_return_pct: f64,
+    test_buy_and_hold_delta_micro_units: i64,
+    test_max_drawdown_pct: f64,
+    test_filled_order_count: i64,
+    test_rejected_order_count: i64,
+    test_buy_count: i64,
+    test_sell_count: i64,
+    test_exposure_pct: f64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -327,19 +338,29 @@ fn latest_strategy_research_run(
         return Ok(None);
     }
 
+    let split_projection =
+        if column_exists(connection, "strategy_research_runs", "train_split_bps")? {
+            "train_split_bps"
+        } else {
+            "7000"
+        };
+
     connection
         .query_row(
-            "
+            &format!(
+                "
             SELECT
                 recorded_at_ms,
                 kind,
                 symbol,
                 runnable_count,
-                skipped_under_warmed_count
+                skipped_under_warmed_count,
+                {split_projection}
             FROM strategy_research_runs
             ORDER BY id DESC
             LIMIT 1
-            ",
+            "
+            ),
             [],
             |row| {
                 Ok(StrategyResearchRunRow {
@@ -348,6 +369,7 @@ fn latest_strategy_research_run(
                     symbol: row.get(2)?,
                     runnable_count: row.get(3)?,
                     skipped_under_warmed_count: row.get(4)?,
+                    train_split_bps: row.get(5)?,
                 })
             },
         )
@@ -359,6 +381,11 @@ fn latest_strategy_research_results(
 ) -> rusqlite::Result<Vec<StrategyResearchResultRow>> {
     if !table_exists(connection, "strategy_research_runs")?
         || !table_exists(connection, "strategy_research_results")?
+        || !column_exists(
+            connection,
+            "strategy_research_results",
+            "test_pnl_micro_units",
+        )?
     {
         return Ok(Vec::new());
     }
@@ -380,19 +407,29 @@ fn latest_strategy_research_results(
             rank,
             interval_seconds,
             candle_count,
+            train_candle_count,
+            test_candle_count,
             fast_window,
             slow_window,
             quantity_base_micro_units,
-            pnl_micro_units,
-            return_pct,
-            buy_and_hold_delta_micro_units,
-            max_drawdown_pct,
-            filled_order_count,
-            rejected_order_count,
-            buy_count,
-            sell_count,
-            exposure_pct,
-            final_base_micro_units
+            train_pnl_micro_units,
+            train_return_pct,
+            train_buy_and_hold_delta_micro_units,
+            train_max_drawdown_pct,
+            train_filled_order_count,
+            train_rejected_order_count,
+            train_buy_count,
+            train_sell_count,
+            train_exposure_pct,
+            test_pnl_micro_units,
+            test_return_pct,
+            test_buy_and_hold_delta_micro_units,
+            test_max_drawdown_pct,
+            test_filled_order_count,
+            test_rejected_order_count,
+            test_buy_count,
+            test_sell_count,
+            test_exposure_pct
         FROM strategy_research_results
         WHERE run_id = ?1
         ORDER BY rank ASC
@@ -406,19 +443,29 @@ fn latest_strategy_research_results(
                 rank: row.get(0)?,
                 interval_seconds: row.get(1)?,
                 candle_count: row.get(2)?,
-                fast_window: row.get(3)?,
-                slow_window: row.get(4)?,
-                quantity_base_micro_units: row.get(5)?,
-                pnl_micro_units: row.get(6)?,
-                return_pct: row.get(7)?,
-                buy_and_hold_delta_micro_units: row.get(8)?,
-                max_drawdown_pct: row.get(9)?,
-                filled_order_count: row.get(10)?,
-                rejected_order_count: row.get(11)?,
-                buy_count: row.get(12)?,
-                sell_count: row.get(13)?,
-                exposure_pct: row.get(14)?,
-                final_base_micro_units: row.get(15)?,
+                train_candle_count: row.get(3)?,
+                test_candle_count: row.get(4)?,
+                fast_window: row.get(5)?,
+                slow_window: row.get(6)?,
+                quantity_base_micro_units: row.get(7)?,
+                train_pnl_micro_units: row.get(8)?,
+                train_return_pct: row.get(9)?,
+                train_buy_and_hold_delta_micro_units: row.get(10)?,
+                train_max_drawdown_pct: row.get(11)?,
+                train_filled_order_count: row.get(12)?,
+                train_rejected_order_count: row.get(13)?,
+                train_buy_count: row.get(14)?,
+                train_sell_count: row.get(15)?,
+                train_exposure_pct: row.get(16)?,
+                test_pnl_micro_units: row.get(17)?,
+                test_return_pct: row.get(18)?,
+                test_buy_and_hold_delta_micro_units: row.get(19)?,
+                test_max_drawdown_pct: row.get(20)?,
+                test_filled_order_count: row.get(21)?,
+                test_rejected_order_count: row.get(22)?,
+                test_buy_count: row.get(23)?,
+                test_sell_count: row.get(24)?,
+                test_exposure_pct: row.get(25)?,
             })
         })?
         .collect()
@@ -436,6 +483,20 @@ fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> 
         [table],
         |row| row.get(0),
     )
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn render_html(db_path: &str, snapshot: &Snapshot) -> String {
@@ -751,6 +812,7 @@ fn render_strategy_research(
 <div class="tile"><div class="label">Latest Sweep</div><div class="value" data-ms="{}">{}</div><div class="muted">{} {}</div></div>
 <div class="tile"><div class="label">Runnable</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Skipped Warmup</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Train/Test</div><div class="value">{}% / {}%</div></div>
 </section>"#,
         run.recorded_at_ms,
         escape_html(&time_fallback(Some(run.recorded_at_ms))),
@@ -758,6 +820,8 @@ fn render_strategy_research(
         escape_html(&run.kind),
         run.runnable_count,
         run.skipped_under_warmed_count,
+        run.train_split_bps / 100,
+        100 - (run.train_split_bps / 100),
     );
 
     html.push_str(
@@ -769,14 +833,17 @@ fn render_strategy_research(
 <th>Candles</th>
 <th>MA</th>
 <th>Qty</th>
-<th>P/L</th>
-<th>Ret</th>
-<th>Vs Hold</th>
-<th>DD</th>
-<th>Fills</th>
-<th>B/S</th>
+<th>Train P/L</th>
+<th>Test P/L</th>
+<th>Train Ret</th>
+<th>Test Ret</th>
+<th>Train Vs Hold</th>
+<th>Test Vs Hold</th>
+<th>Train DD</th>
+<th>Test DD</th>
+<th>Train Fills</th>
+<th>Test Fills</th>
 <th>Exposure</th>
-<th>Final Base</th>
 </tr>
 </thead>
 <tbody>"#,
@@ -784,7 +851,7 @@ fn render_strategy_research(
 
     if results.is_empty() {
         html.push_str(
-            r#"<tr><td colspan="13" class="muted">No runnable sweep rows yet.</td></tr>"#,
+            r#"<tr><td colspan="15" class="muted">No runnable train/test sweep rows yet.</td></tr>"#,
         );
     } else {
         for result in results {
@@ -793,34 +860,51 @@ fn render_strategy_research(
                 r#"<tr>
 <td>{}</td>
 <td>{}s</td>
-<td>{}</td>
+<td>{} <span class="muted">{} / {}</span></td>
 <td>{}/{}</td>
 <td>{}</td>
 <td>{}</td>
-<td>{:.2}%</td>
 <td>{}</td>
 <td>{:.2}%</td>
-<td>{} <span class="muted">rej {}</span></td>
-<td>{}/{}</td>
 <td>{:.2}%</td>
 <td>{}</td>
+<td>{}</td>
+<td>{:.2}%</td>
+<td>{:.2}%</td>
+<td>{} <span class="muted">rej {}</span> <span class="muted">{} / {}</span></td>
+<td>{} <span class="muted">rej {}</span> <span class="muted">{} / {}</span></td>
+<td>{:.2}% / {:.2}%</td>
 </tr>"#,
                 result.rank,
                 result.interval_seconds,
                 result.candle_count,
+                result.train_candle_count,
+                result.test_candle_count,
                 result.fast_window,
                 result.slow_window,
                 escape_html(&format_micro_units(result.quantity_base_micro_units)),
-                escape_html(&format_micro_units(result.pnl_micro_units)),
-                result.return_pct,
-                escape_html(&format_micro_units(result.buy_and_hold_delta_micro_units)),
-                result.max_drawdown_pct,
-                result.filled_order_count,
-                result.rejected_order_count,
-                result.buy_count,
-                result.sell_count,
-                result.exposure_pct,
-                escape_html(&format_micro_units(result.final_base_micro_units)),
+                escape_html(&format_micro_units(result.train_pnl_micro_units)),
+                escape_html(&format_micro_units(result.test_pnl_micro_units)),
+                result.train_return_pct,
+                result.test_return_pct,
+                escape_html(&format_micro_units(
+                    result.train_buy_and_hold_delta_micro_units
+                )),
+                escape_html(&format_micro_units(
+                    result.test_buy_and_hold_delta_micro_units
+                )),
+                result.train_max_drawdown_pct,
+                result.test_max_drawdown_pct,
+                result.train_filled_order_count,
+                result.train_rejected_order_count,
+                result.train_buy_count,
+                result.train_sell_count,
+                result.test_filled_order_count,
+                result.test_rejected_order_count,
+                result.test_buy_count,
+                result.test_sell_count,
+                result.train_exposure_pct,
+                result.test_exposure_pct,
             );
         }
     }

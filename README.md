@@ -54,7 +54,7 @@ Sweep moving-average crossover parameters against 1m/5m candles built from recor
 cargo run -- --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/trader/trader.sqlite
 ```
 
-The candle sweep saves its latest ranked results into SQLite. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
+The candle sweep uses a chronological 70/30 train/test split and saves its latest ranked results into SQLite. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
 
 Configure cost assumptions and optional CSV output:
 
@@ -109,7 +109,7 @@ The dashboard is a separate read-only binary. It does not control trading and on
 Build it on the Pi:
 
 ```sh
-cd /home/danutz/Development/trader
+cd /home/user/Development/trader
 cargo build --release --bin dashboard
 ```
 

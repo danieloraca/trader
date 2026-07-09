@@ -15,6 +15,7 @@ const CANDLE_INTERVAL_SECONDS: [i64; 2] = [60, 300];
 const FAST_WINDOWS: [usize; 4] = [3, 5, 8, 10];
 const SLOW_WINDOWS: [usize; 4] = [15, 30, 60, 120];
 const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
+const TRAIN_SPLIT_BPS: usize = 7_000;
 
 #[derive(Debug, Clone)]
 pub struct SweepReport {
@@ -53,19 +54,31 @@ pub struct CandleSweepReport {
 pub struct CandleSweepResult {
     pub interval_seconds: i64,
     pub candle_count: usize,
+    pub train_candle_count: usize,
+    pub test_candle_count: usize,
     pub fast_window: usize,
     pub slow_window: usize,
     pub quantity_base: Decimal,
-    pub net_profit_loss_quote: Decimal,
-    pub return_pct: f64,
-    pub buy_and_hold_delta_quote: Decimal,
-    pub max_drawdown_pct: f64,
-    pub filled_order_count: usize,
-    pub rejected_order_count: usize,
-    pub buy_count: usize,
-    pub sell_count: usize,
-    pub exposure_pct: f64,
-    pub final_base_balance: Decimal,
+    pub train_profit_loss_quote: Decimal,
+    pub train_return_pct: f64,
+    pub train_buy_and_hold_delta_quote: Decimal,
+    pub train_max_drawdown_pct: f64,
+    pub train_filled_order_count: usize,
+    pub train_rejected_order_count: usize,
+    pub train_buy_count: usize,
+    pub train_sell_count: usize,
+    pub train_exposure_pct: f64,
+    pub train_final_base_balance: Decimal,
+    pub test_profit_loss_quote: Decimal,
+    pub test_return_pct: f64,
+    pub test_buy_and_hold_delta_quote: Decimal,
+    pub test_max_drawdown_pct: f64,
+    pub test_filled_order_count: usize,
+    pub test_rejected_order_count: usize,
+    pub test_buy_count: usize,
+    pub test_sell_count: usize,
+    pub test_exposure_pct: f64,
+    pub test_final_base_balance: Decimal,
 }
 
 pub fn run(config: &Config, sqlite_path: &str) -> Result<SweepReport> {
@@ -123,6 +136,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
             .iter()
             .map(|candle| candle.close)
             .collect::<Vec<_>>();
+        let (train_closes, test_closes) = split_train_test(&candle_closes);
 
         for fast_window in FAST_WINDOWS {
             for slow_window in SLOW_WINDOWS {
@@ -130,7 +144,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                     continue;
                 }
 
-                if candles.len() < slow_window + 1 {
+                if train_closes.len() < slow_window + 1 || test_closes.len() < slow_window + 1 {
                     skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
                     continue;
                 }
@@ -144,14 +158,18 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                         Decimal::from_micro_units(quantity_micro_units);
                     candidate.backtest.trade_log_csv_path = None;
 
-                    let report = backtest::run_from_prices(&candidate, candle_closes.clone())?;
+                    let train_report = backtest::run_from_prices(&candidate, train_closes.clone())?;
+                    let test_report = backtest::run_from_prices(&candidate, test_closes.clone())?;
                     results.push(CandleSweepResult::from_report(
                         interval_seconds,
                         candles.len(),
+                        train_closes.len(),
+                        test_closes.len(),
                         fast_window,
                         slow_window,
                         Decimal::from_micro_units(quantity_micro_units),
-                        &report,
+                        &train_report,
+                        &test_report,
                     ));
                 }
             }
@@ -180,14 +198,33 @@ fn compare_sweep_results(lhs: &SweepResult, rhs: &SweepResult) -> Ordering {
 }
 
 fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult) -> Ordering {
-    let lhs_traded = lhs.filled_order_count > 0;
-    let rhs_traded = rhs.filled_order_count > 0;
+    let lhs_traded = lhs.train_filled_order_count > 0 && lhs.test_filled_order_count > 0;
+    let rhs_traded = rhs.train_filled_order_count > 0 && rhs.test_filled_order_count > 0;
 
     rhs_traded
         .cmp(&lhs_traded)
-        .then_with(|| rhs.net_profit_loss_quote.cmp(&lhs.net_profit_loss_quote))
-        .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
-        .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
+        .then_with(|| rhs.test_profit_loss_quote.cmp(&lhs.test_profit_loss_quote))
+        .then_with(|| {
+            rhs.train_profit_loss_quote
+                .cmp(&lhs.train_profit_loss_quote)
+        })
+        .then_with(|| {
+            lhs.test_max_drawdown_pct
+                .total_cmp(&rhs.test_max_drawdown_pct)
+        })
+        .then_with(|| {
+            rhs.test_filled_order_count
+                .cmp(&lhs.test_filled_order_count)
+        })
+}
+
+fn split_train_test(prices: &[Decimal]) -> (Vec<Decimal>, Vec<Decimal>) {
+    let split_index = (prices.len() * TRAIN_SPLIT_BPS) / 10_000;
+    let split_index = split_index.clamp(1, prices.len().saturating_sub(1));
+    (
+        prices[..split_index].to_vec(),
+        prices[split_index..].to_vec(),
+    )
 }
 
 fn save_candle_sweep_report(
@@ -214,7 +251,8 @@ fn save_candle_sweep_report(
                 kind TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 runnable_count INTEGER NOT NULL,
-                skipped_under_warmed_count INTEGER NOT NULL
+                skipped_under_warmed_count INTEGER NOT NULL,
+                train_split_bps INTEGER NOT NULL DEFAULT 7000
             );
 
             CREATE TABLE IF NOT EXISTS strategy_research_results (
@@ -223,6 +261,8 @@ fn save_candle_sweep_report(
                 rank INTEGER NOT NULL,
                 interval_seconds INTEGER NOT NULL,
                 candle_count INTEGER NOT NULL,
+                train_candle_count INTEGER NOT NULL DEFAULT 0,
+                test_candle_count INTEGER NOT NULL DEFAULT 0,
                 fast_window INTEGER NOT NULL,
                 slow_window INTEGER NOT NULL,
                 quantity_base_micro_units INTEGER NOT NULL,
@@ -235,7 +275,27 @@ fn save_candle_sweep_report(
                 buy_count INTEGER NOT NULL,
                 sell_count INTEGER NOT NULL,
                 exposure_pct REAL NOT NULL,
-                final_base_micro_units INTEGER NOT NULL
+                final_base_micro_units INTEGER NOT NULL,
+                train_pnl_micro_units INTEGER NOT NULL DEFAULT 0,
+                train_return_pct REAL NOT NULL DEFAULT 0,
+                train_buy_and_hold_delta_micro_units INTEGER NOT NULL DEFAULT 0,
+                train_max_drawdown_pct REAL NOT NULL DEFAULT 0,
+                train_filled_order_count INTEGER NOT NULL DEFAULT 0,
+                train_rejected_order_count INTEGER NOT NULL DEFAULT 0,
+                train_buy_count INTEGER NOT NULL DEFAULT 0,
+                train_sell_count INTEGER NOT NULL DEFAULT 0,
+                train_exposure_pct REAL NOT NULL DEFAULT 0,
+                train_final_base_micro_units INTEGER NOT NULL DEFAULT 0,
+                test_pnl_micro_units INTEGER NOT NULL DEFAULT 0,
+                test_return_pct REAL NOT NULL DEFAULT 0,
+                test_buy_and_hold_delta_micro_units INTEGER NOT NULL DEFAULT 0,
+                test_max_drawdown_pct REAL NOT NULL DEFAULT 0,
+                test_filled_order_count INTEGER NOT NULL DEFAULT 0,
+                test_rejected_order_count INTEGER NOT NULL DEFAULT 0,
+                test_buy_count INTEGER NOT NULL DEFAULT 0,
+                test_sell_count INTEGER NOT NULL DEFAULT 0,
+                test_exposure_pct REAL NOT NULL DEFAULT 0,
+                test_final_base_micro_units INTEGER NOT NULL DEFAULT 0
             );
             ",
         )
@@ -244,6 +304,7 @@ fn save_candle_sweep_report(
                 "failed to migrate strategy research tables: {error}"
             ))
         })?;
+    ensure_strategy_research_schema(&connection)?;
 
     let transaction = connection.transaction().map_err(|error| {
         BotError::Storage(format!(
@@ -258,9 +319,10 @@ fn save_candle_sweep_report(
                 kind,
                 symbol,
                 runnable_count,
-                skipped_under_warmed_count
+                skipped_under_warmed_count,
+                train_split_bps
             )
-            VALUES (?1, 'candle_ma_sweep', ?2, ?3, ?4)
+            VALUES (?1, 'candle_ma_sweep_train_test', ?2, ?3, ?4, ?5)
             ",
             params![
                 report.recorded_at_ms,
@@ -270,6 +332,7 @@ fn save_candle_sweep_report(
                     report.skipped_under_warmed_count,
                     "skipped under-warmed count"
                 )?,
+                usize_to_i64(TRAIN_SPLIT_BPS, "train split bps")?,
             ],
         )
         .map_err(|error| {
@@ -286,6 +349,8 @@ fn save_candle_sweep_report(
                     rank,
                     interval_seconds,
                     candle_count,
+                    train_candle_count,
+                    test_candle_count,
                     fast_window,
                     slow_window,
                     quantity_base_micro_units,
@@ -298,28 +363,70 @@ fn save_candle_sweep_report(
                     buy_count,
                     sell_count,
                     exposure_pct,
-                    final_base_micro_units
+                    final_base_micro_units,
+                    train_pnl_micro_units,
+                    train_return_pct,
+                    train_buy_and_hold_delta_micro_units,
+                    train_max_drawdown_pct,
+                    train_filled_order_count,
+                    train_rejected_order_count,
+                    train_buy_count,
+                    train_sell_count,
+                    train_exposure_pct,
+                    train_final_base_micro_units,
+                    test_pnl_micro_units,
+                    test_return_pct,
+                    test_buy_and_hold_delta_micro_units,
+                    test_max_drawdown_pct,
+                    test_filled_order_count,
+                    test_rejected_order_count,
+                    test_buy_count,
+                    test_sell_count,
+                    test_exposure_pct,
+                    test_final_base_micro_units
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
                 ",
                 params![
                     run_id,
                     usize_to_i64(rank + 1, "strategy research rank")?,
                     result.interval_seconds,
                     usize_to_i64(result.candle_count, "candle count")?,
+                    usize_to_i64(result.train_candle_count, "train candle count")?,
+                    usize_to_i64(result.test_candle_count, "test candle count")?,
                     usize_to_i64(result.fast_window, "fast window")?,
                     usize_to_i64(result.slow_window, "slow window")?,
                     result.quantity_base.micro_units(),
-                    result.net_profit_loss_quote.micro_units(),
-                    result.return_pct,
-                    result.buy_and_hold_delta_quote.micro_units(),
-                    result.max_drawdown_pct,
-                    usize_to_i64(result.filled_order_count, "filled order count")?,
-                    usize_to_i64(result.rejected_order_count, "rejected order count")?,
-                    usize_to_i64(result.buy_count, "buy count")?,
-                    usize_to_i64(result.sell_count, "sell count")?,
-                    result.exposure_pct,
-                    result.final_base_balance.micro_units(),
+                    result.train_profit_loss_quote.micro_units(),
+                    result.train_return_pct,
+                    result.train_buy_and_hold_delta_quote.micro_units(),
+                    result.train_max_drawdown_pct,
+                    usize_to_i64(result.train_filled_order_count, "filled order count")?,
+                    usize_to_i64(result.train_rejected_order_count, "rejected order count")?,
+                    usize_to_i64(result.train_buy_count, "buy count")?,
+                    usize_to_i64(result.train_sell_count, "sell count")?,
+                    result.train_exposure_pct,
+                    result.train_final_base_balance.micro_units(),
+                    result.train_profit_loss_quote.micro_units(),
+                    result.train_return_pct,
+                    result.train_buy_and_hold_delta_quote.micro_units(),
+                    result.train_max_drawdown_pct,
+                    usize_to_i64(result.train_filled_order_count, "train filled order count")?,
+                    usize_to_i64(result.train_rejected_order_count, "train rejected order count")?,
+                    usize_to_i64(result.train_buy_count, "train buy count")?,
+                    usize_to_i64(result.train_sell_count, "train sell count")?,
+                    result.train_exposure_pct,
+                    result.train_final_base_balance.micro_units(),
+                    result.test_profit_loss_quote.micro_units(),
+                    result.test_return_pct,
+                    result.test_buy_and_hold_delta_quote.micro_units(),
+                    result.test_max_drawdown_pct,
+                    usize_to_i64(result.test_filled_order_count, "test filled order count")?,
+                    usize_to_i64(result.test_rejected_order_count, "test rejected order count")?,
+                    usize_to_i64(result.test_buy_count, "test buy count")?,
+                    usize_to_i64(result.test_sell_count, "test sell count")?,
+                    result.test_exposure_pct,
+                    result.test_final_base_balance.micro_units(),
                 ],
             )
             .map_err(|error| {
@@ -338,6 +445,91 @@ fn save_candle_sweep_report(
 
 fn usize_to_i64(value: usize, label: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| BotError::Storage(format!("{label} is too large to store")))
+}
+
+fn ensure_strategy_research_schema(connection: &Connection) -> Result<()> {
+    add_column_if_missing(
+        connection,
+        "strategy_research_runs",
+        "train_split_bps",
+        "INTEGER NOT NULL DEFAULT 7000",
+    )?;
+
+    for (column, definition) in [
+        ("train_candle_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_candle_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("train_pnl_micro_units", "INTEGER NOT NULL DEFAULT 0"),
+        ("train_return_pct", "REAL NOT NULL DEFAULT 0"),
+        (
+            "train_buy_and_hold_delta_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("train_max_drawdown_pct", "REAL NOT NULL DEFAULT 0"),
+        ("train_filled_order_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("train_rejected_order_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("train_buy_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("train_sell_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("train_exposure_pct", "REAL NOT NULL DEFAULT 0"),
+        ("train_final_base_micro_units", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_pnl_micro_units", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_return_pct", "REAL NOT NULL DEFAULT 0"),
+        (
+            "test_buy_and_hold_delta_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("test_max_drawdown_pct", "REAL NOT NULL DEFAULT 0"),
+        ("test_filled_order_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_rejected_order_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_buy_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_sell_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("test_exposure_pct", "REAL NOT NULL DEFAULT 0"),
+        ("test_final_base_micro_units", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        add_column_if_missing(connection, "strategy_research_results", column, definition)?;
+    }
+
+    Ok(())
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    if column_exists(connection, table, column)? {
+        return Ok(());
+    }
+
+    connection
+        .execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|error| {
+            BotError::Storage(format!("failed to add {table}.{column} column: {error}"))
+        })?;
+
+    Ok(())
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| BotError::Storage(format!("failed to inspect schema: {error}")))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| BotError::Storage(format!("failed to read schema: {error}")))?;
+
+    for name in columns {
+        if name.map_err(|error| BotError::Storage(format!("failed to read column: {error}")))?
+            == column
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn now_ms() -> Result<i64> {
@@ -377,28 +569,44 @@ impl CandleSweepResult {
     fn from_report(
         interval_seconds: i64,
         candle_count: usize,
+        train_candle_count: usize,
+        test_candle_count: usize,
         fast_window: usize,
         slow_window: usize,
         quantity_base: Decimal,
-        report: &BacktestReport,
+        train_report: &BacktestReport,
+        test_report: &BacktestReport,
     ) -> Self {
         Self {
             interval_seconds,
             candle_count,
+            train_candle_count,
+            test_candle_count,
             fast_window,
             slow_window,
             quantity_base,
-            net_profit_loss_quote: report.profit_loss_quote,
-            return_pct: report.return_pct,
-            buy_and_hold_delta_quote: report.profit_loss_quote
-                - report.buy_and_hold_profit_loss_quote,
-            max_drawdown_pct: report.max_drawdown_pct,
-            filled_order_count: report.filled_order_count,
-            rejected_order_count: report.rejected_order_count,
-            buy_count: report.buy_count,
-            sell_count: report.sell_count,
-            exposure_pct: report.exposure_pct,
-            final_base_balance: report.final_base_balance,
+            train_profit_loss_quote: train_report.profit_loss_quote,
+            train_return_pct: train_report.return_pct,
+            train_buy_and_hold_delta_quote: train_report.profit_loss_quote
+                - train_report.buy_and_hold_profit_loss_quote,
+            train_max_drawdown_pct: train_report.max_drawdown_pct,
+            train_filled_order_count: train_report.filled_order_count,
+            train_rejected_order_count: train_report.rejected_order_count,
+            train_buy_count: train_report.buy_count,
+            train_sell_count: train_report.sell_count,
+            train_exposure_pct: train_report.exposure_pct,
+            train_final_base_balance: train_report.final_base_balance,
+            test_profit_loss_quote: test_report.profit_loss_quote,
+            test_return_pct: test_report.return_pct,
+            test_buy_and_hold_delta_quote: test_report.profit_loss_quote
+                - test_report.buy_and_hold_profit_loss_quote,
+            test_max_drawdown_pct: test_report.max_drawdown_pct,
+            test_filled_order_count: test_report.filled_order_count,
+            test_rejected_order_count: test_report.rejected_order_count,
+            test_buy_count: test_report.buy_count,
+            test_sell_count: test_report.sell_count,
+            test_exposure_pct: test_report.exposure_pct,
+            test_final_base_balance: test_report.final_base_balance,
         }
     }
 }
@@ -468,42 +676,45 @@ impl Display for CandleSweepReport {
         }
         writeln!(
             f,
-            "{:>8} {:>7} {:>4} {:>4} {:>8} {:>12} {:>8} {:>12} {:>8} {:>7} {:>7} {:>7} {:>9} {:>10}",
+            "{:>8} {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
             "interval",
             "candles",
+            "train",
+            "test",
             "fast",
             "slow",
             "qty",
-            "pnl",
-            "ret%",
-            "vs_hold",
-            "dd%",
-            "fills",
-            "rej",
-            "b/s",
-            "exposure",
-            "final_base"
+            "train_pnl",
+            "test_pnl",
+            "train_hold",
+            "test_hold",
+            "tr_fill",
+            "te_fill",
+            "tr_b/s",
+            "te_b/s"
         )?;
 
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>4} {:>4} {:>8} {:>12} {:>8.2} {:>12} {:>8.2} {:>7} {:>7} {:>3}/{:<3} {:>8.2}% {:>10}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
+                result.train_candle_count,
+                result.test_candle_count,
                 result.fast_window,
                 result.slow_window,
                 result.quantity_base,
-                result.net_profit_loss_quote,
-                result.return_pct,
-                result.buy_and_hold_delta_quote,
-                result.max_drawdown_pct,
-                result.filled_order_count,
-                result.rejected_order_count,
-                result.buy_count,
-                result.sell_count,
-                result.exposure_pct,
-                result.final_base_balance,
+                result.train_profit_loss_quote,
+                result.test_profit_loss_quote,
+                result.train_buy_and_hold_delta_quote,
+                result.test_buy_and_hold_delta_quote,
+                result.train_filled_order_count,
+                result.test_filled_order_count,
+                result.train_buy_count,
+                result.train_sell_count,
+                result.test_buy_count,
+                result.test_sell_count,
             )?;
         }
 
@@ -635,9 +846,9 @@ mod tests {
         let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
             .expect("candle sweep should run");
 
-        assert_eq!(report.result_count, 72);
-        assert_eq!(report.results.len(), 72);
-        assert_eq!(report.skipped_under_warmed_count, 24);
+        assert_eq!(report.result_count, 24);
+        assert_eq!(report.results.len(), 24);
+        assert_eq!(report.skipped_under_warmed_count, 72);
         assert!(report.recorded_at_ms > 0);
         assert!(report.results.iter().all(|result| result.candle_count > 0));
 
@@ -655,7 +866,7 @@ mod tests {
             )
             .expect("research results should count");
         assert_eq!(saved_runs, 1);
-        assert_eq!(saved_results, 72);
+        assert_eq!(saved_results, 24);
         drop(connection);
 
         fs::remove_file(path).expect("test database should be removed");
@@ -701,7 +912,8 @@ mod tests {
             report
                 .results
                 .iter()
-                .all(|result| result.candle_count > result.slow_window)
+                .all(|result| result.train_candle_count > result.slow_window
+                    && result.test_candle_count > result.slow_window)
         );
 
         fs::remove_file(path).expect("test database should be removed");
@@ -749,18 +961,22 @@ mod tests {
         let first_zero_fill_index = report
             .results
             .iter()
-            .position(|result| result.filled_order_count == 0)
+            .position(|result| {
+                result.train_filled_order_count == 0 || result.test_filled_order_count == 0
+            })
             .unwrap_or(report.results.len());
 
         assert!(
             report.results[..first_zero_fill_index]
                 .iter()
-                .all(|result| result.filled_order_count > 0)
+                .all(|result| result.train_filled_order_count > 0
+                    && result.test_filled_order_count > 0)
         );
         assert!(
             report.results[first_zero_fill_index..]
                 .iter()
-                .all(|result| result.filled_order_count == 0)
+                .all(|result| result.train_filled_order_count == 0
+                    || result.test_filled_order_count == 0)
         );
 
         fs::remove_file(path).expect("test database should be removed");
