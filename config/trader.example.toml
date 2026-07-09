@@ -4,6 +4,16 @@ base_currency = "BTC"
 quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
+[exchange]
+kind = "paper"
+
+[exchange.kraken]
+base_url = "https://api.kraken.com"
+pair = "XBTUSD"
+api_key_env = "KRAKEN_API_KEY"
+api_secret_env = "KRAKEN_API_SECRET"
+enable_order_placement = false
+
 [market_data]
 replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
 idle_sleep_ms = 1000

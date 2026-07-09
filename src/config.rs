@@ -11,6 +11,8 @@ const CONFIG_ENV_VAR: &str = "TRADER_CONFIG";
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub bot: BotConfig,
+    #[serde(default)]
+    pub exchange: ExchangeConfig,
     pub market_data: MarketDataConfig,
     pub risk: RiskConfig,
     pub storage: StorageConfig,
@@ -23,6 +25,62 @@ pub struct BotConfig {
     pub quote_currency: String,
     pub base_currency: String,
     pub paper_starting_quote_balance: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExchangeConfig {
+    #[serde(default)]
+    pub kind: ExchangeKind,
+    #[serde(default)]
+    pub kraken: KrakenConfig,
+}
+
+impl Default for ExchangeConfig {
+    fn default() -> Self {
+        Self {
+            kind: ExchangeKind::Paper,
+            kraken: KrakenConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExchangeKind {
+    Paper,
+    Kraken,
+}
+
+impl Default for ExchangeKind {
+    fn default() -> Self {
+        Self::Paper
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KrakenConfig {
+    #[serde(default = "default_kraken_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_kraken_pair")]
+    pub pair: String,
+    #[serde(default = "default_kraken_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_kraken_api_secret_env")]
+    pub api_secret_env: String,
+    #[serde(default)]
+    pub enable_order_placement: bool,
+}
+
+impl Default for KrakenConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_kraken_base_url(),
+            pair: default_kraken_pair(),
+            api_key_env: default_kraken_api_key_env(),
+            api_secret_env: default_kraken_api_secret_env(),
+            enable_order_placement: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +153,32 @@ impl Config {
             ));
         }
 
+        if self.exchange.kind == ExchangeKind::Kraken {
+            if self.exchange.kraken.base_url.trim().is_empty() {
+                return Err(BotError::Config(
+                    "kraken base url must not be empty".to_string(),
+                ));
+            }
+
+            if self.exchange.kraken.pair.trim().is_empty() {
+                return Err(BotError::Config(
+                    "kraken pair must not be empty".to_string(),
+                ));
+            }
+
+            if self.exchange.kraken.api_key_env.trim().is_empty() {
+                return Err(BotError::Config(
+                    "kraken api key env var name must not be empty".to_string(),
+                ));
+            }
+
+            if self.exchange.kraken.api_secret_env.trim().is_empty() {
+                return Err(BotError::Config(
+                    "kraken api secret env var name must not be empty".to_string(),
+                ));
+            }
+        }
+
         if self.market_data.replay_prices.is_empty() {
             return Err(BotError::Config(
                 "market data replay prices must not be empty".to_string(),
@@ -140,6 +224,22 @@ impl Config {
     }
 }
 
+fn default_kraken_base_url() -> String {
+    "https://api.kraken.com".to_string()
+}
+
+fn default_kraken_pair() -> String {
+    "XBTUSD".to_string()
+}
+
+fn default_kraken_api_key_env() -> String {
+    "KRAKEN_API_KEY".to_string()
+}
+
+fn default_kraken_api_secret_env() -> String {
+    "KRAKEN_API_SECRET".to_string()
+}
+
 fn config_path_from_args_and_env(
     args: impl IntoIterator<Item = String>,
     env_config_path: Option<String>,
@@ -173,6 +273,16 @@ base_currency = "BTC"
 quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
+[exchange]
+kind = "paper"
+
+[exchange.kraken]
+base_url = "https://api.kraken.com"
+pair = "XBTUSD"
+api_key_env = "KRAKEN_API_KEY"
+api_secret_env = "KRAKEN_API_SECRET"
+enable_order_placement = false
+
 [market_data]
 replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
 idle_sleep_ms = 1000
@@ -196,6 +306,9 @@ verbose = true
         assert_eq!(config.bot.base_currency, "BTC");
         assert_eq!(config.bot.quote_currency, "USD");
         assert_eq!(config.bot.paper_starting_quote_balance.to_string(), "10000");
+        assert_eq!(config.exchange.kind, super::ExchangeKind::Paper);
+        assert_eq!(config.exchange.kraken.pair, "XBTUSD");
+        assert!(!config.exchange.kraken.enable_order_placement);
         assert_eq!(
             config
                 .market_data

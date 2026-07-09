@@ -23,7 +23,7 @@ impl OrderManager {
 
     pub fn submit_prepared_order(
         &self,
-        exchange: &mut impl Exchange,
+        exchange: &mut (impl Exchange + ?Sized),
         submitted_order: &Order,
     ) -> Result<Order> {
         if submitted_order.status != OrderStatus::Submitted {
@@ -47,8 +47,15 @@ impl OrderManager {
                     request,
                     "exchange rejected order".to_string(),
                 )),
+                OrderStatus::Submitted => Ok(Order {
+                    id: submitted_order.id,
+                    exchange_order_id: Some(exchange_order.exchange_order_id),
+                    request,
+                    status: OrderStatus::Submitted,
+                    status_reason: None,
+                }),
                 status => Err(BotError::Exchange(format!(
-                    "paper exchange returned unsupported terminal status: {status:?}"
+                    "exchange returned unsupported order status: {status:?}"
                 ))),
             },
             Err(BotError::Exchange(message)) => {
@@ -66,7 +73,7 @@ impl OrderManager {
 }
 
 fn client_order_id(order_id: u64) -> String {
-    format!("trader-{order_id}")
+    format!("trd-{order_id}")
 }
 
 #[cfg(test)]
@@ -99,10 +106,7 @@ mod tests {
 
         let submitted = manager.prepare_order(buy_request(0.5, 100.0));
         assert_eq!(submitted.id, 1);
-        assert_eq!(
-            submitted.request.client_order_id.as_deref(),
-            Some("trader-1")
-        );
+        assert_eq!(submitted.request.client_order_id.as_deref(), Some("trd-1"));
         assert_eq!(submitted.status, OrderStatus::Submitted);
         assert_eq!(submitted.exchange_order_id, None);
 
@@ -111,9 +115,9 @@ mod tests {
             .expect("order should submit");
 
         assert_eq!(filled.id, 1);
-        assert_eq!(filled.request.client_order_id.as_deref(), Some("trader-1"));
+        assert_eq!(filled.request.client_order_id.as_deref(), Some("trd-1"));
         assert_eq!(filled.status, OrderStatus::Filled);
-        assert_eq!(filled.exchange_order_id, Some(1));
+        assert_eq!(filled.exchange_order_id.as_deref(), Some("1"));
         assert_eq!(exchange.portfolio().base_balance.to_string(), "0.5");
         assert_eq!(exchange.portfolio().quote_balance.to_string(), "950");
     }

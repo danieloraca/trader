@@ -38,7 +38,7 @@ impl OrderRequest {
 #[derive(Debug, Clone)]
 pub struct Order {
     pub id: u64,
-    pub exchange_order_id: Option<u64>,
+    pub exchange_order_id: Option<String>,
     pub request: OrderRequest,
     pub status: OrderStatus,
     pub status_reason: Option<String>,
@@ -55,10 +55,10 @@ impl Order {
         }
     }
 
-    pub fn filled(id: u64, exchange_order_id: u64, request: OrderRequest) -> Self {
+    pub fn filled(id: u64, exchange_order_id: impl Into<String>, request: OrderRequest) -> Self {
         Self {
             id,
-            exchange_order_id: Some(exchange_order_id),
+            exchange_order_id: Some(exchange_order_id.into()),
             request,
             status: OrderStatus::Filled,
             status_reason: None,
@@ -78,7 +78,7 @@ impl Order {
 
 #[derive(Debug, Clone)]
 pub struct ExchangeOrder {
-    pub exchange_order_id: u64,
+    pub exchange_order_id: String,
     pub client_order_id: String,
     pub status: OrderStatus,
 }

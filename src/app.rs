@@ -1,6 +1,6 @@
-use crate::config::Config;
+use crate::config::{Config, ExchangeKind};
 use crate::error::{BotError, Result};
-use crate::exchange::{Exchange, PaperExchange};
+use crate::exchange::{Exchange, KrakenExchange, PaperExchange};
 use crate::market::{MarketDataSource, ReplayMarketDataSource};
 use crate::orders::{OrderManager, OrderRequest, OrderStatus};
 use crate::portfolio::Portfolio;
@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 pub struct App {
     config: Config,
-    exchange: PaperExchange,
+    exchange: Box<dyn Exchange>,
     market_data: ReplayMarketDataSource,
     order_manager: OrderManager,
     risk: RiskManager,
@@ -41,10 +41,14 @@ impl App {
             replay_cursor,
         );
 
-        let exchange = PaperExchange::new(portfolio);
-        let _synced_portfolio = exchange.sync_portfolio()?;
+        let mut exchange: Box<dyn Exchange> = match config.exchange.kind {
+            ExchangeKind::Paper => Box::new(PaperExchange::new(portfolio)),
+            ExchangeKind::Kraken => Box::new(KrakenExchange::new(&config, portfolio)?),
+        };
+        let synced_portfolio = exchange.sync_portfolio()?;
+        store.save_portfolio(&synced_portfolio)?;
         let run_id = telemetry::new_run_id();
-        reconcile_unresolved_orders(&run_id, &mut store, &exchange)?;
+        reconcile_unresolved_orders(&run_id, &mut store, exchange.as_ref())?;
 
         info!(
             run_id = %run_id,
@@ -138,10 +142,10 @@ impl App {
 
                 let terminal_order = self
                     .order_manager
-                    .submit_prepared_order(&mut self.exchange, &submitted_order)?;
+                    .submit_prepared_order(self.exchange.as_mut(), &submitted_order)?;
                 self.store.record_order(&terminal_order)?;
                 let exchange_status =
-                    if let Some(exchange_order_id) = terminal_order.exchange_order_id {
+                    if let Some(exchange_order_id) = terminal_order.exchange_order_id.as_deref() {
                         Some(self.exchange.order_status(exchange_order_id)?.status)
                     } else {
                         None
@@ -203,7 +207,7 @@ impl App {
 fn reconcile_unresolved_orders(
     run_id: &str,
     store: &mut impl Store,
-    exchange: &impl Exchange,
+    exchange: &(impl Exchange + ?Sized),
 ) -> Result<()> {
     let unresolved_orders = store.load_unresolved_submitted_orders()?;
 
@@ -247,7 +251,7 @@ fn reconcile_unresolved_orders(
                 let order = match reconciled_order {
                     OrderStatus::Filled => crate::orders::Order::filled(
                         submitted_order.id,
-                        exchange_order.exchange_order_id,
+                        exchange_order.exchange_order_id.clone(),
                         submitted_order.request.clone(),
                     ),
                     OrderStatus::Rejected => crate::orders::Order::rejected(
@@ -257,7 +261,7 @@ fn reconcile_unresolved_orders(
                     ),
                     OrderStatus::Cancelled => crate::orders::Order {
                         id: submitted_order.id,
-                        exchange_order_id: Some(exchange_order.exchange_order_id),
+                        exchange_order_id: Some(exchange_order.exchange_order_id.clone()),
                         request: submitted_order.request.clone(),
                         status: OrderStatus::Cancelled,
                         status_reason: Some("reconciled exchange cancellation".to_string()),

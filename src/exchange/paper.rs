@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 pub struct PaperExchange {
     portfolio: Portfolio,
-    orders: HashMap<u64, ExchangeOrder>,
+    orders: HashMap<String, ExchangeOrder>,
     next_order_id: u64,
 }
 
@@ -31,7 +31,7 @@ impl Exchange for PaperExchange {
         &self.portfolio
     }
 
-    fn sync_portfolio(&self) -> Result<Portfolio> {
+    fn sync_portfolio(&mut self) -> Result<Portfolio> {
         Ok(self.portfolio.clone())
     }
 
@@ -67,19 +67,21 @@ impl Exchange for PaperExchange {
             }
         }
 
+        let exchange_order_id = self.next_id().to_string();
         let order = ExchangeOrder {
-            exchange_order_id: self.next_id(),
+            exchange_order_id,
             client_order_id,
             status: OrderStatus::Filled,
         };
-        self.orders.insert(order.exchange_order_id, order.clone());
+        self.orders
+            .insert(order.exchange_order_id.clone(), order.clone());
 
         Ok(order)
     }
 
-    fn order_status(&self, exchange_order_id: u64) -> Result<ExchangeOrder> {
+    fn order_status(&self, exchange_order_id: &str) -> Result<ExchangeOrder> {
         self.orders
-            .get(&exchange_order_id)
+            .get(exchange_order_id)
             .cloned()
             .ok_or_else(|| BotError::Exchange(format!("unknown order id {exchange_order_id}")))
     }
@@ -92,18 +94,18 @@ impl Exchange for PaperExchange {
             .cloned())
     }
 
-    fn cancel_order(&mut self, exchange_order_id: u64) -> Result<ExchangeOrder> {
+    fn cancel_order(&mut self, exchange_order_id: &str) -> Result<ExchangeOrder> {
         let order = self.order_status(exchange_order_id)?;
 
         match order.status {
             OrderStatus::Submitted => {
                 let cancelled_order = ExchangeOrder {
-                    exchange_order_id,
+                    exchange_order_id: exchange_order_id.to_string(),
                     client_order_id: order.client_order_id,
                     status: OrderStatus::Cancelled,
                 };
                 self.orders
-                    .insert(exchange_order_id, cancelled_order.clone());
+                    .insert(exchange_order_id.to_string(), cancelled_order.clone());
                 Ok(cancelled_order)
             }
             OrderStatus::Cancelled => Ok(order),
@@ -158,7 +160,7 @@ mod tests {
             .place_order(buy_request(0.5, 100.0))
             .expect("buy should fill");
 
-        assert_eq!(order.exchange_order_id, 1);
+        assert_eq!(order.exchange_order_id, "1");
         assert_eq!(order.client_order_id, "test-client-order");
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(exchange.portfolio().base_balance.to_string(), "0.5");
@@ -191,7 +193,7 @@ mod tests {
             .place_order(sell_request(0.2, 110.0))
             .expect("sell should fill");
 
-        assert_eq!(order.exchange_order_id, 2);
+        assert_eq!(order.exchange_order_id, "2");
         assert_eq!(exchange.portfolio().base_balance.to_string(), "0.3");
         assert_eq!(exchange.portfolio().quote_balance.to_string(), "972");
     }
@@ -249,7 +251,7 @@ mod tests {
             .expect("buy should fill");
 
         let status = exchange
-            .order_status(order.exchange_order_id)
+            .order_status(&order.exchange_order_id)
             .expect("status should exist");
 
         assert_eq!(status.exchange_order_id, order.exchange_order_id);
@@ -262,7 +264,7 @@ mod tests {
         let exchange = PaperExchange::new(portfolio);
 
         let error = exchange
-            .order_status(99)
+            .order_status("99")
             .expect_err("unknown order should fail");
 
         assert!(error.to_string().contains("unknown order id 99"));
@@ -306,7 +308,7 @@ mod tests {
             .expect("buy should fill");
 
         let error = exchange
-            .cancel_order(order.exchange_order_id)
+            .cancel_order(&order.exchange_order_id)
             .expect_err("filled order cannot cancel");
 
         assert!(error.to_string().contains("cannot cancel filled order"));

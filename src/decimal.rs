@@ -36,6 +36,71 @@ impl Decimal {
         })
     }
 
+    pub fn from_decimal_str(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("decimal value must not be empty".to_string());
+        }
+
+        let (negative, value) = match value.strip_prefix('-') {
+            Some(value) => (true, value),
+            None => (false, value.strip_prefix('+').unwrap_or(value)),
+        };
+
+        let mut parts = value.split('.');
+        let whole = parts.next().unwrap_or_default();
+        let fractional = parts.next();
+        if parts.next().is_some() {
+            return Err("decimal value must contain at most one decimal point".to_string());
+        }
+
+        if whole.is_empty() && fractional.unwrap_or_default().is_empty() {
+            return Err("decimal value must contain digits".to_string());
+        }
+
+        if !whole.chars().all(|character| character.is_ascii_digit()) {
+            return Err("decimal whole part must contain only digits".to_string());
+        }
+
+        let whole_units = if whole.is_empty() {
+            0
+        } else {
+            whole
+                .parse::<i64>()
+                .map_err(|_| "decimal whole part is outside supported range".to_string())?
+        };
+
+        let fractional = fractional.unwrap_or_default();
+        if !fractional
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
+            return Err("decimal fractional part must contain only digits".to_string());
+        }
+
+        let mut fractional_digits = fractional.chars();
+        let mut fractional_units = 0_i64;
+        for _ in 0..6 {
+            fractional_units *= 10;
+            if let Some(character) = fractional_digits.next() {
+                fractional_units += i64::from(character as u8 - b'0');
+            }
+        }
+
+        if matches!(fractional_digits.next(), Some(character) if character >= '5') {
+            fractional_units += 1;
+        }
+
+        let micro_units = whole_units
+            .checked_mul(SCALE)
+            .and_then(|value| value.checked_add(fractional_units))
+            .ok_or_else(|| "decimal value is outside supported range".to_string())?;
+
+        Ok(Self {
+            micro_units: if negative { -micro_units } else { micro_units },
+        })
+    }
+
     pub fn ratio_to(self, denominator: Self) -> f64 {
         self.micro_units as f64 / denominator.micro_units as f64
     }
@@ -144,6 +209,13 @@ impl Visitor<'_> for DecimalVisitor {
     {
         Decimal::from_f64(value).map_err(E::custom)
     }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Decimal::from_decimal_str(value).map_err(E::custom)
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +243,22 @@ mod tests {
         assert_eq!(
             Decimal::from_micro_units(9_998_465_000).to_string(),
             "9998.465"
+        );
+    }
+
+    #[test]
+    fn parses_decimal_strings_without_binary_float_arithmetic() {
+        assert_eq!(
+            Decimal::from_decimal_str("1011.1908877900")
+                .expect("decimal should parse")
+                .to_string(),
+            "1011.190888"
+        );
+        assert_eq!(
+            Decimal::from_decimal_str(".25")
+                .expect("decimal should parse")
+                .to_string(),
+            "0.25"
         );
     }
 }

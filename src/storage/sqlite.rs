@@ -64,7 +64,7 @@ impl SqliteStore {
                     recorded_at_ms INTEGER NOT NULL,
                     bot_order_id INTEGER NOT NULL,
                     client_order_id TEXT NOT NULL,
-                    exchange_order_id INTEGER,
+                    exchange_order_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     quantity_base_micro_units INTEGER NOT NULL,
@@ -149,6 +149,10 @@ impl SqliteStore {
             self.rebuild_orders_with_micro_units()?;
         }
 
+        if self.column_type("orders", "exchange_order_id")?.as_deref() != Some("TEXT") {
+            self.rebuild_orders_with_text_exchange_order_id()?;
+        }
+
         Ok(())
     }
 
@@ -215,6 +219,33 @@ impl SqliteStore {
         Ok(false)
     }
 
+    fn column_type(&self, table: &str, column: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| BotError::Storage(format!("failed to inspect schema: {error}")))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| BotError::Storage(format!("failed to read schema: {error}")))?;
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| BotError::Storage(format!("failed to read schema row: {error}")))?
+        {
+            let name: String = row.get(1).map_err(|error| {
+                BotError::Storage(format!("failed to read column name: {error}"))
+            })?;
+            if name == column {
+                let column_type: String = row.get(2).map_err(|error| {
+                    BotError::Storage(format!("failed to read column type: {error}"))
+                })?;
+                return Ok(Some(column_type.to_uppercase()));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn rebuild_orders_with_nullable_exchange_order_id(&self) -> Result<()> {
         self.connection
             .execute_batch(
@@ -224,7 +255,7 @@ impl SqliteStore {
                     recorded_at_ms INTEGER NOT NULL,
                     bot_order_id INTEGER NOT NULL,
                     client_order_id TEXT NOT NULL,
-                    exchange_order_id INTEGER,
+                    exchange_order_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     quantity_base REAL NOT NULL,
@@ -253,7 +284,7 @@ impl SqliteStore {
                     recorded_at_ms,
                     bot_order_id,
                     client_order_id,
-                    NULLIF(exchange_order_id, 0),
+                    NULLIF(CAST(exchange_order_id AS TEXT), '0'),
                     symbol,
                     side,
                     quantity_base,
@@ -285,7 +316,7 @@ impl SqliteStore {
                     recorded_at_ms INTEGER NOT NULL,
                     bot_order_id INTEGER NOT NULL,
                     client_order_id TEXT NOT NULL,
-                    exchange_order_id INTEGER,
+                    exchange_order_id TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     quantity_base_micro_units INTEGER NOT NULL,
@@ -331,6 +362,67 @@ impl SqliteStore {
             .map_err(|error| {
                 BotError::Storage(format!(
                     "failed to rebuild orders table for fixed-point values: {error}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    fn rebuild_orders_with_text_exchange_order_id(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "
+                CREATE TABLE orders_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    bot_order_id INTEGER NOT NULL,
+                    client_order_id TEXT NOT NULL,
+                    exchange_order_id TEXT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity_base_micro_units INTEGER NOT NULL,
+                    limit_price_micro_units INTEGER NOT NULL,
+                    quote_value_micro_units INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    status_reason TEXT
+                );
+
+                INSERT INTO orders_new (
+                    id,
+                    recorded_at_ms,
+                    bot_order_id,
+                    client_order_id,
+                    exchange_order_id,
+                    symbol,
+                    side,
+                    quantity_base_micro_units,
+                    limit_price_micro_units,
+                    quote_value_micro_units,
+                    status,
+                    status_reason
+                )
+                SELECT
+                    id,
+                    recorded_at_ms,
+                    bot_order_id,
+                    client_order_id,
+                    CAST(exchange_order_id AS TEXT),
+                    symbol,
+                    side,
+                    quantity_base_micro_units,
+                    limit_price_micro_units,
+                    quote_value_micro_units,
+                    status,
+                    status_reason
+                FROM orders;
+
+                DROP TABLE orders;
+                ALTER TABLE orders_new RENAME TO orders;
+                ",
+            )
+            .map_err(|error| {
+                BotError::Storage(format!(
+                    "failed to rebuild orders table for text exchange ids: {error}"
                 ))
             })?;
 
@@ -742,7 +834,7 @@ impl Store for SqliteStore {
                     Self::now_ms()?,
                     order.id,
                     order.request.client_order_id.as_deref().unwrap_or(""),
-                    optional_i64(order.exchange_order_id)?,
+                    order.exchange_order_id.as_deref(),
                     order.request.symbol.as_str(),
                     side_name(order.request.side),
                     order.request.quantity_base.micro_units(),
@@ -775,18 +867,6 @@ fn parse_side(side: &str) -> Result<Side> {
     }
 }
 
-fn optional_i64(value: Option<u64>) -> Result<Option<i64>> {
-    value
-        .map(|value| {
-            i64::try_from(value).map_err(|_| {
-                BotError::Storage(format!(
-                    "value is too large to store as sqlite integer: {value}"
-                ))
-            })
-        })
-        .transpose()
-}
-
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
@@ -814,7 +894,7 @@ mod tests {
     fn order(id: u64) -> Order {
         Order {
             id,
-            exchange_order_id: Some(id),
+            exchange_order_id: Some(id.to_string()),
             request: OrderRequest {
                 symbol: "BTC-USD".to_string(),
                 side: Side::Buy,
