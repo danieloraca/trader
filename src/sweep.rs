@@ -1,12 +1,17 @@
 use crate::backtest::{self, BacktestReport};
-use crate::config::Config;
+use crate::candles;
+use crate::config::{Config, StrategyKind};
 use crate::decimal::Decimal;
-use crate::error::Result;
+use crate::error::{BotError, Result};
 use std::fmt::{Display, Formatter};
 
 const BUY_THRESHOLDS_BPS: [i64; 6] = [3, 5, 8, 10, 15, 20];
 const SELL_THRESHOLDS_BPS: [i64; 7] = [-3, -5, -8, -10, -15, -20, -30];
 const QUANTITY_MICRO_UNITS: [i64; 4] = [500, 1_000, 2_000, 5_000];
+const CANDLE_INTERVAL_SECONDS: [i64; 2] = [60, 300];
+const FAST_WINDOWS: [usize; 4] = [3, 5, 8, 10];
+const SLOW_WINDOWS: [usize; 4] = [15, 30, 60, 120];
+const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
 
 #[derive(Debug, Clone)]
 pub struct SweepReport {
@@ -19,6 +24,32 @@ pub struct SweepReport {
 pub struct SweepResult {
     pub buy_threshold_bps: i64,
     pub sell_threshold_bps: i64,
+    pub quantity_base: Decimal,
+    pub net_profit_loss_quote: Decimal,
+    pub return_pct: f64,
+    pub buy_and_hold_delta_quote: Decimal,
+    pub max_drawdown_pct: f64,
+    pub filled_order_count: usize,
+    pub rejected_order_count: usize,
+    pub buy_count: usize,
+    pub sell_count: usize,
+    pub exposure_pct: f64,
+    pub final_base_balance: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandleSweepReport {
+    pub sqlite_path: String,
+    pub result_count: usize,
+    pub results: Vec<CandleSweepResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandleSweepResult {
+    pub interval_seconds: i64,
+    pub candle_count: usize,
+    pub fast_window: usize,
+    pub slow_window: usize,
     pub quantity_base: Decimal,
     pub net_profit_loss_quote: Decimal,
     pub return_pct: f64,
@@ -73,6 +104,68 @@ pub fn run(config: &Config, sqlite_path: &str) -> Result<SweepReport> {
     })
 }
 
+pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepReport> {
+    let recorded_prices =
+        backtest::load_recorded_prices_from_sqlite(sqlite_path, &config.bot.symbol)?;
+    if recorded_prices.is_empty() {
+        return Err(BotError::Config(
+            "candle sweep price source is empty".to_string(),
+        ));
+    }
+
+    let mut results = Vec::new();
+
+    for interval_seconds in CANDLE_INTERVAL_SECONDS {
+        let interval_ms = interval_seconds * 1_000;
+        let candles = candles::aggregate_prices_to_candles(&recorded_prices, interval_ms)?;
+        let candle_closes = candles
+            .iter()
+            .map(|candle| candle.close)
+            .collect::<Vec<_>>();
+
+        for fast_window in FAST_WINDOWS {
+            for slow_window in SLOW_WINDOWS {
+                if fast_window >= slow_window {
+                    continue;
+                }
+
+                for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                    let mut candidate = config.clone();
+                    candidate.strategy.kind = StrategyKind::MovingAverageCrossover;
+                    candidate.strategy.moving_average_crossover.fast_window = fast_window;
+                    candidate.strategy.moving_average_crossover.slow_window = slow_window;
+                    candidate.strategy.moving_average_crossover.quantity_base =
+                        Decimal::from_micro_units(quantity_micro_units);
+                    candidate.backtest.trade_log_csv_path = None;
+
+                    let report = backtest::run_from_prices(&candidate, candle_closes.clone())?;
+                    results.push(CandleSweepResult::from_report(
+                        interval_seconds,
+                        candles.len(),
+                        fast_window,
+                        slow_window,
+                        Decimal::from_micro_units(quantity_micro_units),
+                        &report,
+                    ));
+                }
+            }
+        }
+    }
+
+    results.sort_by(|lhs, rhs| {
+        rhs.net_profit_loss_quote
+            .cmp(&lhs.net_profit_loss_quote)
+            .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
+            .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
+    });
+
+    Ok(CandleSweepReport {
+        sqlite_path: sqlite_path.to_string(),
+        result_count: results.len(),
+        results,
+    })
+}
+
 impl SweepResult {
     fn from_report(
         buy_threshold_bps: i64,
@@ -83,6 +176,36 @@ impl SweepResult {
         Self {
             buy_threshold_bps,
             sell_threshold_bps,
+            quantity_base,
+            net_profit_loss_quote: report.profit_loss_quote,
+            return_pct: report.return_pct,
+            buy_and_hold_delta_quote: report.profit_loss_quote
+                - report.buy_and_hold_profit_loss_quote,
+            max_drawdown_pct: report.max_drawdown_pct,
+            filled_order_count: report.filled_order_count,
+            rejected_order_count: report.rejected_order_count,
+            buy_count: report.buy_count,
+            sell_count: report.sell_count,
+            exposure_pct: report.exposure_pct,
+            final_base_balance: report.final_base_balance,
+        }
+    }
+}
+
+impl CandleSweepResult {
+    fn from_report(
+        interval_seconds: i64,
+        candle_count: usize,
+        fast_window: usize,
+        slow_window: usize,
+        quantity_base: Decimal,
+        report: &BacktestReport,
+    ) -> Self {
+        Self {
+            interval_seconds,
+            candle_count,
+            fast_window,
+            slow_window,
             quantity_base,
             net_profit_loss_quote: report.profit_loss_quote,
             return_pct: report.return_pct,
@@ -145,9 +268,59 @@ impl Display for SweepReport {
     }
 }
 
+impl Display for CandleSweepReport {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Candle MA sweep report")?;
+        writeln!(f, "SQLite source: {}", self.sqlite_path)?;
+        writeln!(f, "Combinations: {}", self.result_count)?;
+        writeln!(
+            f,
+            "{:>8} {:>7} {:>4} {:>4} {:>8} {:>12} {:>8} {:>12} {:>8} {:>7} {:>7} {:>7} {:>9} {:>10}",
+            "interval",
+            "candles",
+            "fast",
+            "slow",
+            "qty",
+            "pnl",
+            "ret%",
+            "vs_hold",
+            "dd%",
+            "fills",
+            "rej",
+            "b/s",
+            "exposure",
+            "final_base"
+        )?;
+
+        for result in self.results.iter().take(25) {
+            writeln!(
+                f,
+                "{:>7}s {:>7} {:>4} {:>4} {:>8} {:>12} {:>8.2} {:>12} {:>8.2} {:>7} {:>7} {:>3}/{:<3} {:>8.2}% {:>10}",
+                result.interval_seconds,
+                result.candle_count,
+                result.fast_window,
+                result.slow_window,
+                result.quantity_base,
+                result.net_profit_loss_quote,
+                result.return_pct,
+                result.buy_and_hold_delta_quote,
+                result.max_drawdown_pct,
+                result.filled_order_count,
+                result.rejected_order_count,
+                result.buy_count,
+                result.sell_count,
+                result.exposure_pct,
+                result.final_base_balance,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{run, run_candles};
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
         StorageConfig, StrategyConfig, TelemetryConfig,
@@ -226,6 +399,52 @@ mod tests {
 
         assert_eq!(report.result_count, 168);
         assert_eq!(report.results.len(), 168);
+
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn ranks_moving_average_combinations_from_sqlite_candles() {
+        let path = db_path("sqlite-candles-source");
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute(
+                "
+                CREATE TABLE market_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                )
+                ",
+                [],
+            )
+            .expect("market events table should create");
+
+        for index in 0..180_i64 {
+            let price_micro_units = if index < 90 {
+                100_000_000 + (index * 100_000)
+            } else {
+                109_000_000 - ((index - 90) * 100_000)
+            };
+            connection
+                .execute(
+                    "
+                    INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
+                    VALUES (?1, 'BTC-USD', ?2)
+                    ",
+                    (index * 60_000, price_micro_units),
+                )
+                .expect("market event should insert");
+        }
+        drop(connection);
+
+        let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
+            .expect("candle sweep should run");
+
+        assert_eq!(report.result_count, 96);
+        assert_eq!(report.results.len(), 96);
+        assert!(report.results.iter().all(|result| result.candle_count > 0));
 
         fs::remove_file(path).expect("test database should be removed");
     }

@@ -1,5 +1,6 @@
 mod app;
 mod backtest;
+mod candles;
 mod config;
 mod decimal;
 mod error;
@@ -40,6 +41,19 @@ fn main() -> Result<()> {
                 error::BotError::Config("--sweep-sqlite requires a sqlite path".to_string())
             })?;
             let report = sweep::run(&config, sqlite_path)?;
+            println!("{report}");
+            return Ok(());
+        }
+        RuntimeCommand::SweepCandlesSqlite => {
+            let sqlite_path = runtime
+                .sweep_candles_sqlite_path
+                .as_deref()
+                .ok_or_else(|| {
+                    error::BotError::Config(
+                        "--sweep-candles-sqlite requires a sqlite path".to_string(),
+                    )
+                })?;
+            let report = sweep::run_candles(&config, sqlite_path)?;
             println!("{report}");
             return Ok(());
         }

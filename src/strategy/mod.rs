@@ -1,5 +1,7 @@
+mod moving_average;
 mod simple;
 
+pub use moving_average::MovingAverageCrossoverStrategy;
 pub use simple::SimpleMomentumStrategy;
 
 use crate::config::{StrategyConfig, StrategyKind};
@@ -25,5 +27,8 @@ pub fn from_config(config: &StrategyConfig) -> Box<dyn Strategy> {
         StrategyKind::SimpleMomentum => {
             Box::new(SimpleMomentumStrategy::new(config.simple_momentum.clone()))
         }
+        StrategyKind::MovingAverageCrossover => Box::new(MovingAverageCrossoverStrategy::new(
+            config.moving_average_crossover.clone(),
+        )),
     }
 }

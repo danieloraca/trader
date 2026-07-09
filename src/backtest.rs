@@ -1,3 +1,4 @@
+use crate::candles::RecordedPrice;
 use crate::config::Config;
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
@@ -259,6 +260,16 @@ fn run_with_source(
 }
 
 pub fn load_prices_from_sqlite(sqlite_path: &str, symbol: &str) -> Result<Vec<Decimal>> {
+    Ok(load_recorded_prices_from_sqlite(sqlite_path, symbol)?
+        .into_iter()
+        .map(|recorded_price| recorded_price.price)
+        .collect())
+}
+
+pub fn load_recorded_prices_from_sqlite(
+    sqlite_path: &str,
+    symbol: &str,
+) -> Result<Vec<RecordedPrice>> {
     let connection = Connection::open_with_flags(
         sqlite_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -273,7 +284,7 @@ pub fn load_prices_from_sqlite(sqlite_path: &str, symbol: &str) -> Result<Vec<De
     let mut statement = connection
         .prepare(
             "
-            SELECT price_micro_units
+            SELECT recorded_at_ms, price_micro_units
             FROM market_events
             WHERE symbol = ?1
             ORDER BY recorded_at_ms ASC, id ASC
@@ -287,8 +298,12 @@ pub fn load_prices_from_sqlite(sqlite_path: &str, symbol: &str) -> Result<Vec<De
 
     statement
         .query_map([symbol], |row| {
-            let price_micro_units: i64 = row.get(0)?;
-            Ok(Decimal::from_micro_units(price_micro_units))
+            let recorded_at_ms: i64 = row.get(0)?;
+            let price_micro_units: i64 = row.get(1)?;
+            Ok(RecordedPrice {
+                recorded_at_ms,
+                price: Decimal::from_micro_units(price_micro_units),
+            })
         })
         .map_err(|error| {
             BotError::Storage(format!(

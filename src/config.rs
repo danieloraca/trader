@@ -175,6 +175,8 @@ pub struct StrategyConfig {
     pub kind: StrategyKind,
     #[serde(default)]
     pub simple_momentum: SimpleMomentumConfig,
+    #[serde(default)]
+    pub moving_average_crossover: MovingAverageCrossoverConfig,
 }
 
 impl Default for StrategyConfig {
@@ -182,6 +184,7 @@ impl Default for StrategyConfig {
         Self {
             kind: StrategyKind::SimpleMomentum,
             simple_momentum: SimpleMomentumConfig::default(),
+            moving_average_crossover: MovingAverageCrossoverConfig::default(),
         }
     }
 }
@@ -190,6 +193,7 @@ impl Default for StrategyConfig {
 #[serde(rename_all = "snake_case")]
 pub enum StrategyKind {
     SimpleMomentum,
+    MovingAverageCrossover,
 }
 
 impl Default for StrategyKind {
@@ -208,6 +212,26 @@ pub struct SimpleMomentumConfig {
     pub buy_quantity_base: Decimal,
     #[serde(default = "default_simple_momentum_sell_quantity_base")]
     pub sell_quantity_base: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MovingAverageCrossoverConfig {
+    #[serde(default = "default_moving_average_fast_window")]
+    pub fast_window: usize,
+    #[serde(default = "default_moving_average_slow_window")]
+    pub slow_window: usize,
+    #[serde(default = "default_moving_average_quantity_base")]
+    pub quantity_base: Decimal,
+}
+
+impl Default for MovingAverageCrossoverConfig {
+    fn default() -> Self {
+        Self {
+            fast_window: default_moving_average_fast_window(),
+            slow_window: default_moving_average_slow_window(),
+            quantity_base: default_moving_average_quantity_base(),
+        }
+    }
 }
 
 impl Default for SimpleMomentumConfig {
@@ -237,6 +261,7 @@ pub enum RuntimeCommand {
     Backtest,
     BacktestSqlite,
     SweepSqlite,
+    SweepCandlesSqlite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +270,7 @@ pub struct RuntimeOptions {
     pub command: RuntimeCommand,
     pub backtest_sqlite_path: Option<String>,
     pub sweep_sqlite_path: Option<String>,
+    pub sweep_candles_sqlite_path: Option<String>,
 }
 
 impl Config {
@@ -409,6 +435,32 @@ impl Config {
             ));
         }
 
+        if self.strategy.moving_average_crossover.fast_window == 0 {
+            return Err(BotError::Config(
+                "moving average fast window must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.moving_average_crossover.slow_window == 0 {
+            return Err(BotError::Config(
+                "moving average slow window must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.moving_average_crossover.fast_window
+            >= self.strategy.moving_average_crossover.slow_window
+        {
+            return Err(BotError::Config(
+                "moving average fast window must be smaller than slow window".to_string(),
+            ));
+        }
+
+        if self.strategy.moving_average_crossover.quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "moving average quantity must be positive".to_string(),
+            ));
+        }
+
         if self.storage.sqlite_path.trim().is_empty() {
             return Err(BotError::Config(
                 "sqlite path must not be empty".to_string(),
@@ -434,6 +486,7 @@ impl RuntimeOptions {
         let mut command = RuntimeCommand::Run;
         let mut backtest_sqlite_path = None;
         let mut sweep_sqlite_path = None;
+        let mut sweep_candles_sqlite_path = None;
 
         while let Some(arg) = args.next() {
             if arg == "--config" {
@@ -459,6 +512,14 @@ impl RuntimeOptions {
                 };
                 command = RuntimeCommand::SweepSqlite;
                 sweep_sqlite_path = Some(path);
+            } else if arg == "--sweep-candles-sqlite" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--sweep-candles-sqlite requires a sqlite path".to_string(),
+                    ));
+                };
+                command = RuntimeCommand::SweepCandlesSqlite;
+                sweep_candles_sqlite_path = Some(path);
             } else {
                 return Err(BotError::Config(format!("unknown argument: {arg}")));
             }
@@ -469,6 +530,7 @@ impl RuntimeOptions {
             command,
             backtest_sqlite_path,
             sweep_sqlite_path,
+            sweep_candles_sqlite_path,
         })
     }
 }
@@ -519,6 +581,18 @@ fn default_simple_momentum_buy_quantity_base() -> Decimal {
 
 fn default_simple_momentum_sell_quantity_base() -> Decimal {
     Decimal::from_micro_units(5_000)
+}
+
+fn default_moving_average_fast_window() -> usize {
+    5
+}
+
+fn default_moving_average_slow_window() -> usize {
+    20
+}
+
+fn default_moving_average_quantity_base() -> Decimal {
+    Decimal::from_micro_units(1_000)
 }
 
 #[cfg(test)]
@@ -578,6 +652,11 @@ sell_threshold_bps = -100
 buy_quantity_base = 0.01
 sell_quantity_base = 0.005
 
+[strategy.moving_average_crossover]
+fast_window = 5
+slow_window = 20
+quantity_base = 0.001
+
 [storage]
 sqlite_path = "data/trader.sqlite"
 
@@ -635,6 +714,16 @@ verbose = true
                 .sell_quantity_base
                 .to_string(),
             "0.005"
+        );
+        assert_eq!(config.strategy.moving_average_crossover.fast_window, 5);
+        assert_eq!(config.strategy.moving_average_crossover.slow_window, 20);
+        assert_eq!(
+            config
+                .strategy
+                .moving_average_crossover
+                .quantity_base
+                .to_string(),
+            "0.001"
         );
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
         assert!(config.telemetry.verbose);
@@ -802,6 +891,28 @@ verbose = true
         assert_eq!(options.command, RuntimeCommand::SweepSqlite);
         assert_eq!(
             options.sweep_sqlite_path.as_deref(),
+            Some("/var/lib/trader/trader.sqlite")
+        );
+    }
+
+    #[test]
+    fn accepts_sweep_candles_sqlite_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "/etc/trader.toml".to_string(),
+                "--sweep-candles-sqlite".to_string(),
+                "/var/lib/trader/trader.sqlite".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.config_path, "/etc/trader.toml");
+        assert_eq!(options.command, RuntimeCommand::SweepCandlesSqlite);
+        assert_eq!(
+            options.sweep_candles_sqlite_path.as_deref(),
             Some("/var/lib/trader/trader.sqlite")
         );
     }

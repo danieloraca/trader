@@ -48,6 +48,12 @@ Sweep simple momentum parameters against recorded Pi market data:
 cargo run -- --config config/pi-paper-live.toml --sweep-sqlite /var/lib/trader/trader.sqlite
 ```
 
+Sweep moving-average crossover parameters against 1m/5m candles built from recorded Pi market data:
+
+```sh
+cargo run -- --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/trader/trader.sqlite
+```
+
 Configure cost assumptions and optional CSV output:
 
 ```toml
