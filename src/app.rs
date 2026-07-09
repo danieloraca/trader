@@ -19,16 +19,20 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Result<Self> {
-        let portfolio = Portfolio::new(
-            &config.bot.base_currency,
-            &config.bot.quote_currency,
-            config.bot.paper_starting_quote_balance,
-        );
-        let market_data = ReplayMarketDataSource::from_prices(
+        let store = SqliteStore::open(&config.storage.sqlite_path)?;
+        let portfolio = store.load_portfolio()?.unwrap_or_else(|| {
+            Portfolio::new(
+                &config.bot.base_currency,
+                &config.bot.quote_currency,
+                config.bot.paper_starting_quote_balance,
+            )
+        });
+        let replay_cursor = store.load_replay_cursor()?.unwrap_or(0);
+        let market_data = ReplayMarketDataSource::from_prices_at_cursor(
             &config.bot.symbol,
             config.market_data.replay_prices.clone(),
+            replay_cursor,
         );
-        let store = SqliteStore::open(&config.storage.sqlite_path)?;
 
         Ok(Self {
             exchange: PaperExchange::new(portfolio),
@@ -54,6 +58,9 @@ impl App {
                 self.store.record_order(&order)?;
                 println!("placed paper order: {order}");
             }
+
+            self.store.save_portfolio(self.exchange.portfolio())?;
+            self.store.save_replay_cursor(self.market_data.cursor())?;
         }
 
         println!("final paper portfolio: {}", self.exchange.portfolio());
