@@ -722,12 +722,19 @@ impl Store for SqliteStore {
                 SELECT
                     submitted.bot_order_id,
                     submitted.client_order_id,
+                    submitted.exchange_order_id,
                     submitted.symbol,
                     submitted.side,
                     submitted.quantity_base_micro_units,
                     submitted.limit_price_micro_units
                 FROM orders submitted
                 WHERE submitted.status = 'Submitted'
+                  AND submitted.id = (
+                      SELECT MAX(latest_submitted.id)
+                      FROM orders latest_submitted
+                      WHERE latest_submitted.bot_order_id = submitted.bot_order_id
+                        AND latest_submitted.status = 'Submitted'
+                  )
                   AND NOT EXISTS (
                       SELECT 1
                       FROM orders terminal
@@ -745,14 +752,16 @@ impl Store for SqliteStore {
             .query_map([], |row| {
                 let bot_order_id: i64 = row.get(0)?;
                 let client_order_id: String = row.get(1)?;
-                let symbol: String = row.get(2)?;
-                let side: String = row.get(3)?;
-                let quantity_base_micro_units: i64 = row.get(4)?;
-                let limit_price_micro_units: i64 = row.get(5)?;
+                let exchange_order_id: Option<String> = row.get(2)?;
+                let symbol: String = row.get(3)?;
+                let side: String = row.get(4)?;
+                let quantity_base_micro_units: i64 = row.get(5)?;
+                let limit_price_micro_units: i64 = row.get(6)?;
 
                 Ok((
                     bot_order_id,
                     client_order_id,
+                    exchange_order_id,
                     symbol,
                     side,
                     quantity_base_micro_units,
@@ -766,6 +775,7 @@ impl Store for SqliteStore {
                 let (
                     bot_order_id,
                     client_order_id,
+                    exchange_order_id,
                     symbol,
                     side,
                     quantity_base_micro_units,
@@ -779,16 +789,19 @@ impl Store for SqliteStore {
                 })?;
 
                 let side = parse_side(&side)?;
-                Ok(Order::submitted(
+                Ok(Order {
                     id,
-                    OrderRequest {
+                    exchange_order_id,
+                    request: OrderRequest {
                         symbol,
                         side,
                         quantity_base: Decimal::from_micro_units(quantity_base_micro_units),
                         limit_price: Decimal::from_micro_units(limit_price_micro_units),
                         client_order_id: Some(client_order_id),
                     },
-                ))
+                    status: crate::orders::OrderStatus::Submitted,
+                    status_reason: None,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -923,6 +936,22 @@ mod tests {
         }
     }
 
+    fn submitted_exchange_order(id: u64, exchange_order_id: &str) -> Order {
+        Order {
+            id,
+            exchange_order_id: Some(exchange_order_id.to_string()),
+            request: OrderRequest {
+                symbol: "BTC-USD".to_string(),
+                side: Side::Buy,
+                quantity_base: decimal(0.01),
+                limit_price: decimal(100.0),
+                client_order_id: Some(format!("test-client-{id}")),
+            },
+            status: OrderStatus::Submitted,
+            status_reason: None,
+        }
+    }
+
     #[test]
     fn creates_database_and_records_events_and_orders() {
         let path = db_path("records");
@@ -984,6 +1013,37 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].id, 7);
         assert_eq!(orders[0].status, OrderStatus::Submitted);
+        assert_eq!(
+            orders[0].request.client_order_id.as_deref(),
+            Some("test-client-7")
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn loads_latest_unresolved_submitted_order_per_bot_order_id() {
+        let path = db_path("latest-unresolved-orders");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        store
+            .record_order(&submitted_order(7))
+            .expect("local submitted order should record");
+        store
+            .record_order(&submitted_exchange_order(7, "OKRAKEN-TXID-7"))
+            .expect("exchange submitted order should record");
+
+        let orders = store
+            .load_unresolved_submitted_orders()
+            .expect("unresolved orders should load");
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].id, 7);
+        assert_eq!(
+            orders[0].exchange_order_id.as_deref(),
+            Some("OKRAKEN-TXID-7")
+        );
         assert_eq!(
             orders[0].request.client_order_id.as_deref(),
             Some("test-client-7")
