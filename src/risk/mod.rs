@@ -50,3 +50,74 @@ impl RiskManager {
         Ok(request)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RiskManager;
+    use crate::config::RiskConfig;
+    use crate::orders::Side;
+    use crate::portfolio::Portfolio;
+    use crate::strategy::Signal;
+
+    fn risk_manager() -> RiskManager {
+        RiskManager::new(RiskConfig {
+            max_order_quote_value: 500.0,
+            max_position_base: 0.25,
+        })
+    }
+
+    fn portfolio(base_balance: f64) -> Portfolio {
+        let mut portfolio = Portfolio::new("BTC", "USD", 10_000.0);
+        portfolio.base_balance = base_balance;
+        portfolio
+    }
+
+    fn signal(side: Side, quantity_base: f64, price: f64) -> Signal {
+        Signal {
+            symbol: "BTC-USD".to_string(),
+            side,
+            quantity_base,
+            price,
+            reason: "test signal".to_string(),
+        }
+    }
+
+    #[test]
+    fn approves_order_within_limits() {
+        let request = risk_manager()
+            .approve(&signal(Side::Buy, 0.01, 100.0), &portfolio(0.0))
+            .expect("signal should be approved");
+
+        assert_eq!(request.symbol, "BTC-USD");
+        assert_eq!(request.side, Side::Buy);
+        assert_eq!(request.quantity_base, 0.01);
+        assert_eq!(request.limit_price, 100.0);
+    }
+
+    #[test]
+    fn rejects_order_above_quote_limit() {
+        let error = risk_manager()
+            .approve(&signal(Side::Buy, 1.0, 501.0), &portfolio(0.0))
+            .expect_err("signal should be rejected");
+
+        assert!(error.to_string().contains("order value 501.00 exceeds max"));
+    }
+
+    #[test]
+    fn rejects_buy_that_exceeds_position_limit() {
+        let error = risk_manager()
+            .approve(&signal(Side::Buy, 0.02, 100.0), &portfolio(0.24))
+            .expect_err("signal should be rejected");
+
+        assert!(error.to_string().contains("resulting position"));
+    }
+
+    #[test]
+    fn rejects_sell_above_current_position() {
+        let error = risk_manager()
+            .approve(&signal(Side::Sell, 0.01, 100.0), &portfolio(0.005))
+            .expect_err("signal should be rejected");
+
+        assert!(error.to_string().contains("sell quantity"));
+    }
+}

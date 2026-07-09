@@ -43,3 +43,62 @@ impl Strategy for SimpleMomentumStrategy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SimpleMomentumStrategy;
+    use crate::market::{MarketEvent, PriceTick};
+    use crate::orders::Side;
+    use crate::strategy::Strategy;
+
+    fn tick(price: f64) -> MarketEvent {
+        MarketEvent::PriceTick(PriceTick::new("BTC-USD", price))
+    }
+
+    #[test]
+    fn first_tick_does_not_emit_signal() {
+        let mut strategy = SimpleMomentumStrategy::new();
+
+        let signals = strategy.on_market_event(&tick(100.0));
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn emits_buy_signal_when_price_rises_above_threshold() {
+        let mut strategy = SimpleMomentumStrategy::new();
+
+        strategy.on_market_event(&tick(100.0));
+        let signals = strategy.on_market_event(&tick(101.0));
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].side, Side::Buy);
+        assert_eq!(signals[0].quantity_base, 0.01);
+        assert_eq!(signals[0].price, 101.0);
+        assert!(signals[0].reason.contains("price rose"));
+    }
+
+    #[test]
+    fn emits_sell_signal_when_price_falls_below_threshold() {
+        let mut strategy = SimpleMomentumStrategy::new();
+
+        strategy.on_market_event(&tick(100.0));
+        let signals = strategy.on_market_event(&tick(98.0));
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].side, Side::Sell);
+        assert_eq!(signals[0].quantity_base, 0.005);
+        assert_eq!(signals[0].price, 98.0);
+        assert!(signals[0].reason.contains("price fell"));
+    }
+
+    #[test]
+    fn ignores_price_change_inside_thresholds() {
+        let mut strategy = SimpleMomentumStrategy::new();
+
+        strategy.on_market_event(&tick(100.0));
+        let signals = strategy.on_market_event(&tick(100.2));
+
+        assert!(signals.is_empty());
+    }
+}
