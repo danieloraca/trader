@@ -16,6 +16,7 @@ const FAST_WINDOWS: [usize; 4] = [3, 5, 8, 10];
 const SLOW_WINDOWS: [usize; 4] = [15, 30, 60, 120];
 const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
 const TRAIN_SPLIT_BPS: usize = 7_000;
+const MIN_TEST_FILLS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct SweepReport {
@@ -200,9 +201,12 @@ fn compare_sweep_results(lhs: &SweepResult, rhs: &SweepResult) -> Ordering {
 fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult) -> Ordering {
     let lhs_traded = lhs.train_filled_order_count > 0 && lhs.test_filled_order_count > 0;
     let rhs_traded = rhs.train_filled_order_count > 0 && rhs.test_filled_order_count > 0;
+    let lhs_has_enough_test_fills = lhs.test_filled_order_count >= MIN_TEST_FILLS;
+    let rhs_has_enough_test_fills = rhs.test_filled_order_count >= MIN_TEST_FILLS;
 
-    rhs_traded
-        .cmp(&lhs_traded)
+    rhs_has_enough_test_fills
+        .cmp(&lhs_has_enough_test_fills)
+        .then_with(|| rhs_traded.cmp(&lhs_traded))
         .then_with(|| rhs.test_profit_loss_quote.cmp(&lhs.test_profit_loss_quote))
         .then_with(|| {
             rhs.train_profit_loss_quote
@@ -252,7 +256,8 @@ fn save_candle_sweep_report(
                 symbol TEXT NOT NULL,
                 runnable_count INTEGER NOT NULL,
                 skipped_under_warmed_count INTEGER NOT NULL,
-                train_split_bps INTEGER NOT NULL DEFAULT 7000
+                train_split_bps INTEGER NOT NULL DEFAULT 7000,
+                min_test_fills INTEGER NOT NULL DEFAULT 3
             );
 
             CREATE TABLE IF NOT EXISTS strategy_research_results (
@@ -320,9 +325,10 @@ fn save_candle_sweep_report(
                 symbol,
                 runnable_count,
                 skipped_under_warmed_count,
-                train_split_bps
+                train_split_bps,
+                min_test_fills
             )
-            VALUES (?1, 'candle_ma_sweep_train_test', ?2, ?3, ?4, ?5)
+            VALUES (?1, 'candle_ma_sweep_train_test', ?2, ?3, ?4, ?5, ?6)
             ",
             params![
                 report.recorded_at_ms,
@@ -333,6 +339,7 @@ fn save_candle_sweep_report(
                     "skipped under-warmed count"
                 )?,
                 usize_to_i64(TRAIN_SPLIT_BPS, "train split bps")?,
+                usize_to_i64(MIN_TEST_FILLS, "minimum test fills")?,
             ],
         )
         .map_err(|error| {
@@ -453,6 +460,12 @@ fn ensure_strategy_research_schema(connection: &Connection) -> Result<()> {
         "strategy_research_runs",
         "train_split_bps",
         "INTEGER NOT NULL DEFAULT 7000",
+    )?;
+    add_column_if_missing(
+        connection,
+        "strategy_research_runs",
+        "min_test_fills",
+        "INTEGER NOT NULL DEFAULT 3",
     )?;
 
     for (column, definition) in [
@@ -667,6 +680,7 @@ impl Display for CandleSweepReport {
             "Skipped under-warmed combinations: {}",
             self.skipped_under_warmed_count
         )?;
+        writeln!(f, "Minimum test fills for ranking: {MIN_TEST_FILLS}")?;
         if self.results.is_empty() {
             writeln!(
                 f,
@@ -676,7 +690,7 @@ impl Display for CandleSweepReport {
         }
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
             "interval",
             "candles",
             "train",
@@ -684,6 +698,7 @@ impl Display for CandleSweepReport {
             "fast",
             "slow",
             "qty",
+            "quality",
             "train_pnl",
             "test_pnl",
             "train_hold",
@@ -697,7 +712,7 @@ impl Display for CandleSweepReport {
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_candle_count,
@@ -705,6 +720,11 @@ impl Display for CandleSweepReport {
                 result.fast_window,
                 result.slow_window,
                 result.quantity_base,
+                if result.test_filled_order_count >= MIN_TEST_FILLS {
+                    "ok"
+                } else {
+                    "thin"
+                },
                 result.train_profit_loss_quote,
                 result.test_profit_loss_quote,
                 result.train_buy_and_hold_delta_quote,
@@ -724,7 +744,7 @@ impl Display for CandleSweepReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{run, run_candles};
+    use super::{MIN_TEST_FILLS, run, run_candles};
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
         StorageConfig, StrategyConfig, TelemetryConfig,
@@ -865,8 +885,16 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("research results should count");
+        let min_test_fills: i64 = connection
+            .query_row(
+                "SELECT min_test_fills FROM strategy_research_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("min test fills should save");
         assert_eq!(saved_runs, 1);
         assert_eq!(saved_results, 24);
+        assert_eq!(min_test_fills, 3);
         drop(connection);
 
         fs::remove_file(path).expect("test database should be removed");
@@ -977,6 +1005,65 @@ mod tests {
                 .iter()
                 .all(|result| result.train_filled_order_count == 0
                     || result.test_filled_order_count == 0)
+        );
+
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn ranks_candle_sweep_rows_with_enough_test_fills_first() {
+        let path = db_path("sqlite-candles-min-test-fills");
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute(
+                "
+                CREATE TABLE market_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                )
+                ",
+                [],
+            )
+            .expect("market events table should create");
+
+        for index in 0..360_i64 {
+            let cycle = index % 24;
+            let price_micro_units = if cycle < 12 {
+                100_000_000 + (cycle * 750_000)
+            } else {
+                109_000_000 - ((cycle - 12) * 750_000)
+            };
+            connection
+                .execute(
+                    "
+                    INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
+                    VALUES (?1, 'BTC-USD', ?2)
+                    ",
+                    (index * 60_000, price_micro_units),
+                )
+                .expect("market event should insert");
+        }
+        drop(connection);
+
+        let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
+            .expect("candle sweep should run");
+        let first_thin_index = report
+            .results
+            .iter()
+            .position(|result| result.test_filled_order_count < MIN_TEST_FILLS)
+            .unwrap_or(report.results.len());
+
+        assert!(
+            report.results[..first_thin_index]
+                .iter()
+                .all(|result| result.test_filled_order_count >= MIN_TEST_FILLS)
+        );
+        assert!(
+            report.results[first_thin_index..]
+                .iter()
+                .all(|result| result.test_filled_order_count < MIN_TEST_FILLS)
         );
 
         fs::remove_file(path).expect("test database should be removed");

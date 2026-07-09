@@ -74,6 +74,7 @@ struct StrategyResearchRunRow {
     runnable_count: i64,
     skipped_under_warmed_count: i64,
     train_split_bps: i64,
+    min_test_fills: i64,
 }
 
 #[derive(Debug)]
@@ -344,6 +345,12 @@ fn latest_strategy_research_run(
         } else {
             "7000"
         };
+    let min_test_fills_projection =
+        if column_exists(connection, "strategy_research_runs", "min_test_fills")? {
+            "min_test_fills"
+        } else {
+            "3"
+        };
 
     connection
         .query_row(
@@ -355,7 +362,8 @@ fn latest_strategy_research_run(
                 symbol,
                 runnable_count,
                 skipped_under_warmed_count,
-                {split_projection}
+                {split_projection},
+                {min_test_fills_projection}
             FROM strategy_research_runs
             ORDER BY id DESC
             LIMIT 1
@@ -370,6 +378,7 @@ fn latest_strategy_research_run(
                     runnable_count: row.get(3)?,
                     skipped_under_warmed_count: row.get(4)?,
                     train_split_bps: row.get(5)?,
+                    min_test_fills: row.get(6)?,
                 })
             },
         )
@@ -531,6 +540,7 @@ th, td {{ border-bottom: 1px solid #30363d; padding: 10px; text-align: left; fon
 th {{ color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
 tr:last-child td {{ border-bottom: 0; }}
 .status {{ display: inline-block; padding: 3px 7px; border-radius: 999px; background: #243b2a; color: #9ee493; font-size: 12px; }}
+.status.thin {{ background: #4a351d; color: #f0c36a; }}
 @media (max-width: 720px) {{ main {{ padding: 16px; }} table {{ display: block; overflow-x: auto; }} .subgrid {{ grid-template-columns: 1fr; }} }}
 </style>
 <script>
@@ -813,6 +823,7 @@ fn render_strategy_research(
 <div class="tile"><div class="label">Runnable</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Skipped Warmup</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Train/Test</div><div class="value">{}% / {}%</div></div>
+<div class="tile"><div class="label">Min Test Fills</div><div class="value">{}</div></div>
 </section>"#,
         run.recorded_at_ms,
         escape_html(&time_fallback(Some(run.recorded_at_ms))),
@@ -822,6 +833,7 @@ fn render_strategy_research(
         run.skipped_under_warmed_count,
         run.train_split_bps / 100,
         100 - (run.train_split_bps / 100),
+        run.min_test_fills,
     );
 
     html.push_str(
@@ -833,6 +845,7 @@ fn render_strategy_research(
 <th>Candles</th>
 <th>MA</th>
 <th>Qty</th>
+<th>Quality</th>
 <th>Train P/L</th>
 <th>Test P/L</th>
 <th>Train Ret</th>
@@ -851,10 +864,20 @@ fn render_strategy_research(
 
     if results.is_empty() {
         html.push_str(
-            r#"<tr><td colspan="15" class="muted">No runnable train/test sweep rows yet.</td></tr>"#,
+            r#"<tr><td colspan="17" class="muted">No runnable train/test sweep rows yet.</td></tr>"#,
         );
     } else {
         for result in results {
+            let quality_class = if result.test_filled_order_count >= run.min_test_fills {
+                "status"
+            } else {
+                "status thin"
+            };
+            let quality_label = if result.test_filled_order_count >= run.min_test_fills {
+                "ok"
+            } else {
+                "thin"
+            };
             let _ = write!(
                 html,
                 r#"<tr>
@@ -863,6 +886,7 @@ fn render_strategy_research(
 <td>{} <span class="muted">{} / {}</span></td>
 <td>{}/{}</td>
 <td>{}</td>
+<td><span class="{}">{}</span></td>
 <td>{}</td>
 <td>{}</td>
 <td>{:.2}%</td>
@@ -883,6 +907,8 @@ fn render_strategy_research(
                 result.fast_window,
                 result.slow_window,
                 escape_html(&format_micro_units(result.quantity_base_micro_units)),
+                quality_class,
+                quality_label,
                 escape_html(&format_micro_units(result.train_pnl_micro_units)),
                 escape_html(&format_micro_units(result.test_pnl_micro_units)),
                 result.train_return_pct,
