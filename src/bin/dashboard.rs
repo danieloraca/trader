@@ -553,6 +553,7 @@ th, td {{ border-bottom: 1px solid #30363d; padding: 10px; text-align: left; fon
 th {{ color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
 tr:last-child td {{ border-bottom: 0; }}
 .status {{ display: inline-block; padding: 3px 7px; border-radius: 999px; background: #243b2a; color: #9ee493; font-size: 12px; }}
+.status.candidate {{ background: #123f2a; color: #6ee7a8; }}
 .status.thin {{ background: #4a351d; color: #f0c36a; }}
 @media (max-width: 720px) {{ main {{ padding: 16px; }} table {{ display: block; overflow-x: auto; }} .subgrid {{ grid-template-columns: 1fr; }} }}
 </style>
@@ -882,12 +883,19 @@ fn render_strategy_research(
         );
     } else {
         for result in results {
-            let quality_class = if result.test_filled_order_count >= run.min_test_fills {
+            let is_candidate = result.test_filled_order_count >= run.min_test_fills
+                && result.test_pnl_micro_units > 0
+                && result.test_buy_and_hold_delta_micro_units > 0;
+            let quality_class = if is_candidate {
+                "status candidate"
+            } else if result.test_filled_order_count >= run.min_test_fills {
                 "status"
             } else {
                 "status thin"
             };
-            let quality_label = if result.test_filled_order_count >= run.min_test_fills {
+            let quality_label = if is_candidate {
+                "candidate"
+            } else if result.test_filled_order_count >= run.min_test_fills {
                 "ok"
             } else {
                 "thin"

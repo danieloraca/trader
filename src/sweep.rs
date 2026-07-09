@@ -254,13 +254,16 @@ fn compare_sweep_results(lhs: &SweepResult, rhs: &SweepResult) -> Ordering {
 }
 
 fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult) -> Ordering {
+    let lhs_is_candidate = is_candidate(lhs);
+    let rhs_is_candidate = is_candidate(rhs);
     let lhs_traded = lhs.train_filled_order_count > 0 && lhs.test_filled_order_count > 0;
     let rhs_traded = rhs.train_filled_order_count > 0 && rhs.test_filled_order_count > 0;
     let lhs_has_enough_test_fills = lhs.test_filled_order_count >= MIN_TEST_FILLS;
     let rhs_has_enough_test_fills = rhs.test_filled_order_count >= MIN_TEST_FILLS;
 
-    rhs_has_enough_test_fills
-        .cmp(&lhs_has_enough_test_fills)
+    rhs_is_candidate
+        .cmp(&lhs_is_candidate)
+        .then_with(|| rhs_has_enough_test_fills.cmp(&lhs_has_enough_test_fills))
         .then_with(|| rhs_traded.cmp(&lhs_traded))
         .then_with(|| {
             rhs.test_buy_and_hold_delta_quote
@@ -283,6 +286,22 @@ fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult
             rhs.test_filled_order_count
                 .cmp(&lhs.test_filled_order_count)
         })
+}
+
+fn is_candidate(result: &CandleSweepResult) -> bool {
+    result.test_filled_order_count >= MIN_TEST_FILLS
+        && result.test_profit_loss_quote > Decimal::ZERO
+        && result.test_buy_and_hold_delta_quote > Decimal::ZERO
+}
+
+fn quality_label(result: &CandleSweepResult) -> &'static str {
+    if is_candidate(result) {
+        "candidate"
+    } else if result.test_filled_order_count >= MIN_TEST_FILLS {
+        "ok"
+    } else {
+        "thin"
+    }
 }
 
 fn split_train_test(prices: &[Decimal]) -> (Vec<Decimal>, Vec<Decimal>) {
@@ -795,11 +814,7 @@ impl Display for CandleSweepReport {
                 result.strategy_kind,
                 result.parameter_summary,
                 result.quantity_base,
-                if result.test_filled_order_count >= MIN_TEST_FILLS {
-                    "ok"
-                } else {
-                    "thin"
-                },
+                quality_label(result),
                 result.train_profit_loss_quote,
                 result.test_profit_loss_quote,
                 result.train_buy_and_hold_delta_quote,
@@ -819,7 +834,9 @@ impl Display for CandleSweepReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_TEST_FILLS, run, run_candles};
+    use super::{
+        CandleSweepResult, MIN_TEST_FILLS, compare_candle_sweep_results, run, run_candles,
+    };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
         StorageConfig, StrategyConfig, TelemetryConfig,
@@ -869,6 +886,40 @@ mod tests {
         }
     }
 
+    fn candle_result(test_pnl: &str, test_alpha: &str, test_fills: usize) -> CandleSweepResult {
+        CandleSweepResult {
+            strategy_kind: "test".to_string(),
+            parameter_summary: "x".to_string(),
+            interval_seconds: 60,
+            candle_count: 100,
+            train_candle_count: 70,
+            test_candle_count: 30,
+            fast_window: 1,
+            slow_window: 2,
+            quantity_base: decimal("0.001"),
+            train_profit_loss_quote: decimal("1"),
+            train_return_pct: 0.01,
+            train_buy_and_hold_delta_quote: decimal("1"),
+            train_max_drawdown_pct: 0.0,
+            train_filled_order_count: 3,
+            train_rejected_order_count: 0,
+            train_buy_count: 2,
+            train_sell_count: 1,
+            train_exposure_pct: 10.0,
+            train_final_base_balance: Decimal::ZERO,
+            test_profit_loss_quote: decimal(test_pnl),
+            test_return_pct: 0.01,
+            test_buy_and_hold_delta_quote: decimal(test_alpha),
+            test_max_drawdown_pct: 0.0,
+            test_filled_order_count: test_fills,
+            test_rejected_order_count: 0,
+            test_buy_count: 2,
+            test_sell_count: 1,
+            test_exposure_pct: 10.0,
+            test_final_base_balance: Decimal::ZERO,
+        }
+    }
+
     #[test]
     fn ranks_parameter_combinations_from_sqlite_events() {
         let path = db_path("sqlite-source");
@@ -900,6 +951,27 @@ mod tests {
         assert_eq!(report.results.len(), 168);
 
         fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn ranks_candidate_rows_before_non_candidates() {
+        let candidate = candle_result("1", "1", MIN_TEST_FILLS);
+        let no_profit = candle_result("-1", "10", MIN_TEST_FILLS);
+        let no_alpha = candle_result("10", "-1", MIN_TEST_FILLS);
+        let thin = candle_result("10", "10", MIN_TEST_FILLS - 1);
+
+        assert_eq!(
+            compare_candle_sweep_results(&candidate, &no_profit),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_candle_sweep_results(&candidate, &no_alpha),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_candle_sweep_results(&candidate, &thin),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
