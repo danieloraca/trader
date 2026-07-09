@@ -25,10 +25,6 @@ impl ReplayMarketDataSource {
 
         Self::new_at_cursor(events, cursor)
     }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
 }
 
 impl MarketDataSource for ReplayMarketDataSource {
@@ -40,6 +36,10 @@ impl MarketDataSource for ReplayMarketDataSource {
         }
 
         Ok(event)
+    }
+
+    fn replay_cursor(&self) -> Option<usize> {
+        Some(self.cursor)
     }
 }
 
@@ -92,7 +92,7 @@ mod tests {
             .expect("event should exist");
 
         assert_eq!(event.price().to_string(), "102");
-        assert_eq!(source.cursor(), 3);
+        assert_eq!(source.replay_cursor(), Some(3));
         assert!(
             source
                 .next_event()
@@ -106,7 +106,7 @@ mod tests {
         let mut source =
             ReplayMarketDataSource::from_prices_at_cursor("BTC-USD", [decimal(100.0)], 99);
 
-        assert_eq!(source.cursor(), 1);
+        assert_eq!(source.replay_cursor(), Some(1));
         assert!(
             source
                 .next_event()

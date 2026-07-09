@@ -1,7 +1,7 @@
-use crate::config::{Config, ExchangeKind};
+use crate::config::{Config, ExchangeKind, MarketDataKind};
 use crate::error::{BotError, Result};
 use crate::exchange::{Exchange, KrakenExchange, PaperExchange};
-use crate::market::{MarketDataSource, ReplayMarketDataSource};
+use crate::market::{KrakenTickerMarketDataSource, MarketDataSource, ReplayMarketDataSource};
 use crate::orders::{OrderManager, OrderRequest, OrderStatus};
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 pub struct App {
     config: Config,
     exchange: Box<dyn Exchange>,
-    market_data: ReplayMarketDataSource,
+    market_data: Box<dyn MarketDataSource>,
     order_manager: OrderManager,
     risk: RiskManager,
     run_id: String,
@@ -35,11 +35,14 @@ impl App {
         });
         let replay_cursor = store.load_replay_cursor()?.unwrap_or(0);
         let next_order_id = store.load_next_order_id()?.unwrap_or(1);
-        let market_data = ReplayMarketDataSource::from_prices_at_cursor(
-            &config.bot.symbol,
-            config.market_data.replay_prices.clone(),
-            replay_cursor,
-        );
+        let market_data: Box<dyn MarketDataSource> = match config.market_data.kind {
+            MarketDataKind::Replay => Box::new(ReplayMarketDataSource::from_prices_at_cursor(
+                &config.bot.symbol,
+                config.market_data.replay_prices.clone(),
+                replay_cursor,
+            )),
+            MarketDataKind::KrakenTicker => Box::new(KrakenTickerMarketDataSource::new(&config)),
+        };
 
         let mut exchange: Box<dyn Exchange> = match config.exchange.kind {
             ExchangeKind::Paper => Box::new(PaperExchange::new(portfolio)),
@@ -53,7 +56,7 @@ impl App {
         info!(
             run_id = %run_id,
             symbol = %config.bot.symbol,
-            replay_cursor,
+            replay_cursor = ?market_data.replay_cursor(),
             next_order_id,
             "app initialized"
         );
@@ -82,20 +85,35 @@ impl App {
         let mut logged_idle = false;
 
         loop {
-            let Some(event) = self.market_data.next_event()? else {
-                self.store.save_heartbeat(&self.run_id)?;
-                if !logged_idle {
-                    info!(
-                        run_id = %self.run_id,
-                        replay_cursor = self.market_data.cursor(),
-                        idle_sleep_ms = self.config.market_data.idle_sleep_ms,
-                        "market data source idle"
-                    );
-                    logged_idle = true;
-                }
+            let event = match self.market_data.next_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    self.store.save_heartbeat(&self.run_id)?;
+                    if !logged_idle {
+                        info!(
+                            run_id = %self.run_id,
+                            replay_cursor = ?self.market_data.replay_cursor(),
+                            idle_sleep_ms = self.config.market_data.idle_sleep_ms,
+                            "market data source idle"
+                        );
+                        logged_idle = true;
+                    }
 
-                thread::sleep(idle_sleep);
-                continue;
+                    thread::sleep(idle_sleep);
+                    continue;
+                }
+                Err(BotError::MarketData(message)) => {
+                    warn!(
+                        run_id = %self.run_id,
+                        retry_sleep_ms = self.config.market_data.idle_sleep_ms,
+                        error = %message,
+                        "market data source failed; retrying"
+                    );
+                    self.store.save_heartbeat(&self.run_id)?;
+                    thread::sleep(idle_sleep);
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
 
             logged_idle = false;
@@ -103,7 +121,7 @@ impl App {
                 run_id = %self.run_id,
                 symbol = %event.symbol(),
                 price = %event.price(),
-                replay_cursor = self.market_data.cursor(),
+                replay_cursor = ?self.market_data.replay_cursor(),
                 "market event received"
             );
             self.store.record_market_event(&event)?;
@@ -154,7 +172,9 @@ impl App {
             }
 
             self.store.save_portfolio(self.exchange.portfolio())?;
-            self.store.save_replay_cursor(self.market_data.cursor())?;
+            if let Some(replay_cursor) = self.market_data.replay_cursor() {
+                self.store.save_replay_cursor(replay_cursor)?;
+            }
             self.store.save_heartbeat(&self.run_id)?;
         }
     }

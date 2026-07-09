@@ -85,8 +85,46 @@ impl Default for KrakenConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketDataConfig {
+    #[serde(default)]
+    pub kind: MarketDataKind,
+    #[serde(default)]
     pub replay_prices: Vec<Decimal>,
     pub idle_sleep_ms: u64,
+    #[serde(default)]
+    pub kraken: KrakenMarketDataConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketDataKind {
+    Replay,
+    KrakenTicker,
+}
+
+impl Default for MarketDataKind {
+    fn default() -> Self {
+        Self::Replay
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KrakenMarketDataConfig {
+    #[serde(default = "default_kraken_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_kraken_pair")]
+    pub pair: String,
+    #[serde(default = "default_kraken_ticker_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for KrakenMarketDataConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_kraken_base_url(),
+            pair: default_kraken_pair(),
+            poll_interval_ms: default_kraken_ticker_poll_interval_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,7 +217,9 @@ impl Config {
             }
         }
 
-        if self.market_data.replay_prices.is_empty() {
+        if self.market_data.kind == MarketDataKind::Replay
+            && self.market_data.replay_prices.is_empty()
+        {
             return Err(BotError::Config(
                 "market data replay prices must not be empty".to_string(),
             ));
@@ -200,6 +240,26 @@ impl Config {
             return Err(BotError::Config(
                 "market data idle sleep must be positive".to_string(),
             ));
+        }
+
+        if self.market_data.kind == MarketDataKind::KrakenTicker {
+            if self.market_data.kraken.base_url.trim().is_empty() {
+                return Err(BotError::Config(
+                    "kraken market data base url must not be empty".to_string(),
+                ));
+            }
+
+            if self.market_data.kraken.pair.trim().is_empty() {
+                return Err(BotError::Config(
+                    "kraken market data pair must not be empty".to_string(),
+                ));
+            }
+
+            if self.market_data.kraken.poll_interval_ms == 0 {
+                return Err(BotError::Config(
+                    "kraken market data poll interval must be positive".to_string(),
+                ));
+            }
         }
 
         if self.risk.max_order_quote_value <= Decimal::ZERO {
@@ -238,6 +298,10 @@ fn default_kraken_api_key_env() -> String {
 
 fn default_kraken_api_secret_env() -> String {
     "KRAKEN_API_SECRET".to_string()
+}
+
+fn default_kraken_ticker_poll_interval_ms() -> u64 {
+    5_000
 }
 
 fn config_path_from_args_and_env(
@@ -284,8 +348,14 @@ api_secret_env = "KRAKEN_API_SECRET"
 enable_order_placement = false
 
 [market_data]
+kind = "replay"
 replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
 idle_sleep_ms = 1000
+
+[market_data.kraken]
+base_url = "https://api.kraken.com"
+pair = "XBTUSD"
+poll_interval_ms = 5000
 
 [risk]
 max_order_quote_value = 500.0
@@ -309,6 +379,7 @@ verbose = true
         assert_eq!(config.exchange.kind, super::ExchangeKind::Paper);
         assert_eq!(config.exchange.kraken.pair, "XBTUSD");
         assert!(!config.exchange.kraken.enable_order_placement);
+        assert_eq!(config.market_data.kind, super::MarketDataKind::Replay);
         assert_eq!(
             config
                 .market_data
@@ -319,6 +390,8 @@ verbose = true
             vec!["100", "101", "102", "101.5", "99"]
         );
         assert_eq!(config.market_data.idle_sleep_ms, 1_000);
+        assert_eq!(config.market_data.kraken.pair, "XBTUSD");
+        assert_eq!(config.market_data.kraken.poll_interval_ms, 5_000);
         assert_eq!(config.risk.max_order_quote_value.to_string(), "500");
         assert_eq!(config.risk.max_position_base.to_string(), "0.25");
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
@@ -361,6 +434,20 @@ verbose = true
                 .to_string()
                 .contains("replay prices must not be empty")
         );
+    }
+
+    #[test]
+    fn allows_empty_replay_prices_for_kraken_ticker_market_data() {
+        let valid_config = VALID_CONFIG
+            .replace("kind = \"replay\"", "kind = \"kraken_ticker\"")
+            .replace(
+                "replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]",
+                "replay_prices = []",
+            );
+        let config = Config::from_toml_str(&valid_config).expect("config should parse");
+
+        assert_eq!(config.market_data.kind, super::MarketDataKind::KrakenTicker);
+        assert!(config.market_data.replay_prices.is_empty());
     }
 
     #[test]

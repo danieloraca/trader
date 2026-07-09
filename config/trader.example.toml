@@ -15,8 +15,14 @@ api_secret_env = "KRAKEN_API_SECRET"
 enable_order_placement = false
 
 [market_data]
+kind = "replay"
 replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
 idle_sleep_ms = 1000
+
+[market_data.kraken]
+base_url = "https://api.kraken.com"
+pair = "XBTUSD"
+poll_interval_ms = 5000
 
 [risk]
 max_order_quote_value = 500.0

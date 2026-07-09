@@ -1,6 +1,8 @@
+mod kraken;
 mod replay;
 mod ticker;
 
+pub use kraken::KrakenTickerMarketDataSource;
 pub use replay::ReplayMarketDataSource;
 pub use ticker::PriceTick;
 
@@ -14,6 +16,10 @@ pub enum MarketEvent {
 
 pub trait MarketDataSource {
     fn next_event(&mut self) -> Result<Option<MarketEvent>>;
+
+    fn replay_cursor(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl MarketEvent {
