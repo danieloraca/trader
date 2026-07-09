@@ -36,8 +36,11 @@ impl App {
             replay_cursor,
         );
 
+        let exchange = PaperExchange::new(portfolio);
+        let _synced_portfolio = exchange.sync_portfolio()?;
+
         Ok(Self {
-            exchange: PaperExchange::new(portfolio),
+            exchange,
             market_data,
             order_manager: OrderManager::new_at(next_order_id),
             risk: RiskManager::new(config.risk.clone()),
@@ -63,7 +66,18 @@ impl App {
                 for order in transitions {
                     self.store.record_order(&order)?;
                     match order.status {
-                        OrderStatus::Filled => println!("filled paper order: {order}"),
+                        OrderStatus::Filled => {
+                            if let Some(exchange_order_id) = order.exchange_order_id {
+                                let exchange_order =
+                                    self.exchange.order_status(exchange_order_id)?;
+                                println!(
+                                    "filled paper order: {order} ({:?})",
+                                    exchange_order.status
+                                );
+                            } else {
+                                println!("filled paper order: {order}");
+                            }
+                        }
                         OrderStatus::Rejected => println!("rejected paper order: {order}"),
                         _ => {}
                     }

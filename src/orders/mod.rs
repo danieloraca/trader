@@ -15,6 +15,8 @@ pub enum OrderStatus {
     Submitted,
     Filled,
     Rejected,
+    #[allow(dead_code)]
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]

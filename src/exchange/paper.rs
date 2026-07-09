@@ -2,9 +2,11 @@ use crate::error::{BotError, Result};
 use crate::exchange::Exchange;
 use crate::orders::{ExchangeOrder, OrderRequest, OrderStatus, Side};
 use crate::portfolio::Portfolio;
+use std::collections::HashMap;
 
 pub struct PaperExchange {
     portfolio: Portfolio,
+    orders: HashMap<u64, ExchangeOrder>,
     next_order_id: u64,
 }
 
@@ -12,6 +14,7 @@ impl PaperExchange {
     pub fn new(portfolio: Portfolio) -> Self {
         Self {
             portfolio,
+            orders: HashMap::new(),
             next_order_id: 1,
         }
     }
@@ -26,6 +29,10 @@ impl PaperExchange {
 impl Exchange for PaperExchange {
     fn portfolio(&self) -> &Portfolio {
         &self.portfolio
+    }
+
+    fn sync_portfolio(&self) -> Result<Portfolio> {
+        Ok(self.portfolio.clone())
     }
 
     fn place_order(&mut self, request: OrderRequest) -> Result<ExchangeOrder> {
@@ -57,10 +64,43 @@ impl Exchange for PaperExchange {
             }
         }
 
-        Ok(ExchangeOrder {
+        let order = ExchangeOrder {
             exchange_order_id: self.next_id(),
             status: OrderStatus::Filled,
-        })
+        };
+        self.orders.insert(order.exchange_order_id, order.clone());
+
+        Ok(order)
+    }
+
+    fn order_status(&self, exchange_order_id: u64) -> Result<ExchangeOrder> {
+        self.orders
+            .get(&exchange_order_id)
+            .cloned()
+            .ok_or_else(|| BotError::Exchange(format!("unknown order id {exchange_order_id}")))
+    }
+
+    fn cancel_order(&mut self, exchange_order_id: u64) -> Result<ExchangeOrder> {
+        let order = self.order_status(exchange_order_id)?;
+
+        match order.status {
+            OrderStatus::Submitted => {
+                let cancelled_order = ExchangeOrder {
+                    exchange_order_id,
+                    status: OrderStatus::Cancelled,
+                };
+                self.orders
+                    .insert(exchange_order_id, cancelled_order.clone());
+                Ok(cancelled_order)
+            }
+            OrderStatus::Cancelled => Ok(order),
+            OrderStatus::Filled => Err(BotError::Exchange(format!(
+                "cannot cancel filled order {exchange_order_id}"
+            ))),
+            OrderStatus::Rejected => Err(BotError::Exchange(format!(
+                "cannot cancel rejected order {exchange_order_id}"
+            ))),
+        }
     }
 }
 
@@ -102,6 +142,20 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(exchange.portfolio().base_balance, 0.5);
         assert_eq!(exchange.portfolio().quote_balance, 950.0);
+    }
+
+    #[test]
+    fn sync_portfolio_returns_latest_balances() {
+        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let mut exchange = PaperExchange::new(portfolio);
+
+        exchange
+            .place_order(buy_request(0.5, 100.0))
+            .expect("buy should fill");
+        let synced = exchange.sync_portfolio().expect("sync should work");
+
+        assert_eq!(synced.base_balance, 0.5);
+        assert_eq!(synced.quote_balance, 950.0);
     }
 
     #[test]
@@ -147,5 +201,48 @@ mod tests {
         assert!(error.to_string().contains("insufficient base balance"));
         assert_eq!(exchange.portfolio().base_balance, 0.0);
         assert_eq!(exchange.portfolio().quote_balance, 1_000.0);
+    }
+
+    #[test]
+    fn polls_order_status_for_known_order() {
+        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let mut exchange = PaperExchange::new(portfolio);
+        let order = exchange
+            .place_order(buy_request(0.5, 100.0))
+            .expect("buy should fill");
+
+        let status = exchange
+            .order_status(order.exchange_order_id)
+            .expect("status should exist");
+
+        assert_eq!(status.exchange_order_id, order.exchange_order_id);
+        assert_eq!(status.status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn rejects_status_poll_for_unknown_order() {
+        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let exchange = PaperExchange::new(portfolio);
+
+        let error = exchange
+            .order_status(99)
+            .expect_err("unknown order should fail");
+
+        assert!(error.to_string().contains("unknown order id 99"));
+    }
+
+    #[test]
+    fn rejects_cancel_for_filled_order() {
+        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let mut exchange = PaperExchange::new(portfolio);
+        let order = exchange
+            .place_order(buy_request(0.5, 100.0))
+            .expect("buy should fill");
+
+        let error = exchange
+            .cancel_order(order.exchange_order_id)
+            .expect_err("filled order cannot cancel");
+
+        assert!(error.to_string().contains("cannot cancel filled order"));
     }
 }
