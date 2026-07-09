@@ -10,6 +10,7 @@ pub struct Config {
     pub bot: BotConfig,
     pub market_data: MarketDataConfig,
     pub risk: RiskConfig,
+    pub storage: StorageConfig,
     pub telemetry: TelemetryConfig,
 }
 
@@ -30,6 +31,11 @@ pub struct MarketDataConfig {
 pub struct RiskConfig {
     pub max_order_quote_value: f64,
     pub max_position_base: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    pub sqlite_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +121,12 @@ impl Config {
             ));
         }
 
+        if self.storage.sqlite_path.trim().is_empty() {
+            return Err(BotError::Config(
+                "sqlite path must not be empty".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -137,6 +149,9 @@ replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
 max_order_quote_value = 500.0
 max_position_base = 0.25
 
+[storage]
+sqlite_path = "data/trader.sqlite"
+
 [telemetry]
 verbose = true
 "#;
@@ -155,6 +170,7 @@ verbose = true
         );
         assert_eq!(config.risk.max_order_quote_value, 500.0);
         assert_eq!(config.risk.max_position_base, 0.25);
+        assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
         assert!(config.telemetry.verbose);
     }
 
@@ -209,5 +225,14 @@ verbose = true
                 .to_string()
                 .contains("replay prices must be positive finite values")
         );
+    }
+
+    #[test]
+    fn rejects_empty_sqlite_path() {
+        let invalid_config =
+            VALID_CONFIG.replace("sqlite_path = \"data/trader.sqlite\"", "sqlite_path = \"\"");
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(error.to_string().contains("sqlite path must not be empty"));
     }
 }

@@ -5,7 +5,7 @@ use crate::market::{MarketDataSource, ReplayMarketDataSource};
 use crate::orders::OrderRequest;
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
-use crate::storage::{InMemoryStore, Store};
+use crate::storage::{SqliteStore, Store};
 use crate::strategy::{SimpleMomentumStrategy, Strategy};
 
 pub struct App {
@@ -14,7 +14,7 @@ pub struct App {
     market_data: ReplayMarketDataSource,
     risk: RiskManager,
     strategy: SimpleMomentumStrategy,
-    store: InMemoryStore,
+    store: SqliteStore,
 }
 
 impl App {
@@ -28,13 +28,14 @@ impl App {
             &config.bot.symbol,
             config.market_data.replay_prices.clone(),
         );
+        let store = SqliteStore::open(&config.storage.sqlite_path)?;
 
         Ok(Self {
             exchange: PaperExchange::new(portfolio),
             market_data,
             risk: RiskManager::new(config.risk.clone()),
             strategy: SimpleMomentumStrategy::new(),
-            store: InMemoryStore::new(),
+            store,
             config,
         })
     }

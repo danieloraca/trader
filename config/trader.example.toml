@@ -11,5 +11,8 @@ replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
 max_order_quote_value = 500.0
 max_position_base = 0.25
 
+[storage]
+sqlite_path = "data/trader.sqlite"
+
 [telemetry]
 verbose = true
