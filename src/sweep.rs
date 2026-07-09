@@ -262,6 +262,14 @@ fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult
     rhs_has_enough_test_fills
         .cmp(&lhs_has_enough_test_fills)
         .then_with(|| rhs_traded.cmp(&lhs_traded))
+        .then_with(|| {
+            rhs.test_buy_and_hold_delta_quote
+                .cmp(&lhs.test_buy_and_hold_delta_quote)
+        })
+        .then_with(|| {
+            rhs.train_buy_and_hold_delta_quote
+                .cmp(&lhs.train_buy_and_hold_delta_quote)
+        })
         .then_with(|| rhs.test_profit_loss_quote.cmp(&lhs.test_profit_loss_quote))
         .then_with(|| {
             rhs.train_profit_loss_quote
@@ -768,8 +776,8 @@ impl Display for CandleSweepReport {
             "quality",
             "train_pnl",
             "test_pnl",
-            "train_hold",
-            "test_hold",
+            "train_alpha",
+            "test_alpha",
             "tr_fill",
             "te_fill",
             "tr_b/s",

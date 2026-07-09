@@ -864,8 +864,8 @@ fn render_strategy_research(
 <th>Test P/L</th>
 <th>Train Ret</th>
 <th>Test Ret</th>
-<th>Train Vs Hold</th>
-<th>Test Vs Hold</th>
+<th>Train Alpha</th>
+<th>Test Alpha</th>
 <th>Train DD</th>
 <th>Test DD</th>
 <th>Train Fills</th>

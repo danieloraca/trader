@@ -55,6 +55,7 @@ cargo run -- --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/
 ```
 
 The candle sweep uses a chronological 70/30 train/test split, ranks rows with at least 3 test fills first, and saves its latest ranked results into SQLite. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
+Sweep alpha means strategy P/L minus buy-and-hold P/L over the same train or test slice.
 
 Configure cost assumptions and optional CSV output:
 
