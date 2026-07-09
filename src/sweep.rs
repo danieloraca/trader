@@ -3,8 +3,10 @@ use crate::candles;
 use crate::config::{Config, StrategyKind};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
+use rusqlite::{Connection, params};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BUY_THRESHOLDS_BPS: [i64; 6] = [3, 5, 8, 10, 15, 20];
 const SELL_THRESHOLDS_BPS: [i64; 7] = [-3, -5, -8, -10, -15, -20, -30];
@@ -41,6 +43,7 @@ pub struct SweepResult {
 #[derive(Debug, Clone)]
 pub struct CandleSweepReport {
     pub sqlite_path: String,
+    pub recorded_at_ms: i64,
     pub result_count: usize,
     pub skipped_under_warmed_count: usize,
     pub results: Vec<CandleSweepResult>,
@@ -157,12 +160,16 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
 
     results.sort_by(compare_candle_sweep_results);
 
-    Ok(CandleSweepReport {
+    let report = CandleSweepReport {
         sqlite_path: sqlite_path.to_string(),
+        recorded_at_ms: now_ms()?,
         result_count: results.len(),
         skipped_under_warmed_count,
         results,
-    })
+    };
+    save_candle_sweep_report(sqlite_path, &config.bot.symbol, &report)?;
+
+    Ok(report)
 }
 
 fn compare_sweep_results(lhs: &SweepResult, rhs: &SweepResult) -> Ordering {
@@ -181,6 +188,163 @@ fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult
         .then_with(|| rhs.net_profit_loss_quote.cmp(&lhs.net_profit_loss_quote))
         .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
         .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
+}
+
+fn save_candle_sweep_report(
+    sqlite_path: &str,
+    symbol: &str,
+    report: &CandleSweepReport,
+) -> Result<()> {
+    let mut connection = Connection::open(sqlite_path).map_err(|error| {
+        BotError::Storage(format!(
+            "failed to open sqlite for strategy research persistence {sqlite_path}: {error}"
+        ))
+    })?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            BotError::Storage(format!("failed to set sqlite busy timeout: {error}"))
+        })?;
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS strategy_research_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                runnable_count INTEGER NOT NULL,
+                skipped_under_warmed_count INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS strategy_research_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                rank INTEGER NOT NULL,
+                interval_seconds INTEGER NOT NULL,
+                candle_count INTEGER NOT NULL,
+                fast_window INTEGER NOT NULL,
+                slow_window INTEGER NOT NULL,
+                quantity_base_micro_units INTEGER NOT NULL,
+                pnl_micro_units INTEGER NOT NULL,
+                return_pct REAL NOT NULL,
+                buy_and_hold_delta_micro_units INTEGER NOT NULL,
+                max_drawdown_pct REAL NOT NULL,
+                filled_order_count INTEGER NOT NULL,
+                rejected_order_count INTEGER NOT NULL,
+                buy_count INTEGER NOT NULL,
+                sell_count INTEGER NOT NULL,
+                exposure_pct REAL NOT NULL,
+                final_base_micro_units INTEGER NOT NULL
+            );
+            ",
+        )
+        .map_err(|error| {
+            BotError::Storage(format!(
+                "failed to migrate strategy research tables: {error}"
+            ))
+        })?;
+
+    let transaction = connection.transaction().map_err(|error| {
+        BotError::Storage(format!(
+            "failed to start strategy research transaction: {error}"
+        ))
+    })?;
+    transaction
+        .execute(
+            "
+            INSERT INTO strategy_research_runs (
+                recorded_at_ms,
+                kind,
+                symbol,
+                runnable_count,
+                skipped_under_warmed_count
+            )
+            VALUES (?1, 'candle_ma_sweep', ?2, ?3, ?4)
+            ",
+            params![
+                report.recorded_at_ms,
+                symbol,
+                usize_to_i64(report.result_count, "runnable count")?,
+                usize_to_i64(
+                    report.skipped_under_warmed_count,
+                    "skipped under-warmed count"
+                )?,
+            ],
+        )
+        .map_err(|error| {
+            BotError::Storage(format!("failed to save strategy research run: {error}"))
+        })?;
+    let run_id = transaction.last_insert_rowid();
+
+    for (rank, result) in report.results.iter().enumerate() {
+        transaction
+            .execute(
+                "
+                INSERT INTO strategy_research_results (
+                    run_id,
+                    rank,
+                    interval_seconds,
+                    candle_count,
+                    fast_window,
+                    slow_window,
+                    quantity_base_micro_units,
+                    pnl_micro_units,
+                    return_pct,
+                    buy_and_hold_delta_micro_units,
+                    max_drawdown_pct,
+                    filled_order_count,
+                    rejected_order_count,
+                    buy_count,
+                    sell_count,
+                    exposure_pct,
+                    final_base_micro_units
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                ",
+                params![
+                    run_id,
+                    usize_to_i64(rank + 1, "strategy research rank")?,
+                    result.interval_seconds,
+                    usize_to_i64(result.candle_count, "candle count")?,
+                    usize_to_i64(result.fast_window, "fast window")?,
+                    usize_to_i64(result.slow_window, "slow window")?,
+                    result.quantity_base.micro_units(),
+                    result.net_profit_loss_quote.micro_units(),
+                    result.return_pct,
+                    result.buy_and_hold_delta_quote.micro_units(),
+                    result.max_drawdown_pct,
+                    usize_to_i64(result.filled_order_count, "filled order count")?,
+                    usize_to_i64(result.rejected_order_count, "rejected order count")?,
+                    usize_to_i64(result.buy_count, "buy count")?,
+                    usize_to_i64(result.sell_count, "sell count")?,
+                    result.exposure_pct,
+                    result.final_base_balance.micro_units(),
+                ],
+            )
+            .map_err(|error| {
+                BotError::Storage(format!("failed to save strategy research result: {error}"))
+            })?;
+    }
+
+    transaction.commit().map_err(|error| {
+        BotError::Storage(format!(
+            "failed to commit strategy research transaction: {error}"
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn usize_to_i64(value: usize, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| BotError::Storage(format!("{label} is too large to store")))
+}
+
+fn now_ms() -> Result<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .map_err(|error| BotError::Storage(format!("system clock is before unix epoch: {error}")))
 }
 
 impl SweepResult {
@@ -474,7 +638,25 @@ mod tests {
         assert_eq!(report.result_count, 72);
         assert_eq!(report.results.len(), 72);
         assert_eq!(report.skipped_under_warmed_count, 24);
+        assert!(report.recorded_at_ms > 0);
         assert!(report.results.iter().all(|result| result.candle_count > 0));
+
+        let connection = Connection::open(&path).expect("database should open");
+        let saved_runs: i64 = connection
+            .query_row("SELECT COUNT(*) FROM strategy_research_runs", [], |row| {
+                row.get(0)
+            })
+            .expect("research runs should count");
+        let saved_results: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM strategy_research_results",
+                [],
+                |row| row.get(0),
+            )
+            .expect("research results should count");
+        assert_eq!(saved_runs, 1);
+        assert_eq!(saved_results, 72);
+        drop(connection);
 
         fs::remove_file(path).expect("test database should be removed");
     }

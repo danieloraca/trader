@@ -25,6 +25,8 @@ struct Snapshot {
     portfolio: Option<PortfolioRow>,
     recent_prices: Vec<MarketEventRow>,
     latest_orders: Vec<OrderRow>,
+    strategy_research_run: Option<StrategyResearchRunRow>,
+    strategy_research_results: Vec<StrategyResearchResultRow>,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,35 @@ struct OrderRow {
     quote_value_micro_units: i64,
     status: String,
     status_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct StrategyResearchRunRow {
+    recorded_at_ms: i64,
+    kind: String,
+    symbol: String,
+    runnable_count: i64,
+    skipped_under_warmed_count: i64,
+}
+
+#[derive(Debug)]
+struct StrategyResearchResultRow {
+    rank: i64,
+    interval_seconds: i64,
+    candle_count: i64,
+    fast_window: i64,
+    slow_window: i64,
+    quantity_base_micro_units: i64,
+    pnl_micro_units: i64,
+    return_pct: f64,
+    buy_and_hold_delta_micro_units: i64,
+    max_drawdown_pct: f64,
+    filled_order_count: i64,
+    rejected_order_count: i64,
+    buy_count: i64,
+    sell_count: i64,
+    exposure_pct: f64,
+    final_base_micro_units: i64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -144,6 +175,8 @@ impl Dashboard {
             portfolio: portfolio(&connection)?,
             recent_prices: recent_prices(&connection)?,
             latest_orders: latest_orders(&connection)?,
+            strategy_research_run: latest_strategy_research_run(&connection)?,
+            strategy_research_results: latest_strategy_research_results(&connection)?,
         })
     }
 }
@@ -287,6 +320,124 @@ fn latest_orders(connection: &Connection) -> rusqlite::Result<Vec<OrderRow>> {
         .collect()
 }
 
+fn latest_strategy_research_run(
+    connection: &Connection,
+) -> rusqlite::Result<Option<StrategyResearchRunRow>> {
+    if !table_exists(connection, "strategy_research_runs")? {
+        return Ok(None);
+    }
+
+    connection
+        .query_row(
+            "
+            SELECT
+                recorded_at_ms,
+                kind,
+                symbol,
+                runnable_count,
+                skipped_under_warmed_count
+            FROM strategy_research_runs
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            [],
+            |row| {
+                Ok(StrategyResearchRunRow {
+                    recorded_at_ms: row.get(0)?,
+                    kind: row.get(1)?,
+                    symbol: row.get(2)?,
+                    runnable_count: row.get(3)?,
+                    skipped_under_warmed_count: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+}
+
+fn latest_strategy_research_results(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<StrategyResearchResultRow>> {
+    if !table_exists(connection, "strategy_research_runs")?
+        || !table_exists(connection, "strategy_research_results")?
+    {
+        return Ok(Vec::new());
+    }
+
+    let Some(run_id) = connection
+        .query_row(
+            "SELECT id FROM strategy_research_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut statement = connection.prepare(
+        "
+        SELECT
+            rank,
+            interval_seconds,
+            candle_count,
+            fast_window,
+            slow_window,
+            quantity_base_micro_units,
+            pnl_micro_units,
+            return_pct,
+            buy_and_hold_delta_micro_units,
+            max_drawdown_pct,
+            filled_order_count,
+            rejected_order_count,
+            buy_count,
+            sell_count,
+            exposure_pct,
+            final_base_micro_units
+        FROM strategy_research_results
+        WHERE run_id = ?1
+        ORDER BY rank ASC
+        LIMIT 10
+        ",
+    )?;
+
+    statement
+        .query_map([run_id], |row| {
+            Ok(StrategyResearchResultRow {
+                rank: row.get(0)?,
+                interval_seconds: row.get(1)?,
+                candle_count: row.get(2)?,
+                fast_window: row.get(3)?,
+                slow_window: row.get(4)?,
+                quantity_base_micro_units: row.get(5)?,
+                pnl_micro_units: row.get(6)?,
+                return_pct: row.get(7)?,
+                buy_and_hold_delta_micro_units: row.get(8)?,
+                max_drawdown_pct: row.get(9)?,
+                filled_order_count: row.get(10)?,
+                rejected_order_count: row.get(11)?,
+                buy_count: row.get(12)?,
+                sell_count: row.get(13)?,
+                exposure_pct: row.get(14)?,
+                final_base_micro_units: row.get(15)?,
+            })
+        })?
+        .collect()
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "
+        SELECT EXISTS (
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?1
+        )
+        ",
+        [table],
+        |row| row.get(0),
+    )
+}
+
 fn render_html(db_path: &str, snapshot: &Snapshot) -> String {
     let mut html = String::new();
     let _ = write!(
@@ -343,6 +494,11 @@ window.addEventListener("DOMContentLoaded", formatTimes);
 
     render_summary(&mut html, snapshot);
     render_price_chart(&mut html, &snapshot.recent_prices);
+    render_strategy_research(
+        &mut html,
+        snapshot.strategy_research_run.as_ref(),
+        &snapshot.strategy_research_results,
+    );
     render_orders(&mut html, &snapshot.latest_orders);
 
     html.push_str("</main></body></html>");
@@ -568,6 +724,103 @@ fn render_orders(html: &mut String, orders: &[OrderRow]) {
                 escape_html(&order.client_order_id),
                 escape_html(order.exchange_order_id.as_deref().unwrap_or("")),
                 escape_html(order.status_reason.as_deref().unwrap_or(""))
+            );
+        }
+    }
+
+    html.push_str("</tbody></table>");
+}
+
+fn render_strategy_research(
+    html: &mut String,
+    run: Option<&StrategyResearchRunRow>,
+    results: &[StrategyResearchResultRow],
+) {
+    html.push_str(r#"<h2>Strategy Research</h2>"#);
+
+    let Some(run) = run else {
+        html.push_str(
+            r#"<div class="tile muted">No saved sweep yet. Run <code>target/release/trader --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/trader/trader.sqlite</code>.</div>"#,
+        );
+        return;
+    };
+
+    let _ = write!(
+        html,
+        r#"<section class="grid">
+<div class="tile"><div class="label">Latest Sweep</div><div class="value" data-ms="{}">{}</div><div class="muted">{} {}</div></div>
+<div class="tile"><div class="label">Runnable</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Skipped Warmup</div><div class="value">{}</div></div>
+</section>"#,
+        run.recorded_at_ms,
+        escape_html(&time_fallback(Some(run.recorded_at_ms))),
+        escape_html(&run.symbol),
+        escape_html(&run.kind),
+        run.runnable_count,
+        run.skipped_under_warmed_count,
+    );
+
+    html.push_str(
+        r#"<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th>Interval</th>
+<th>Candles</th>
+<th>MA</th>
+<th>Qty</th>
+<th>P/L</th>
+<th>Ret</th>
+<th>Vs Hold</th>
+<th>DD</th>
+<th>Fills</th>
+<th>B/S</th>
+<th>Exposure</th>
+<th>Final Base</th>
+</tr>
+</thead>
+<tbody>"#,
+    );
+
+    if results.is_empty() {
+        html.push_str(
+            r#"<tr><td colspan="13" class="muted">No runnable sweep rows yet.</td></tr>"#,
+        );
+    } else {
+        for result in results {
+            let _ = write!(
+                html,
+                r#"<tr>
+<td>{}</td>
+<td>{}s</td>
+<td>{}</td>
+<td>{}/{}</td>
+<td>{}</td>
+<td>{}</td>
+<td>{:.2}%</td>
+<td>{}</td>
+<td>{:.2}%</td>
+<td>{} <span class="muted">rej {}</span></td>
+<td>{}/{}</td>
+<td>{:.2}%</td>
+<td>{}</td>
+</tr>"#,
+                result.rank,
+                result.interval_seconds,
+                result.candle_count,
+                result.fast_window,
+                result.slow_window,
+                escape_html(&format_micro_units(result.quantity_base_micro_units)),
+                escape_html(&format_micro_units(result.pnl_micro_units)),
+                result.return_pct,
+                escape_html(&format_micro_units(result.buy_and_hold_delta_micro_units)),
+                result.max_drawdown_pct,
+                result.filled_order_count,
+                result.rejected_order_count,
+                result.buy_count,
+                result.sell_count,
+                result.exposure_pct,
+                escape_html(&format_micro_units(result.final_base_micro_units)),
             );
         }
     }
