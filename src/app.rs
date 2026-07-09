@@ -97,7 +97,7 @@ impl App {
             debug!(
                 run_id = %self.run_id,
                 symbol = %event.symbol(),
-                price = event.price(),
+                price = %event.price(),
                 replay_cursor = self.market_data.cursor(),
                 "market event received"
             );
@@ -119,8 +119,8 @@ impl App {
                             run_id = %self.run_id,
                             symbol = %signal.symbol,
                             side = ?signal.side,
-                            quantity_base = signal.quantity_base,
-                            price = signal.price,
+                            quantity_base = %signal.quantity_base,
+                            price = %signal.price,
                             reason = %signal.reason,
                             rejection = %message,
                             "signal rejected by risk manager"
@@ -149,9 +149,9 @@ impl App {
                                 exchange_status = ?exchange_status,
                                 symbol = %order.request.symbol,
                                 side = ?order.request.side,
-                                quantity_base = order.request.quantity_base,
-                                limit_price = order.request.limit_price,
-                                quote_value = order.request.quote_value(),
+                                quantity_base = %order.request.quantity_base,
+                                limit_price = %order.request.limit_price,
+                                quote_value = %order.request.quote_value(),
                                 status = ?order.status,
                                 "order transition recorded"
                             );

@@ -4,6 +4,7 @@ mod ticker;
 pub use replay::ReplayMarketDataSource;
 pub use ticker::PriceTick;
 
+use crate::decimal::Decimal;
 use crate::error::Result;
 
 #[derive(Debug, Clone)]
@@ -16,7 +17,7 @@ pub trait MarketDataSource {
 }
 
 impl MarketEvent {
-    pub fn price(&self) -> f64 {
+    pub fn price(&self) -> Decimal {
         match self {
             Self::PriceTick(tick) => tick.price,
         }

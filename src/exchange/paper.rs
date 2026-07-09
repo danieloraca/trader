@@ -112,16 +112,21 @@ impl Exchange for PaperExchange {
 #[cfg(test)]
 mod tests {
     use super::PaperExchange;
+    use crate::decimal::Decimal;
     use crate::exchange::Exchange;
     use crate::orders::{OrderRequest, OrderStatus, Side};
     use crate::portfolio::Portfolio;
+
+    fn decimal(value: f64) -> Decimal {
+        Decimal::from_f64(value).expect("decimal should parse")
+    }
 
     fn buy_request(quantity_base: f64, limit_price: f64) -> OrderRequest {
         OrderRequest {
             symbol: "BTC-USD".to_string(),
             side: Side::Buy,
-            quantity_base,
-            limit_price,
+            quantity_base: decimal(quantity_base),
+            limit_price: decimal(limit_price),
             client_order_id: Some("test-client-order".to_string()),
         }
     }
@@ -130,15 +135,15 @@ mod tests {
         OrderRequest {
             symbol: "BTC-USD".to_string(),
             side: Side::Sell,
-            quantity_base,
-            limit_price,
+            quantity_base: decimal(quantity_base),
+            limit_price: decimal(limit_price),
             client_order_id: Some("test-client-order".to_string()),
         }
     }
 
     #[test]
     fn buy_order_updates_balances_and_assigns_id() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
 
         let order = exchange
@@ -148,13 +153,13 @@ mod tests {
         assert_eq!(order.exchange_order_id, 1);
         assert_eq!(order.client_order_id, "test-client-order");
         assert_eq!(order.status, OrderStatus::Filled);
-        assert_eq!(exchange.portfolio().base_balance, 0.5);
-        assert_eq!(exchange.portfolio().quote_balance, 950.0);
+        assert_eq!(exchange.portfolio().base_balance.to_string(), "0.5");
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "950");
     }
 
     #[test]
     fn sync_portfolio_returns_latest_balances() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
 
         exchange
@@ -162,13 +167,13 @@ mod tests {
             .expect("buy should fill");
         let synced = exchange.sync_portfolio().expect("sync should work");
 
-        assert_eq!(synced.base_balance, 0.5);
-        assert_eq!(synced.quote_balance, 950.0);
+        assert_eq!(synced.base_balance.to_string(), "0.5");
+        assert_eq!(synced.quote_balance.to_string(), "950");
     }
 
     #[test]
     fn sell_order_updates_balances_and_increments_id() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
 
         exchange
@@ -179,13 +184,13 @@ mod tests {
             .expect("sell should fill");
 
         assert_eq!(order.exchange_order_id, 2);
-        assert_eq!(exchange.portfolio().base_balance, 0.3);
-        assert_eq!(exchange.portfolio().quote_balance, 972.0);
+        assert_eq!(exchange.portfolio().base_balance.to_string(), "0.3");
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "972");
     }
 
     #[test]
     fn rejects_buy_with_insufficient_quote_balance() {
-        let portfolio = Portfolio::new("BTC", "USD", 10.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(10.0));
         let mut exchange = PaperExchange::new(portfolio);
 
         let error = exchange
@@ -193,13 +198,13 @@ mod tests {
             .expect_err("buy should fail");
 
         assert!(error.to_string().contains("insufficient quote balance"));
-        assert_eq!(exchange.portfolio().base_balance, 0.0);
-        assert_eq!(exchange.portfolio().quote_balance, 10.0);
+        assert_eq!(exchange.portfolio().base_balance, Decimal::ZERO);
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "10");
     }
 
     #[test]
     fn rejects_order_without_client_order_id() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
         let mut request = buy_request(0.5, 100.0);
         request.client_order_id = None;
@@ -209,13 +214,13 @@ mod tests {
             .expect_err("order should fail");
 
         assert!(error.to_string().contains("missing client order id"));
-        assert_eq!(exchange.portfolio().base_balance, 0.0);
-        assert_eq!(exchange.portfolio().quote_balance, 1_000.0);
+        assert_eq!(exchange.portfolio().base_balance, Decimal::ZERO);
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "1000");
     }
 
     #[test]
     fn rejects_sell_with_insufficient_base_balance() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
 
         let error = exchange
@@ -223,13 +228,13 @@ mod tests {
             .expect_err("sell should fail");
 
         assert!(error.to_string().contains("insufficient base balance"));
-        assert_eq!(exchange.portfolio().base_balance, 0.0);
-        assert_eq!(exchange.portfolio().quote_balance, 1_000.0);
+        assert_eq!(exchange.portfolio().base_balance, Decimal::ZERO);
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "1000");
     }
 
     #[test]
     fn polls_order_status_for_known_order() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
         let order = exchange
             .place_order(buy_request(0.5, 100.0))
@@ -245,7 +250,7 @@ mod tests {
 
     #[test]
     fn rejects_status_poll_for_unknown_order() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let exchange = PaperExchange::new(portfolio);
 
         let error = exchange
@@ -257,7 +262,7 @@ mod tests {
 
     #[test]
     fn rejects_cancel_for_filled_order() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
         let mut exchange = PaperExchange::new(portfolio);
         let order = exchange
             .place_order(buy_request(0.5, 100.0))

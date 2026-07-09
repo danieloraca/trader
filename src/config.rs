@@ -1,3 +1,4 @@
+use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use serde::Deserialize;
 use std::env;
@@ -21,19 +22,19 @@ pub struct BotConfig {
     pub symbol: String,
     pub quote_currency: String,
     pub base_currency: String,
-    pub paper_starting_quote_balance: f64,
+    pub paper_starting_quote_balance: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketDataConfig {
-    pub replay_prices: Vec<f64>,
+    pub replay_prices: Vec<Decimal>,
     pub idle_sleep_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
-    pub max_order_quote_value: f64,
-    pub max_position_base: f64,
+    pub max_order_quote_value: Decimal,
+    pub max_position_base: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,9 +89,7 @@ impl Config {
             ));
         }
 
-        if !self.bot.paper_starting_quote_balance.is_finite()
-            || self.bot.paper_starting_quote_balance <= 0.0
-        {
+        if self.bot.paper_starting_quote_balance <= Decimal::ZERO {
             return Err(BotError::Config(
                 "paper starting quote balance must be positive".to_string(),
             ));
@@ -106,7 +105,7 @@ impl Config {
             .market_data
             .replay_prices
             .iter()
-            .any(|price| !price.is_finite() || *price <= 0.0)
+            .any(|price| *price <= Decimal::ZERO)
         {
             return Err(BotError::Config(
                 "market data replay prices must be positive finite values".to_string(),
@@ -119,13 +118,13 @@ impl Config {
             ));
         }
 
-        if !self.risk.max_order_quote_value.is_finite() || self.risk.max_order_quote_value <= 0.0 {
+        if self.risk.max_order_quote_value <= Decimal::ZERO {
             return Err(BotError::Config(
                 "max order quote value must be positive".to_string(),
             ));
         }
 
-        if !self.risk.max_position_base.is_finite() || self.risk.max_position_base <= 0.0 {
+        if self.risk.max_position_base <= Decimal::ZERO {
             return Err(BotError::Config(
                 "max position base must be positive".to_string(),
             ));
@@ -196,14 +195,19 @@ verbose = true
         assert_eq!(config.bot.symbol, "BTC-USD");
         assert_eq!(config.bot.base_currency, "BTC");
         assert_eq!(config.bot.quote_currency, "USD");
-        assert_eq!(config.bot.paper_starting_quote_balance, 10_000.0);
+        assert_eq!(config.bot.paper_starting_quote_balance.to_string(), "10000");
         assert_eq!(
-            config.market_data.replay_prices,
-            vec![100.0, 101.0, 102.0, 101.5, 99.0]
+            config
+                .market_data
+                .replay_prices
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["100", "101", "102", "101.5", "99"]
         );
         assert_eq!(config.market_data.idle_sleep_ms, 1_000);
-        assert_eq!(config.risk.max_order_quote_value, 500.0);
-        assert_eq!(config.risk.max_position_base, 0.25);
+        assert_eq!(config.risk.max_order_quote_value.to_string(), "500");
+        assert_eq!(config.risk.max_position_base.to_string(), "0.25");
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
         assert!(config.telemetry.verbose);
     }

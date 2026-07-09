@@ -2,6 +2,7 @@ mod simple;
 
 pub use simple::SimpleMomentumStrategy;
 
+use crate::decimal::Decimal;
 use crate::market::MarketEvent;
 use crate::orders::Side;
 
@@ -9,8 +10,8 @@ use crate::orders::Side;
 pub struct Signal {
     pub symbol: String,
     pub side: Side,
-    pub quantity_base: f64,
-    pub price: f64,
+    pub quantity_base: Decimal,
+    pub price: Decimal,
     pub reason: String,
 }
 

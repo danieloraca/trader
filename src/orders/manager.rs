@@ -64,6 +64,7 @@ fn client_order_id(order_id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::OrderManager;
+    use crate::decimal::Decimal;
     use crate::exchange::{Exchange, PaperExchange};
     use crate::orders::{OrderRequest, OrderStatus, Side};
     use crate::portfolio::Portfolio;
@@ -72,15 +73,19 @@ mod tests {
         OrderRequest {
             symbol: "BTC-USD".to_string(),
             side: Side::Buy,
-            quantity_base,
-            limit_price,
+            quantity_base: Decimal::from_f64(quantity_base).expect("decimal should parse"),
+            limit_price: Decimal::from_f64(limit_price).expect("decimal should parse"),
             client_order_id: None,
         }
     }
 
     #[test]
     fn records_submitted_and_filled_transitions() {
-        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let portfolio = Portfolio::new(
+            "BTC",
+            "USD",
+            Decimal::from_f64(1_000.0).expect("decimal should parse"),
+        );
         let mut exchange = PaperExchange::new(portfolio);
         let mut manager = OrderManager::new_at(1);
 
@@ -103,13 +108,17 @@ mod tests {
         );
         assert_eq!(transitions[1].status, OrderStatus::Filled);
         assert_eq!(transitions[1].exchange_order_id, Some(1));
-        assert_eq!(exchange.portfolio().base_balance, 0.5);
-        assert_eq!(exchange.portfolio().quote_balance, 950.0);
+        assert_eq!(exchange.portfolio().base_balance.to_string(), "0.5");
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "950");
     }
 
     #[test]
     fn records_rejected_transition_for_exchange_rejection() {
-        let portfolio = Portfolio::new("BTC", "USD", 10.0);
+        let portfolio = Portfolio::new(
+            "BTC",
+            "USD",
+            Decimal::from_f64(10.0).expect("decimal should parse"),
+        );
         let mut exchange = PaperExchange::new(portfolio);
         let mut manager = OrderManager::new_at(1);
 
@@ -127,7 +136,7 @@ mod tests {
                 .expect("rejection should have a reason")
                 .contains("insufficient quote balance")
         );
-        assert_eq!(exchange.portfolio().base_balance, 0.0);
-        assert_eq!(exchange.portfolio().quote_balance, 10.0);
+        assert_eq!(exchange.portfolio().base_balance, Decimal::ZERO);
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "10");
     }
 }

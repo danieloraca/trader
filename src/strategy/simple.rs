@@ -1,9 +1,10 @@
+use crate::decimal::Decimal;
 use crate::market::MarketEvent;
 use crate::orders::Side;
 use crate::strategy::{Signal, Strategy};
 
 pub struct SimpleMomentumStrategy {
-    last_price: Option<f64>,
+    last_price: Option<Decimal>,
 }
 
 impl SimpleMomentumStrategy {
@@ -20,13 +21,13 @@ impl Strategy for SimpleMomentumStrategy {
             return Vec::new();
         };
 
-        let change = (event.price() - previous_price) / previous_price;
+        let change = (event.price() - previous_price).ratio_to(previous_price);
 
         if change > 0.005 {
             vec![Signal {
                 symbol: event.symbol().to_string(),
                 side: Side::Buy,
-                quantity_base: 0.01,
+                quantity_base: Decimal::from_micro_units(10_000),
                 price: event.price(),
                 reason: format!("price rose {:.2}%", change * 100.0),
             }]
@@ -34,7 +35,7 @@ impl Strategy for SimpleMomentumStrategy {
             vec![Signal {
                 symbol: event.symbol().to_string(),
                 side: Side::Sell,
-                quantity_base: 0.005,
+                quantity_base: Decimal::from_micro_units(5_000),
                 price: event.price(),
                 reason: format!("price fell {:.2}%", change * 100.0),
             }]
@@ -47,12 +48,16 @@ impl Strategy for SimpleMomentumStrategy {
 #[cfg(test)]
 mod tests {
     use super::SimpleMomentumStrategy;
+    use crate::decimal::Decimal;
     use crate::market::{MarketEvent, PriceTick};
     use crate::orders::Side;
     use crate::strategy::Strategy;
 
     fn tick(price: f64) -> MarketEvent {
-        MarketEvent::PriceTick(PriceTick::new("BTC-USD", price))
+        MarketEvent::PriceTick(PriceTick::new(
+            "BTC-USD",
+            Decimal::from_f64(price).expect("price should parse"),
+        ))
     }
 
     #[test]
@@ -73,8 +78,8 @@ mod tests {
 
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].side, Side::Buy);
-        assert_eq!(signals[0].quantity_base, 0.01);
-        assert_eq!(signals[0].price, 101.0);
+        assert_eq!(signals[0].quantity_base.to_string(), "0.01");
+        assert_eq!(signals[0].price.to_string(), "101");
         assert!(signals[0].reason.contains("price rose"));
     }
 
@@ -87,8 +92,8 @@ mod tests {
 
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].side, Side::Sell);
-        assert_eq!(signals[0].quantity_base, 0.005);
-        assert_eq!(signals[0].price, 98.0);
+        assert_eq!(signals[0].quantity_base.to_string(), "0.005");
+        assert_eq!(signals[0].price.to_string(), "98");
         assert!(signals[0].reason.contains("price fell"));
     }
 

@@ -25,7 +25,7 @@ impl RiskManager {
 
         if request.quote_value() > self.config.max_order_quote_value {
             return Err(BotError::Risk(format!(
-                "signal rejected: order value {:.2} exceeds max {:.2}",
+                "signal rejected: order value {} exceeds max {}",
                 request.quote_value(),
                 self.config.max_order_quote_value
             )));
@@ -35,7 +35,7 @@ impl RiskManager {
             && portfolio.base_balance + request.quantity_base > self.config.max_position_base
         {
             return Err(BotError::Risk(format!(
-                "signal rejected: resulting position {:.8} exceeds max {:.8}",
+                "signal rejected: resulting position {} exceeds max {}",
                 portfolio.base_balance + request.quantity_base,
                 self.config.max_position_base
             )));
@@ -43,7 +43,7 @@ impl RiskManager {
 
         if request.side == Side::Sell && portfolio.base_balance < request.quantity_base {
             return Err(BotError::Risk(format!(
-                "signal rejected: sell quantity {:.8} exceeds position {:.8}",
+                "signal rejected: sell quantity {} exceeds position {}",
                 request.quantity_base, portfolio.base_balance
             )));
         }
@@ -51,8 +51,8 @@ impl RiskManager {
         info!(
             symbol = %signal.symbol,
             side = ?signal.side,
-            quantity_base = signal.quantity_base,
-            price = signal.price,
+            quantity_base = %signal.quantity_base,
+            price = %signal.price,
             reason = %signal.reason,
             "approved signal"
         );
@@ -64,20 +64,25 @@ impl RiskManager {
 mod tests {
     use super::RiskManager;
     use crate::config::RiskConfig;
+    use crate::decimal::Decimal;
     use crate::orders::Side;
     use crate::portfolio::Portfolio;
     use crate::strategy::Signal;
 
     fn risk_manager() -> RiskManager {
         RiskManager::new(RiskConfig {
-            max_order_quote_value: 500.0,
-            max_position_base: 0.25,
+            max_order_quote_value: Decimal::from_f64(500.0).expect("decimal should parse"),
+            max_position_base: Decimal::from_f64(0.25).expect("decimal should parse"),
         })
     }
 
     fn portfolio(base_balance: f64) -> Portfolio {
-        let mut portfolio = Portfolio::new("BTC", "USD", 10_000.0);
-        portfolio.base_balance = base_balance;
+        let mut portfolio = Portfolio::new(
+            "BTC",
+            "USD",
+            Decimal::from_f64(10_000.0).expect("decimal should parse"),
+        );
+        portfolio.base_balance = Decimal::from_f64(base_balance).expect("decimal should parse");
         portfolio
     }
 
@@ -85,8 +90,8 @@ mod tests {
         Signal {
             symbol: "BTC-USD".to_string(),
             side,
-            quantity_base,
-            price,
+            quantity_base: Decimal::from_f64(quantity_base).expect("decimal should parse"),
+            price: Decimal::from_f64(price).expect("decimal should parse"),
             reason: "test signal".to_string(),
         }
     }
@@ -99,8 +104,8 @@ mod tests {
 
         assert_eq!(request.symbol, "BTC-USD");
         assert_eq!(request.side, Side::Buy);
-        assert_eq!(request.quantity_base, 0.01);
-        assert_eq!(request.limit_price, 100.0);
+        assert_eq!(request.quantity_base.to_string(), "0.01");
+        assert_eq!(request.limit_price.to_string(), "100");
     }
 
     #[test]
@@ -109,7 +114,7 @@ mod tests {
             .approve(&signal(Side::Buy, 1.0, 501.0), &portfolio(0.0))
             .expect_err("signal should be rejected");
 
-        assert!(error.to_string().contains("order value 501.00 exceeds max"));
+        assert!(error.to_string().contains("order value 501 exceeds max"));
     }
 
     #[test]

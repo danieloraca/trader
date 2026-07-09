@@ -1,3 +1,4 @@
+use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use crate::market::MarketEvent;
 use crate::orders::{Order, Side};
@@ -55,7 +56,7 @@ impl SqliteStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     recorded_at_ms INTEGER NOT NULL,
                     symbol TEXT NOT NULL,
-                    price REAL NOT NULL
+                    price_micro_units INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS orders (
@@ -66,9 +67,9 @@ impl SqliteStore {
                     exchange_order_id INTEGER,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
-                    quantity_base REAL NOT NULL,
-                    limit_price REAL NOT NULL,
-                    quote_value REAL NOT NULL,
+                    quantity_base_micro_units INTEGER NOT NULL,
+                    limit_price_micro_units INTEGER NOT NULL,
+                    quote_value_micro_units INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     status_reason TEXT
                 );
@@ -78,8 +79,8 @@ impl SqliteStore {
                     updated_at_ms INTEGER NOT NULL,
                     base_currency TEXT NOT NULL,
                     quote_currency TEXT NOT NULL,
-                    base_balance REAL NOT NULL,
-                    quote_balance REAL NOT NULL
+                    base_balance_micro_units INTEGER NOT NULL,
+                    quote_balance_micro_units INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS replay_state (
@@ -104,6 +105,8 @@ impl SqliteStore {
             .map_err(|error| BotError::Storage(format!("failed to migrate sqlite: {error}")))?;
 
         self.ensure_orders_schema()?;
+        self.ensure_market_events_schema()?;
+        self.ensure_portfolio_schema()?;
         Ok(())
     }
 
@@ -140,6 +143,26 @@ impl SqliteStore {
 
         if self.column_not_null("orders", "exchange_order_id")? {
             self.rebuild_orders_with_nullable_exchange_order_id()?;
+        }
+
+        if self.column_exists("orders", "quantity_base")? {
+            self.rebuild_orders_with_micro_units()?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_market_events_schema(&self) -> Result<()> {
+        if self.column_exists("market_events", "price")? {
+            self.rebuild_market_events_with_micro_units()?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_portfolio_schema(&self) -> Result<()> {
+        if self.column_exists("portfolio_state", "base_balance")? {
+            self.rebuild_portfolio_with_micro_units()?;
         }
 
         Ok(())
@@ -253,6 +276,138 @@ impl SqliteStore {
         Ok(())
     }
 
+    fn rebuild_orders_with_micro_units(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "
+                CREATE TABLE orders_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    bot_order_id INTEGER NOT NULL,
+                    client_order_id TEXT NOT NULL,
+                    exchange_order_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity_base_micro_units INTEGER NOT NULL,
+                    limit_price_micro_units INTEGER NOT NULL,
+                    quote_value_micro_units INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    status_reason TEXT
+                );
+
+                INSERT INTO orders_new (
+                    id,
+                    recorded_at_ms,
+                    bot_order_id,
+                    client_order_id,
+                    exchange_order_id,
+                    symbol,
+                    side,
+                    quantity_base_micro_units,
+                    limit_price_micro_units,
+                    quote_value_micro_units,
+                    status,
+                    status_reason
+                )
+                SELECT
+                    id,
+                    recorded_at_ms,
+                    bot_order_id,
+                    client_order_id,
+                    exchange_order_id,
+                    symbol,
+                    side,
+                    CAST(ROUND(quantity_base * 1000000) AS INTEGER),
+                    CAST(ROUND(limit_price * 1000000) AS INTEGER),
+                    CAST(ROUND(quote_value * 1000000) AS INTEGER),
+                    status,
+                    status_reason
+                FROM orders;
+
+                DROP TABLE orders;
+                ALTER TABLE orders_new RENAME TO orders;
+                ",
+            )
+            .map_err(|error| {
+                BotError::Storage(format!(
+                    "failed to rebuild orders table for fixed-point values: {error}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    fn rebuild_market_events_with_micro_units(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "
+                CREATE TABLE market_events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                );
+
+                INSERT INTO market_events_new (id, recorded_at_ms, symbol, price_micro_units)
+                SELECT id, recorded_at_ms, symbol, CAST(ROUND(price * 1000000) AS INTEGER)
+                FROM market_events;
+
+                DROP TABLE market_events;
+                ALTER TABLE market_events_new RENAME TO market_events;
+                ",
+            )
+            .map_err(|error| {
+                BotError::Storage(format!(
+                    "failed to rebuild market events table for fixed-point values: {error}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    fn rebuild_portfolio_with_micro_units(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "
+                CREATE TABLE portfolio_state_new (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at_ms INTEGER NOT NULL,
+                    base_currency TEXT NOT NULL,
+                    quote_currency TEXT NOT NULL,
+                    base_balance_micro_units INTEGER NOT NULL,
+                    quote_balance_micro_units INTEGER NOT NULL
+                );
+
+                INSERT INTO portfolio_state_new (
+                    id,
+                    updated_at_ms,
+                    base_currency,
+                    quote_currency,
+                    base_balance_micro_units,
+                    quote_balance_micro_units
+                )
+                SELECT
+                    id,
+                    updated_at_ms,
+                    base_currency,
+                    quote_currency,
+                    CAST(ROUND(base_balance * 1000000) AS INTEGER),
+                    CAST(ROUND(quote_balance * 1000000) AS INTEGER)
+                FROM portfolio_state;
+
+                DROP TABLE portfolio_state;
+                ALTER TABLE portfolio_state_new RENAME TO portfolio_state;
+                ",
+            )
+            .map_err(|error| {
+                BotError::Storage(format!(
+                    "failed to rebuild portfolio table for fixed-point values: {error}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
     fn now_ms() -> Result<i64> {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -302,7 +457,7 @@ impl Store for SqliteStore {
         self.connection
             .query_row(
                 "
-                SELECT base_currency, quote_currency, base_balance, quote_balance
+                SELECT base_currency, quote_currency, base_balance_micro_units, quote_balance_micro_units
                 FROM portfolio_state
                 WHERE id = 1
                 ",
@@ -311,8 +466,8 @@ impl Store for SqliteStore {
                     Ok(Portfolio {
                         base_currency: row.get(0)?,
                         quote_currency: row.get(1)?,
-                        base_balance: row.get(2)?,
-                        quote_balance: row.get(3)?,
+                        base_balance: Decimal::from_micro_units(row.get(2)?),
+                        quote_balance: Decimal::from_micro_units(row.get(3)?),
                     })
                 },
             )
@@ -321,12 +476,6 @@ impl Store for SqliteStore {
     }
 
     fn save_portfolio(&mut self, portfolio: &Portfolio) -> Result<()> {
-        if !portfolio.base_balance.is_finite() || !portfolio.quote_balance.is_finite() {
-            return Err(BotError::Storage(
-                "cannot save portfolio with non-finite balances".to_string(),
-            ));
-        }
-
         self.connection
             .execute(
                 "
@@ -335,23 +484,23 @@ impl Store for SqliteStore {
                     updated_at_ms,
                     base_currency,
                     quote_currency,
-                    base_balance,
-                    quote_balance
+                    base_balance_micro_units,
+                    quote_balance_micro_units
                 )
                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(id) DO UPDATE SET
                     updated_at_ms = excluded.updated_at_ms,
                     base_currency = excluded.base_currency,
                     quote_currency = excluded.quote_currency,
-                    base_balance = excluded.base_balance,
-                    quote_balance = excluded.quote_balance
+                    base_balance_micro_units = excluded.base_balance_micro_units,
+                    quote_balance_micro_units = excluded.quote_balance_micro_units
                 ",
                 params![
                     Self::now_ms()?,
                     portfolio.base_currency.as_str(),
                     portfolio.quote_currency.as_str(),
-                    portfolio.base_balance,
-                    portfolio.quote_balance,
+                    portfolio.base_balance.micro_units(),
+                    portfolio.quote_balance.micro_units(),
                 ],
             )
             .map_err(|error| BotError::Storage(format!("failed to save portfolio: {error}")))?;
@@ -474,19 +623,13 @@ impl Store for SqliteStore {
     }
 
     fn record_market_event(&mut self, event: &MarketEvent) -> Result<()> {
-        if !event.price().is_finite() {
-            return Err(BotError::Storage(
-                "cannot record non-finite market price".to_string(),
-            ));
-        }
-
         self.connection
             .execute(
                 "
-                INSERT INTO market_events (recorded_at_ms, symbol, price)
+                INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
                 VALUES (?1, ?2, ?3)
                 ",
-                params![Self::now_ms()?, event.symbol(), event.price()],
+                params![Self::now_ms()?, event.symbol(), event.price().micro_units()],
             )
             .map_err(|error| {
                 BotError::Storage(format!("failed to record market event: {error}"))
@@ -506,9 +649,9 @@ impl Store for SqliteStore {
                     exchange_order_id,
                     symbol,
                     side,
-                    quantity_base,
-                    limit_price,
-                    quote_value,
+                    quantity_base_micro_units,
+                    limit_price_micro_units,
+                    quote_value_micro_units,
                     status,
                     status_reason
                 )
@@ -521,9 +664,9 @@ impl Store for SqliteStore {
                     optional_i64(order.exchange_order_id)?,
                     order.request.symbol.as_str(),
                     side_name(order.request.side),
-                    order.request.quantity_base,
-                    order.request.limit_price,
-                    order.request.quote_value(),
+                    order.request.quantity_base.micro_units(),
+                    order.request.limit_price.micro_units(),
+                    order.request.quote_value().micro_units(),
                     format!("{:?}", order.status),
                     order.status_reason.as_deref(),
                 ],
@@ -556,6 +699,7 @@ fn optional_i64(value: Option<u64>) -> Result<Option<i64>> {
 #[cfg(test)]
 mod tests {
     use super::SqliteStore;
+    use crate::decimal::Decimal;
     use crate::market::{MarketEvent, PriceTick};
     use crate::orders::{Order, OrderRequest, OrderStatus, Side};
     use crate::portfolio::Portfolio;
@@ -572,6 +716,10 @@ mod tests {
         std::env::temp_dir().join(format!("trader-{name}-{millis}.sqlite"))
     }
 
+    fn decimal(value: f64) -> Decimal {
+        Decimal::from_f64(value).expect("decimal should parse")
+    }
+
     fn order(id: u64) -> Order {
         Order {
             id,
@@ -579,8 +727,8 @@ mod tests {
             request: OrderRequest {
                 symbol: "BTC-USD".to_string(),
                 side: Side::Buy,
-                quantity_base: 0.01,
-                limit_price: 100.0,
+                quantity_base: decimal(0.01),
+                limit_price: decimal(100.0),
                 client_order_id: Some(format!("test-client-{id}")),
             },
             status: OrderStatus::Filled,
@@ -595,8 +743,8 @@ mod tests {
             request: OrderRequest {
                 symbol: "BTC-USD".to_string(),
                 side: Side::Buy,
-                quantity_base: 0.01,
-                limit_price: 100.0,
+                quantity_base: decimal(0.01),
+                limit_price: decimal(100.0),
                 client_order_id: Some(format!("test-client-{id}")),
             },
             status: OrderStatus::Submitted,
@@ -610,7 +758,10 @@ mod tests {
         let mut store = SqliteStore::open(&path).expect("store should open");
 
         store
-            .record_market_event(&MarketEvent::PriceTick(PriceTick::new("BTC-USD", 100.0)))
+            .record_market_event(&MarketEvent::PriceTick(PriceTick::new(
+                "BTC-USD",
+                decimal(100.0),
+            )))
             .expect("market event should record");
         store.record_order(&order(1)).expect("order should record");
 
@@ -663,26 +814,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_market_price() {
-        let path = db_path("invalid-price");
-        let mut store = SqliteStore::open(&path).expect("store should open");
-
-        let error = store
-            .record_market_event(&MarketEvent::PriceTick(PriceTick::new("BTC-USD", f64::NAN)))
-            .expect_err("event should fail");
-
-        assert!(error.to_string().contains("non-finite market price"));
-
-        drop(store);
-        fs::remove_file(path).expect("test database should be removed");
-    }
-
-    #[test]
     fn saves_and_loads_portfolio_state() {
         let path = db_path("portfolio-state");
         let mut store = SqliteStore::open(&path).expect("store should open");
-        let mut portfolio = Portfolio::new("BTC", "USD", 9_998.47);
-        portfolio.base_balance = 0.015;
+        let mut portfolio = Portfolio::new("BTC", "USD", decimal(9_998.47));
+        portfolio.base_balance = decimal(0.015);
 
         assert!(
             store
@@ -704,8 +840,8 @@ mod tests {
 
         assert_eq!(loaded.base_currency, "BTC");
         assert_eq!(loaded.quote_currency, "USD");
-        assert_eq!(loaded.base_balance, 0.015);
-        assert_eq!(loaded.quote_balance, 9_998.47);
+        assert_eq!(loaded.base_balance.to_string(), "0.015");
+        assert_eq!(loaded.quote_balance.to_string(), "9998.47");
 
         drop(store);
         fs::remove_file(path).expect("test database should be removed");

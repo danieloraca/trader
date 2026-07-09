@@ -2,6 +2,7 @@ mod manager;
 
 pub use manager::OrderManager;
 
+use crate::decimal::Decimal;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,13 +24,13 @@ pub enum OrderStatus {
 pub struct OrderRequest {
     pub symbol: String,
     pub side: Side,
-    pub quantity_base: f64,
-    pub limit_price: f64,
+    pub quantity_base: Decimal,
+    pub limit_price: Decimal,
     pub client_order_id: Option<String>,
 }
 
 impl OrderRequest {
-    pub fn quote_value(&self) -> f64 {
+    pub fn quote_value(&self) -> Decimal {
         self.quantity_base * self.limit_price
     }
 }

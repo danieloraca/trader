@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod decimal;
 mod error;
 mod exchange;
 mod market;
