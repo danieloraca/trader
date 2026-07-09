@@ -12,6 +12,8 @@ const CONFIG_ENV_VAR: &str = "TRADER_CONFIG";
 pub struct Config {
     pub bot: BotConfig,
     #[serde(default)]
+    pub backtest: BacktestConfig,
+    #[serde(default)]
     pub exchange: ExchangeConfig,
     pub market_data: MarketDataConfig,
     pub risk: RiskConfig,
@@ -27,6 +29,26 @@ pub struct BotConfig {
     pub quote_currency: String,
     pub base_currency: String,
     pub paper_starting_quote_balance: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BacktestConfig {
+    #[serde(default = "default_backtest_fee_bps")]
+    pub fee_bps: i64,
+    #[serde(default = "default_backtest_slippage_bps")]
+    pub slippage_bps: i64,
+    #[serde(default)]
+    pub trade_log_csv_path: Option<String>,
+}
+
+impl Default for BacktestConfig {
+    fn default() -> Self {
+        Self {
+            fee_bps: default_backtest_fee_bps(),
+            slippage_bps: default_backtest_slippage_bps(),
+            trade_log_csv_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +286,18 @@ impl Config {
             ));
         }
 
+        if self.backtest.fee_bps < 0 {
+            return Err(BotError::Config(
+                "backtest fee bps must not be negative".to_string(),
+            ));
+        }
+
+        if self.backtest.slippage_bps < 0 {
+            return Err(BotError::Config(
+                "backtest slippage bps must not be negative".to_string(),
+            ));
+        }
+
         if self.exchange.kind == ExchangeKind::Kraken {
             if self.exchange.kraken.base_url.trim().is_empty() {
                 return Err(BotError::Config(
@@ -419,6 +453,14 @@ fn default_kraken_base_url() -> String {
     "https://api.kraken.com".to_string()
 }
 
+fn default_backtest_fee_bps() -> i64 {
+    26
+}
+
+fn default_backtest_slippage_bps() -> i64 {
+    5
+}
+
 fn default_kraken_pair() -> String {
     "XBTUSD".to_string()
 }
@@ -474,6 +516,11 @@ base_currency = "BTC"
 quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
+[backtest]
+fee_bps = 26
+slippage_bps = 5
+trade_log_csv_path = "data/backtest-trades.csv"
+
 [exchange]
 kind = "paper"
 
@@ -522,6 +569,12 @@ verbose = true
         assert_eq!(config.bot.base_currency, "BTC");
         assert_eq!(config.bot.quote_currency, "USD");
         assert_eq!(config.bot.paper_starting_quote_balance.to_string(), "10000");
+        assert_eq!(config.backtest.fee_bps, 26);
+        assert_eq!(config.backtest.slippage_bps, 5);
+        assert_eq!(
+            config.backtest.trade_log_csv_path.as_deref(),
+            Some("data/backtest-trades.csv")
+        );
         assert_eq!(config.exchange.kind, super::ExchangeKind::Paper);
         assert_eq!(config.exchange.kraken.pair, "XBTUSD");
         assert!(!config.exchange.kraken.enable_order_placement);

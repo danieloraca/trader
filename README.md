@@ -30,11 +30,22 @@ replay_prices = []
 
 ## Backtest Report
 
-Backtest mode uses `market_data.replay_prices`, the configured strategy, risk limits, and paper fills. It does not call Kraken or write to SQLite.
+Backtest mode uses `market_data.replay_prices`, the configured strategy, risk limits, fee/slippage assumptions, and simulated fills. It does not call Kraken or write to SQLite.
 
 ```sh
 cargo run -- --config config/trader.example.toml --backtest
 ```
+
+Configure cost assumptions and optional CSV output:
+
+```toml
+[backtest]
+fee_bps = 26
+slippage_bps = 5
+trade_log_csv_path = "data/backtest-trades.csv"
+```
+
+The report includes net P/L, buy-and-hold benchmark, max drawdown, total fees, total slippage, exposure, realized sell win/loss counts, and final balances. When `trade_log_csv_path` is set, each simulated fill is written to CSV.
 
 ## Raspberry Pi Install
 
@@ -78,7 +89,7 @@ The dashboard is a separate read-only binary. It does not control trading and on
 Build it on the Pi:
 
 ```sh
-cd /home/trader/Development/trader
+cd /home/danutz/Development/trader
 cargo build --release --bin dashboard
 ```
 

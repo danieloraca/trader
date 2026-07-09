@@ -4,6 +4,11 @@ base_currency = "BTC"
 quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
+[backtest]
+fee_bps = 26
+slippage_bps = 5
+trade_log_csv_path = "data/backtest-trades.csv"
+
 [exchange]
 kind = "paper"
 

@@ -1,13 +1,14 @@
 use crate::config::Config;
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
-use crate::exchange::{Exchange, PaperExchange};
 use crate::market::{MarketDataSource, ReplayMarketDataSource};
-use crate::orders::{OrderManager, OrderStatus, Side};
+use crate::orders::{OrderRequest, Side};
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
 use crate::strategy;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct BacktestReport {
@@ -21,9 +22,43 @@ pub struct BacktestReport {
     pub initial_value_quote: Decimal,
     pub final_value_quote: Decimal,
     pub profit_loss_quote: Decimal,
+    pub return_pct: f64,
+    pub buy_and_hold_value_quote: Decimal,
+    pub buy_and_hold_profit_loss_quote: Decimal,
+    pub buy_and_hold_return_pct: f64,
     pub max_drawdown_pct: f64,
+    pub total_fees_quote: Decimal,
+    pub total_slippage_quote: Decimal,
+    pub average_trade_return_pct: f64,
+    pub win_count: usize,
+    pub loss_count: usize,
+    pub exposure_pct: f64,
     pub final_base_balance: Decimal,
     pub final_quote_balance: Decimal,
+    pub trade_log_csv_path: Option<String>,
+    pub trades: Vec<TradeRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub event_index: usize,
+    pub side: Side,
+    pub quantity_base: Decimal,
+    pub signal_price: Decimal,
+    pub fill_price: Decimal,
+    pub gross_quote_value: Decimal,
+    pub fee_quote: Decimal,
+    pub slippage_quote: Decimal,
+    pub equity_after: Decimal,
+    pub realized_pnl_quote: Decimal,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct SimulatedPortfolio {
+    base_balance: Decimal,
+    quote_balance: Decimal,
+    cost_basis_quote: Decimal,
 }
 
 pub fn run(config: &Config) -> Result<BacktestReport> {
@@ -38,15 +73,18 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
         config.market_data.replay_prices.clone(),
         0,
     );
-    let portfolio = Portfolio::new(
+    let mut portfolio = SimulatedPortfolio {
+        base_balance: Decimal::ZERO,
+        quote_balance: config.bot.paper_starting_quote_balance,
+        cost_basis_quote: Decimal::ZERO,
+    };
+    let mut risk_portfolio = Portfolio::new(
         &config.bot.base_currency,
         &config.bot.quote_currency,
         config.bot.paper_starting_quote_balance,
     );
-    let mut exchange = PaperExchange::new(portfolio);
     let mut strategy = strategy::from_config(&config.strategy);
     let risk = RiskManager::new(config.risk.clone());
-    let mut order_manager = OrderManager::new_at(1);
 
     let mut report = BacktestReport {
         symbol: config.bot.symbol.clone(),
@@ -59,22 +97,43 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
         initial_value_quote: config.bot.paper_starting_quote_balance,
         final_value_quote: config.bot.paper_starting_quote_balance,
         profit_loss_quote: Decimal::ZERO,
+        return_pct: 0.0,
+        buy_and_hold_value_quote: config.bot.paper_starting_quote_balance,
+        buy_and_hold_profit_loss_quote: Decimal::ZERO,
+        buy_and_hold_return_pct: 0.0,
         max_drawdown_pct: 0.0,
+        total_fees_quote: Decimal::ZERO,
+        total_slippage_quote: Decimal::ZERO,
+        average_trade_return_pct: 0.0,
+        win_count: 0,
+        loss_count: 0,
+        exposure_pct: 0.0,
         final_base_balance: Decimal::ZERO,
         final_quote_balance: config.bot.paper_starting_quote_balance,
+        trade_log_csv_path: config.backtest.trade_log_csv_path.clone(),
+        trades: Vec::new(),
     };
+
     let mut peak_value = report.initial_value_quote;
+    let mut first_price = None;
     let mut last_price = None;
+    let mut exposed_events = 0_usize;
+    let mut trade_return_sum_pct = 0.0;
 
     while let Some(event) = market_data.next_event()? {
         report.event_count += 1;
+        first_price.get_or_insert(event.price());
         last_price = Some(event.price());
+
+        if portfolio.base_balance > Decimal::ZERO {
+            exposed_events += 1;
+        }
 
         let signals = strategy.on_market_event(&event);
         report.signal_count += signals.len();
 
         for signal in signals {
-            let order_request = match risk.approve(&signal, exchange.portfolio()) {
+            let order_request = match risk.approve(&signal, &risk_portfolio) {
                 Ok(order_request) => order_request,
                 Err(BotError::Risk(_)) => {
                     report.rejected_order_count += 1;
@@ -82,24 +141,47 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
                 }
                 Err(error) => return Err(error),
             };
-            let side = order_request.side;
-            let submitted_order = order_manager.prepare_order(order_request);
-            let order = order_manager.submit_prepared_order(&mut exchange, &submitted_order)?;
 
-            match order.status {
-                OrderStatus::Filled => {
+            match fill_order(
+                &mut portfolio,
+                &order_request,
+                config.backtest.fee_bps,
+                config.backtest.slippage_bps,
+            ) {
+                Ok(mut trade) => {
                     report.filled_order_count += 1;
-                    match side {
+                    report.total_fees_quote += trade.fee_quote;
+                    report.total_slippage_quote += trade.slippage_quote;
+                    trade.event_index = report.event_count;
+                    trade.reason = signal.reason;
+                    trade.equity_after = portfolio_value(&portfolio, event.price());
+
+                    match order_request.side {
                         Side::Buy => report.buy_count += 1,
-                        Side::Sell => report.sell_count += 1,
+                        Side::Sell => {
+                            report.sell_count += 1;
+                            let trade_return_pct =
+                                trade.realized_pnl_quote.ratio_to(trade.gross_quote_value) * 100.0;
+                            trade_return_sum_pct += trade_return_pct;
+                            if trade.realized_pnl_quote > Decimal::ZERO {
+                                report.win_count += 1;
+                            } else if trade.realized_pnl_quote < Decimal::ZERO {
+                                report.loss_count += 1;
+                            }
+                        }
                     }
+
+                    report.trades.push(trade);
                 }
-                OrderStatus::Rejected => report.rejected_order_count += 1,
-                OrderStatus::Submitted | OrderStatus::Cancelled => {}
+                Err(BotError::Risk(_)) => report.rejected_order_count += 1,
+                Err(error) => return Err(error),
             }
         }
 
-        let value = portfolio_value(exchange.portfolio(), event.price());
+        risk_portfolio.base_balance = portfolio.base_balance;
+        risk_portfolio.quote_balance = portfolio.quote_balance;
+
+        let value = portfolio_value(&portfolio, event.price());
         if value > peak_value {
             peak_value = value;
         }
@@ -111,19 +193,156 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
         }
     }
 
-    let last_price = last_price.ok_or_else(|| {
+    let first_price = first_price.ok_or_else(|| {
         BotError::Config("backtest requires at least one replay price".to_string())
     })?;
-    report.final_base_balance = exchange.portfolio().base_balance;
-    report.final_quote_balance = exchange.portfolio().quote_balance;
-    report.final_value_quote = portfolio_value(exchange.portfolio(), last_price);
+    let last_price = last_price.expect("last price should exist when first price exists");
+    report.final_base_balance = portfolio.base_balance;
+    report.final_quote_balance = portfolio.quote_balance;
+    report.final_value_quote = portfolio_value(&portfolio, last_price);
     report.profit_loss_quote = report.final_value_quote - report.initial_value_quote;
+    report.return_pct = report
+        .profit_loss_quote
+        .ratio_to(report.initial_value_quote)
+        * 100.0;
+
+    report.buy_and_hold_value_quote = (report.initial_value_quote / first_price) * last_price;
+    report.buy_and_hold_profit_loss_quote =
+        report.buy_and_hold_value_quote - report.initial_value_quote;
+    report.buy_and_hold_return_pct = report
+        .buy_and_hold_profit_loss_quote
+        .ratio_to(report.initial_value_quote)
+        * 100.0;
+
+    if report.sell_count > 0 {
+        report.average_trade_return_pct = trade_return_sum_pct / report.sell_count as f64;
+    }
+    if report.event_count > 0 {
+        report.exposure_pct = exposed_events as f64 / report.event_count as f64 * 100.0;
+    }
+
+    if let Some(path) = &report.trade_log_csv_path {
+        write_trade_log_csv(path, &report.trades)?;
+    }
 
     Ok(report)
 }
 
-fn portfolio_value(portfolio: &Portfolio, price: Decimal) -> Decimal {
+fn fill_order(
+    portfolio: &mut SimulatedPortfolio,
+    request: &OrderRequest,
+    fee_bps: i64,
+    slippage_bps: i64,
+) -> Result<TradeRecord> {
+    let slippage = bps_value(request.limit_price, slippage_bps);
+    let fill_price = match request.side {
+        Side::Buy => request.limit_price + slippage,
+        Side::Sell => request.limit_price - slippage,
+    };
+    let gross_quote_value = request.quantity_base * fill_price;
+    let fee_quote = bps_value(gross_quote_value, fee_bps);
+    let slippage_quote = request.quantity_base * slippage;
+
+    let realized_pnl_quote = match request.side {
+        Side::Buy => {
+            let total_quote_cost = gross_quote_value + fee_quote;
+            if portfolio.quote_balance < total_quote_cost {
+                return Err(BotError::Risk(format!(
+                    "backtest rejected: insufficient quote balance for cost {total_quote_cost}"
+                )));
+            }
+            portfolio.quote_balance -= total_quote_cost;
+            portfolio.base_balance += request.quantity_base;
+            portfolio.cost_basis_quote += total_quote_cost;
+            Decimal::ZERO
+        }
+        Side::Sell => {
+            if portfolio.base_balance < request.quantity_base {
+                return Err(BotError::Risk(format!(
+                    "backtest rejected: sell quantity {} exceeds position {}",
+                    request.quantity_base, portfolio.base_balance
+                )));
+            }
+            let cost_basis_sold =
+                (portfolio.cost_basis_quote * request.quantity_base) / portfolio.base_balance;
+            let net_proceeds = gross_quote_value - fee_quote;
+            portfolio.base_balance -= request.quantity_base;
+            portfolio.quote_balance += net_proceeds;
+            portfolio.cost_basis_quote -= cost_basis_sold;
+            net_proceeds - cost_basis_sold
+        }
+    };
+
+    Ok(TradeRecord {
+        event_index: 0,
+        side: request.side,
+        quantity_base: request.quantity_base,
+        signal_price: request.limit_price,
+        fill_price,
+        gross_quote_value,
+        fee_quote,
+        slippage_quote,
+        equity_after: Decimal::ZERO,
+        realized_pnl_quote,
+        reason: String::new(),
+    })
+}
+
+fn portfolio_value(portfolio: &SimulatedPortfolio, price: Decimal) -> Decimal {
     portfolio.quote_balance + (portfolio.base_balance * price)
+}
+
+fn bps_value(value: Decimal, bps: i64) -> Decimal {
+    Decimal::from_micro_units(((value.micro_units() as i128 * bps as i128) / 10_000) as i64)
+}
+
+fn write_trade_log_csv(path: &str, trades: &[TradeRecord]) -> Result<()> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            BotError::Storage(format!(
+                "failed to create backtest csv directory {}: {error}",
+                parent.to_string_lossy()
+            ))
+        })?;
+    }
+
+    let mut csv = String::from(
+        "event_index,side,quantity_base,signal_price,fill_price,gross_quote_value,fee_quote,slippage_quote,equity_after,realized_pnl_quote,reason\n",
+    );
+    for trade in trades {
+        csv.push_str(&format!(
+            "{},{:?},{},{},{},{},{},{},{},{},{}\n",
+            trade.event_index,
+            trade.side,
+            trade.quantity_base,
+            trade.signal_price,
+            trade.fill_price,
+            trade.gross_quote_value,
+            trade.fee_quote,
+            trade.slippage_quote,
+            trade.equity_after,
+            trade.realized_pnl_quote,
+            csv_escape(&trade.reason)
+        ));
+    }
+
+    fs::write(path, csv).map_err(|error| {
+        BotError::Storage(format!(
+            "failed to write backtest csv {}: {error}",
+            path.to_string_lossy()
+        ))
+    })
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 impl Display for BacktestReport {
@@ -138,10 +357,33 @@ impl Display for BacktestReport {
         writeln!(f, "Sells: {}", self.sell_count)?;
         writeln!(f, "Initial value: {}", self.initial_value_quote)?;
         writeln!(f, "Final value: {}", self.final_value_quote)?;
-        writeln!(f, "P/L: {}", self.profit_loss_quote)?;
+        writeln!(
+            f,
+            "P/L: {} ({:.2}%)",
+            self.profit_loss_quote, self.return_pct
+        )?;
+        writeln!(f, "Buy & hold value: {}", self.buy_and_hold_value_quote)?;
+        writeln!(
+            f,
+            "Buy & hold P/L: {} ({:.2}%)",
+            self.buy_and_hold_profit_loss_quote, self.buy_and_hold_return_pct
+        )?;
         writeln!(f, "Max drawdown: {:.2}%", self.max_drawdown_pct)?;
+        writeln!(f, "Total fees: {}", self.total_fees_quote)?;
+        writeln!(f, "Total slippage: {}", self.total_slippage_quote)?;
+        writeln!(
+            f,
+            "Average realized sell return: {:.2}%",
+            self.average_trade_return_pct
+        )?;
+        writeln!(f, "Wins / losses: {} / {}", self.win_count, self.loss_count)?;
+        writeln!(f, "Exposure: {:.2}%", self.exposure_pct)?;
         writeln!(f, "Final base balance: {}", self.final_base_balance)?;
-        write!(f, "Final quote balance: {}", self.final_quote_balance)
+        writeln!(f, "Final quote balance: {}", self.final_quote_balance)?;
+        if let Some(path) = &self.trade_log_csv_path {
+            writeln!(f, "Trade log CSV: {path}")?;
+        }
+        Ok(())
     }
 }
 
@@ -149,8 +391,8 @@ impl Display for BacktestReport {
 mod tests {
     use super::run;
     use crate::config::{
-        BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig, StorageConfig,
-        StrategyConfig, TelemetryConfig,
+        BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
+        StorageConfig, StrategyConfig, TelemetryConfig,
     };
     use crate::decimal::Decimal;
 
@@ -165,6 +407,11 @@ mod tests {
                 base_currency: "BTC".to_string(),
                 quote_currency: "USD".to_string(),
                 paper_starting_quote_balance: decimal("10000"),
+            },
+            backtest: BacktestConfig {
+                fee_bps: 26,
+                slippage_bps: 5,
+                trade_log_csv_path: None,
             },
             exchange: ExchangeConfig::default(),
             market_data: MarketDataConfig {
@@ -191,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_backtest_summary() {
+    fn reports_backtest_summary_with_costs_and_benchmark() {
         let report = run(&config()).expect("backtest should run");
 
         assert_eq!(report.event_count, 5);
@@ -199,6 +446,9 @@ mod tests {
         assert_eq!(report.filled_order_count, 3);
         assert_eq!(report.buy_count, 2);
         assert_eq!(report.sell_count, 1);
-        assert!(report.final_value_quote > Decimal::ZERO);
+        assert_eq!(report.trades.len(), 3);
+        assert!(report.total_fees_quote > Decimal::ZERO);
+        assert!(report.total_slippage_quote > Decimal::ZERO);
+        assert!(report.buy_and_hold_value_quote > Decimal::ZERO);
     }
 }
