@@ -7,8 +7,12 @@ pub struct OrderManager {
 }
 
 impl OrderManager {
-    pub fn new() -> Self {
-        Self { next_order_id: 1 }
+    pub fn new_at(next_order_id: u64) -> Self {
+        Self { next_order_id }
+    }
+
+    pub fn next_order_id(&self) -> u64 {
+        self.next_order_id
     }
 
     pub fn submit_order(
@@ -72,7 +76,7 @@ mod tests {
     fn records_submitted_and_filled_transitions() {
         let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
         let mut exchange = PaperExchange::new(portfolio);
-        let mut manager = OrderManager::new();
+        let mut manager = OrderManager::new_at(1);
 
         let transitions = manager
             .submit_order(&mut exchange, buy_request(0.5, 100.0))
@@ -93,7 +97,7 @@ mod tests {
     fn records_rejected_transition_for_exchange_rejection() {
         let portfolio = Portfolio::new("BTC", "USD", 10.0);
         let mut exchange = PaperExchange::new(portfolio);
-        let mut manager = OrderManager::new();
+        let mut manager = OrderManager::new_at(1);
 
         let transitions = manager
             .submit_order(&mut exchange, buy_request(1.0, 100.0))

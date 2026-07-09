@@ -78,6 +78,12 @@ impl SqliteStore {
                     updated_at_ms INTEGER NOT NULL,
                     cursor INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS order_manager_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at_ms INTEGER NOT NULL,
+                    next_order_id INTEGER NOT NULL
+                );
                 ",
             )
             .map_err(|error| BotError::Storage(format!("failed to migrate sqlite: {error}")))?;
@@ -244,6 +250,65 @@ impl Store for SqliteStore {
                 params![Self::now_ms()?, cursor],
             )
             .map_err(|error| BotError::Storage(format!("failed to save replay cursor: {error}")))?;
+
+        Ok(())
+    }
+
+    fn load_next_order_id(&self) -> Result<Option<u64>> {
+        let explicit_next_order_id = self
+            .connection
+            .query_row(
+                "SELECT next_order_id FROM order_manager_state WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| BotError::Storage(format!("failed to load next order id: {error}")))?;
+
+        if let Some(value) = explicit_next_order_id {
+            return u64::try_from(value).map(Some).map_err(|_| {
+                BotError::Storage(format!("stored next order id is invalid: {value}"))
+            });
+        }
+
+        let max_seen_id = self
+            .connection
+            .query_row("SELECT MAX(bot_order_id) FROM orders", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .map_err(|error| {
+                BotError::Storage(format!("failed to infer next order id: {error}"))
+            })?;
+
+        max_seen_id
+            .map(|value| {
+                let value = u64::try_from(value).map_err(|_| {
+                    BotError::Storage(format!("stored bot order id is invalid: {value}"))
+                })?;
+
+                value
+                    .checked_add(1)
+                    .ok_or_else(|| BotError::Storage("next order id overflowed u64".to_string()))
+            })
+            .transpose()
+    }
+
+    fn save_next_order_id(&mut self, next_order_id: u64) -> Result<()> {
+        let next_order_id = i64::try_from(next_order_id)
+            .map_err(|_| BotError::Storage("next order id is too large to store".to_string()))?;
+
+        self.connection
+            .execute(
+                "
+                INSERT INTO order_manager_state (id, updated_at_ms, next_order_id)
+                VALUES (1, ?1, ?2)
+                ON CONFLICT(id) DO UPDATE SET
+                    updated_at_ms = excluded.updated_at_ms,
+                    next_order_id = excluded.next_order_id
+                ",
+                params![Self::now_ms()?, next_order_id],
+            )
+            .map_err(|error| BotError::Storage(format!("failed to save next order id: {error}")))?;
 
         Ok(())
     }
@@ -453,6 +518,57 @@ mod tests {
         assert_eq!(
             store.load_replay_cursor().expect("cursor load should work"),
             Some(5)
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn saves_and_loads_next_order_id() {
+        let path = db_path("next-order-id");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        assert_eq!(
+            store
+                .load_next_order_id()
+                .expect("next order id load should work"),
+            None
+        );
+
+        store
+            .save_next_order_id(12)
+            .expect("next order id should save");
+        drop(store);
+
+        let store = SqliteStore::open(&path).expect("store should reopen");
+
+        assert_eq!(
+            store
+                .load_next_order_id()
+                .expect("next order id load should work"),
+            Some(12)
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn infers_next_order_id_from_order_history_when_state_is_missing() {
+        let path = db_path("next-order-id-history");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        store.record_order(&order(7)).expect("order should record");
+        drop(store);
+
+        let store = SqliteStore::open(&path).expect("store should reopen");
+
+        assert_eq!(
+            store
+                .load_next_order_id()
+                .expect("next order id load should work"),
+            Some(8)
         );
 
         drop(store);

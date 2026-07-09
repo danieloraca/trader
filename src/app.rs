@@ -29,6 +29,7 @@ impl App {
             )
         });
         let replay_cursor = store.load_replay_cursor()?.unwrap_or(0);
+        let next_order_id = store.load_next_order_id()?.unwrap_or(1);
         let market_data = ReplayMarketDataSource::from_prices_at_cursor(
             &config.bot.symbol,
             config.market_data.replay_prices.clone(),
@@ -38,7 +39,7 @@ impl App {
         Ok(Self {
             exchange: PaperExchange::new(portfolio),
             market_data,
-            order_manager: OrderManager::new(),
+            order_manager: OrderManager::new_at(next_order_id),
             risk: RiskManager::new(config.risk.clone()),
             strategy: SimpleMomentumStrategy::new(),
             store,
@@ -67,6 +68,9 @@ impl App {
                         _ => {}
                     }
                 }
+
+                self.store
+                    .save_next_order_id(self.order_manager.next_order_id())?;
             }
 
             self.store.save_portfolio(self.exchange.portfolio())?;
