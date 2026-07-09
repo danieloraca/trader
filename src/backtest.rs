@@ -6,6 +6,7 @@ use crate::orders::{OrderRequest, Side};
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
 use crate::strategy;
+use rusqlite::Connection;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
@@ -68,11 +69,33 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
         ));
     }
 
-    let mut market_data = ReplayMarketDataSource::from_prices_at_cursor(
+    let market_data = ReplayMarketDataSource::from_prices_at_cursor(
         &config.bot.symbol,
         config.market_data.replay_prices.clone(),
         0,
     );
+
+    run_with_source(config, market_data)
+}
+
+pub fn run_from_sqlite(config: &Config, sqlite_path: &str) -> Result<BacktestReport> {
+    let prices = load_replay_prices_from_sqlite(sqlite_path, &config.bot.symbol)?;
+    if prices.is_empty() {
+        return Err(BotError::Config(format!(
+            "backtest sqlite source has no market events for {}",
+            config.bot.symbol
+        )));
+    }
+
+    let market_data = ReplayMarketDataSource::from_prices_at_cursor(&config.bot.symbol, prices, 0);
+
+    run_with_source(config, market_data)
+}
+
+fn run_with_source(
+    config: &Config,
+    mut market_data: impl MarketDataSource,
+) -> Result<BacktestReport> {
     let mut portfolio = SimulatedPortfolio {
         base_balance: Decimal::ZERO,
         quote_balance: config.bot.paper_starting_quote_balance,
@@ -226,6 +249,53 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
     }
 
     Ok(report)
+}
+
+fn load_replay_prices_from_sqlite(sqlite_path: &str, symbol: &str) -> Result<Vec<Decimal>> {
+    let connection = Connection::open_with_flags(
+        sqlite_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        BotError::Storage(format!(
+            "failed to open backtest sqlite source {sqlite_path}: {error}"
+        ))
+    })?;
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT price_micro_units
+            FROM market_events
+            WHERE symbol = ?1
+            ORDER BY recorded_at_ms ASC, id ASC
+            ",
+        )
+        .map_err(|error| {
+            BotError::Storage(format!(
+                "failed to prepare backtest sqlite market event query: {error}"
+            ))
+        })?;
+
+    statement
+        .query_map([symbol], |row| {
+            let price_micro_units: i64 = row.get(0)?;
+            Ok(Decimal::from_micro_units(price_micro_units))
+        })
+        .map_err(|error| {
+            BotError::Storage(format!(
+                "failed to query backtest sqlite market events: {error}"
+            ))
+        })?
+        .map(|row| {
+            row.map_err(|error| {
+                BotError::Storage(format!(
+                    "failed to read backtest sqlite market event: {error}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn fill_order(
@@ -389,12 +459,16 @@ impl Display for BacktestReport {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{run, run_from_sqlite};
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
         StorageConfig, StrategyConfig, TelemetryConfig,
     };
     use crate::decimal::Decimal;
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn decimal(value: &str) -> Decimal {
         Decimal::from_decimal_str(value).expect("decimal should parse")
@@ -437,6 +511,14 @@ mod tests {
         }
     }
 
+    fn db_path(name: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_millis();
+        std::env::temp_dir().join(format!("trader-backtest-{name}-{millis}.sqlite"))
+    }
+
     #[test]
     fn reports_backtest_summary_with_costs_and_benchmark() {
         let report = run(&config()).expect("backtest should run");
@@ -450,5 +532,38 @@ mod tests {
         assert!(report.total_fees_quote > Decimal::ZERO);
         assert!(report.total_slippage_quote > Decimal::ZERO);
         assert!(report.buy_and_hold_value_quote > Decimal::ZERO);
+    }
+
+    #[test]
+    fn reports_backtest_from_sqlite_market_events() {
+        let path = db_path("sqlite-source");
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE market_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                );
+                INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units) VALUES
+                    (1, 'BTC-USD', 100000000),
+                    (2, 'BTC-USD', 101000000),
+                    (3, 'BTC-USD', 102000000),
+                    (4, 'BTC-USD', 101500000),
+                    (5, 'BTC-USD', 99000000);
+                ",
+            )
+            .expect("market events should insert");
+        drop(connection);
+
+        let report = run_from_sqlite(&config(), path.to_str().expect("path should be utf8"))
+            .expect("backtest should run");
+
+        assert_eq!(report.event_count, 5);
+        assert_eq!(report.signal_count, 3);
+
+        fs::remove_file(path).expect("test database should be removed");
     }
 }

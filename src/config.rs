@@ -235,12 +235,14 @@ pub struct TelemetryConfig {
 pub enum RuntimeCommand {
     Run,
     Backtest,
+    BacktestSqlite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeOptions {
     pub config_path: String,
     pub command: RuntimeCommand,
+    pub backtest_sqlite_path: Option<String>,
 }
 
 impl Config {
@@ -428,6 +430,7 @@ impl RuntimeOptions {
         let _program = args.next();
         let mut config_path = env_config_path.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
         let mut command = RuntimeCommand::Run;
+        let mut backtest_sqlite_path = None;
 
         while let Some(arg) = args.next() {
             if arg == "--config" {
@@ -437,6 +440,14 @@ impl RuntimeOptions {
                 config_path = path;
             } else if arg == "--backtest" {
                 command = RuntimeCommand::Backtest;
+            } else if arg == "--backtest-sqlite" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--backtest-sqlite requires a sqlite path".to_string(),
+                    ));
+                };
+                command = RuntimeCommand::BacktestSqlite;
+                backtest_sqlite_path = Some(path);
             } else {
                 return Err(BotError::Config(format!("unknown argument: {arg}")));
             }
@@ -445,6 +456,7 @@ impl RuntimeOptions {
         Ok(Self {
             config_path,
             command,
+            backtest_sqlite_path,
         })
     }
 }
@@ -507,7 +519,7 @@ fn config_path_from_args_and_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, config_path_from_args_and_env};
+    use super::{Config, RuntimeCommand, RuntimeOptions, config_path_from_args_and_env};
 
     const VALID_CONFIG: &str = r#"
 [bot]
@@ -736,6 +748,28 @@ verbose = true
         .expect("path should resolve");
 
         assert_eq!(path, "/etc/trader.toml");
+    }
+
+    #[test]
+    fn accepts_backtest_sqlite_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "/etc/trader.toml".to_string(),
+                "--backtest-sqlite".to_string(),
+                "/var/lib/trader/trader.sqlite".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.config_path, "/etc/trader.toml");
+        assert_eq!(options.command, RuntimeCommand::BacktestSqlite);
+        assert_eq!(
+            options.backtest_sqlite_path.as_deref(),
+            Some("/var/lib/trader/trader.sqlite")
+        );
     }
 
     #[test]

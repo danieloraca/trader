@@ -36,6 +36,12 @@ Backtest mode uses `market_data.replay_prices`, the configured strategy, risk li
 cargo run -- --config config/trader.example.toml --backtest
 ```
 
+Backtest against recorded Pi market data:
+
+```sh
+cargo run -- --config config/pi-paper-live.toml --backtest-sqlite /var/lib/trader/trader.sqlite
+```
+
 Configure cost assumptions and optional CSV output:
 
 ```toml

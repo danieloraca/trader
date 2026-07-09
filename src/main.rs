@@ -20,10 +20,21 @@ fn main() -> Result<()> {
     let runtime = config::RuntimeOptions::from_runtime()?;
     let config = config::Config::load_from_path(&runtime.config_path)?;
 
-    if runtime.command == RuntimeCommand::Backtest {
-        let report = backtest::run(&config)?;
-        println!("{report}");
-        return Ok(());
+    match runtime.command {
+        RuntimeCommand::Backtest => {
+            let report = backtest::run(&config)?;
+            println!("{report}");
+            return Ok(());
+        }
+        RuntimeCommand::BacktestSqlite => {
+            let sqlite_path = runtime.backtest_sqlite_path.as_deref().ok_or_else(|| {
+                error::BotError::Config("--backtest-sqlite requires a sqlite path".to_string())
+            })?;
+            let report = backtest::run_from_sqlite(&config, sqlite_path)?;
+            println!("{report}");
+            return Ok(());
+        }
+        RuntimeCommand::Run => {}
     }
 
     telemetry::init(&config.telemetry);
