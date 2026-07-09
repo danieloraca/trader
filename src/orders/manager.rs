@@ -18,9 +18,10 @@ impl OrderManager {
     pub fn submit_order(
         &mut self,
         exchange: &mut impl Exchange,
-        request: OrderRequest,
+        mut request: OrderRequest,
     ) -> Result<Vec<Order>> {
         let order_id = self.next_id();
+        request.client_order_id = Some(client_order_id(order_id));
         let mut transitions = vec![Order::submitted(order_id, request.clone())];
 
         match exchange.place_order(request.clone()) {
@@ -56,6 +57,10 @@ impl OrderManager {
     }
 }
 
+fn client_order_id(order_id: u64) -> String {
+    format!("trader-{order_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::OrderManager;
@@ -69,6 +74,7 @@ mod tests {
             side: Side::Buy,
             quantity_base,
             limit_price,
+            client_order_id: None,
         }
     }
 
@@ -84,9 +90,17 @@ mod tests {
 
         assert_eq!(transitions.len(), 2);
         assert_eq!(transitions[0].id, 1);
+        assert_eq!(
+            transitions[0].request.client_order_id.as_deref(),
+            Some("trader-1")
+        );
         assert_eq!(transitions[0].status, OrderStatus::Submitted);
         assert_eq!(transitions[0].exchange_order_id, None);
         assert_eq!(transitions[1].id, 1);
+        assert_eq!(
+            transitions[1].request.client_order_id.as_deref(),
+            Some("trader-1")
+        );
         assert_eq!(transitions[1].status, OrderStatus::Filled);
         assert_eq!(transitions[1].exchange_order_id, Some(1));
         assert_eq!(exchange.portfolio().base_balance, 0.5);

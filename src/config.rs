@@ -1,9 +1,11 @@
 use crate::error::{BotError, Result};
 use serde::Deserialize;
+use std::env;
 use std::fs;
 use std::path::Path;
 
 const DEFAULT_CONFIG_PATH: &str = "config/trader.toml";
+const CONFIG_ENV_VAR: &str = "TRADER_CONFIG";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -45,8 +47,9 @@ pub struct TelemetryConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        Self::load_from_path(DEFAULT_CONFIG_PATH)
+    pub fn load_from_runtime() -> Result<Self> {
+        let path = config_path_from_args_and_env(env::args(), env::var(CONFIG_ENV_VAR).ok())?;
+        Self::load_from_path(path)
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
@@ -138,9 +141,31 @@ impl Config {
     }
 }
 
+fn config_path_from_args_and_env(
+    args: impl IntoIterator<Item = String>,
+    env_config_path: Option<String>,
+) -> Result<String> {
+    let mut args = args.into_iter();
+    let _program = args.next();
+    let mut config_path = env_config_path.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            let Some(path) = args.next() else {
+                return Err(BotError::Config("--config requires a path".to_string()));
+            };
+            config_path = path;
+        } else {
+            return Err(BotError::Config(format!("unknown argument: {arg}")));
+        }
+    }
+
+    Ok(config_path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, config_path_from_args_and_env};
 
     const VALID_CONFIG: &str = r#"
 [bot]
@@ -255,5 +280,48 @@ verbose = true
         let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
 
         assert!(error.to_string().contains("sqlite path must not be empty"));
+    }
+
+    #[test]
+    fn uses_default_config_path_when_no_runtime_override_is_present() {
+        let path = config_path_from_args_and_env(["trader".to_string()], None)
+            .expect("path should resolve");
+
+        assert_eq!(path, "config/trader.toml");
+    }
+
+    #[test]
+    fn accepts_config_path_from_env() {
+        let path = config_path_from_args_and_env(
+            ["trader".to_string()],
+            Some("/etc/trader-env.toml".to_string()),
+        )
+        .expect("path should resolve");
+
+        assert_eq!(path, "/etc/trader-env.toml");
+    }
+
+    #[test]
+    fn accepts_config_path_argument() {
+        let path = config_path_from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "/etc/trader.toml".to_string(),
+            ],
+            Some("/etc/trader-env.toml".to_string()),
+        )
+        .expect("path should resolve");
+
+        assert_eq!(path, "/etc/trader.toml");
+    }
+
+    #[test]
+    fn rejects_missing_config_path_argument_value() {
+        let error =
+            config_path_from_args_and_env(["trader".to_string(), "--config".to_string()], None)
+                .expect_err("path should fail");
+
+        assert!(error.to_string().contains("--config requires a path"));
     }
 }

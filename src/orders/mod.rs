@@ -25,6 +25,7 @@ pub struct OrderRequest {
     pub side: Side,
     pub quantity_base: f64,
     pub limit_price: f64,
+    pub client_order_id: Option<String>,
 }
 
 impl OrderRequest {
@@ -77,6 +78,7 @@ impl Order {
 #[derive(Debug, Clone)]
 pub struct ExchangeOrder {
     pub exchange_order_id: u64,
+    pub client_order_id: String,
     pub status: OrderStatus,
 }
 

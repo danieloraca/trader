@@ -20,6 +20,7 @@ impl RiskManager {
             side: signal.side,
             quantity_base: signal.quantity_base,
             limit_price: signal.price,
+            client_order_id: None,
         };
 
         if request.quote_value() > self.config.max_order_quote_value {

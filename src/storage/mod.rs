@@ -14,6 +14,7 @@ pub trait Store {
     fn save_replay_cursor(&mut self, cursor: usize) -> Result<()>;
     fn load_next_order_id(&self) -> Result<Option<u64>>;
     fn save_next_order_id(&mut self, next_order_id: u64) -> Result<()>;
+    fn save_heartbeat(&mut self, run_id: &str) -> Result<()>;
     fn record_market_event(&mut self, event: &MarketEvent) -> Result<()>;
     fn record_order(&mut self, order: &Order) -> Result<()>;
 }

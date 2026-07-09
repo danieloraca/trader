@@ -13,7 +13,7 @@ mod telemetry;
 use crate::error::Result;
 
 fn main() -> Result<()> {
-    let config = config::Config::load()?;
+    let config = config::Config::load_from_runtime()?;
     telemetry::init(&config.telemetry);
 
     let mut app = app::App::new(config)?;

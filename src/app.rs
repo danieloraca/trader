@@ -71,12 +71,14 @@ impl App {
             symbol = %self.config.bot.symbol,
             "trader started"
         );
+        self.store.save_heartbeat(&self.run_id)?;
 
         let idle_sleep = Duration::from_millis(self.config.market_data.idle_sleep_ms);
         let mut logged_idle = false;
 
         loop {
             let Some(event) = self.market_data.next_event()? else {
+                self.store.save_heartbeat(&self.run_id)?;
                 if !logged_idle {
                     info!(
                         run_id = %self.run_id,
@@ -183,6 +185,7 @@ impl App {
 
             self.store.save_portfolio(self.exchange.portfolio())?;
             self.store.save_replay_cursor(self.market_data.cursor())?;
+            self.store.save_heartbeat(&self.run_id)?;
         }
     }
 }

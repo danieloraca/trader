@@ -6,7 +6,7 @@ use crate::storage::Store;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SqliteStore {
     connection: Connection,
@@ -33,6 +33,14 @@ impl SqliteStore {
                 path.to_string_lossy()
             ))
         })?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| {
+                BotError::Storage(format!("failed to set sqlite busy timeout: {error}"))
+            })?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| BotError::Storage(format!("failed to enable sqlite WAL: {error}")))?;
 
         let store = Self { connection };
         store.migrate()?;
@@ -54,7 +62,8 @@ impl SqliteStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     recorded_at_ms INTEGER NOT NULL,
                     bot_order_id INTEGER NOT NULL,
-                    exchange_order_id INTEGER NOT NULL,
+                    client_order_id TEXT NOT NULL,
+                    exchange_order_id INTEGER,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     quantity_base REAL NOT NULL,
@@ -84,6 +93,12 @@ impl SqliteStore {
                     updated_at_ms INTEGER NOT NULL,
                     next_order_id INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS heartbeat_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at_ms INTEGER NOT NULL,
+                    run_id TEXT NOT NULL
+                );
                 ",
             )
             .map_err(|error| BotError::Storage(format!("failed to migrate sqlite: {error}")))?;
@@ -112,6 +127,21 @@ impl SqliteStore {
                 })?;
         }
 
+        if !self.column_exists("orders", "client_order_id")? {
+            self.connection
+                .execute(
+                    "ALTER TABLE orders ADD COLUMN client_order_id TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(|error| {
+                    BotError::Storage(format!("failed to add client_order_id column: {error}"))
+                })?;
+        }
+
+        if self.column_not_null("orders", "exchange_order_id")? {
+            self.rebuild_orders_with_nullable_exchange_order_id()?;
+        }
+
         Ok(())
     }
 
@@ -135,6 +165,94 @@ impl SqliteStore {
         Ok(false)
     }
 
+    fn column_not_null(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| BotError::Storage(format!("failed to inspect schema: {error}")))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| BotError::Storage(format!("failed to read schema: {error}")))?;
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| BotError::Storage(format!("failed to read schema row: {error}")))?
+        {
+            let name: String = row.get(1).map_err(|error| {
+                BotError::Storage(format!("failed to read column name: {error}"))
+            })?;
+            if name == column {
+                let not_null: i64 = row.get(3).map_err(|error| {
+                    BotError::Storage(format!("failed to read column nullability: {error}"))
+                })?;
+                return Ok(not_null != 0);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn rebuild_orders_with_nullable_exchange_order_id(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "
+                CREATE TABLE orders_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    bot_order_id INTEGER NOT NULL,
+                    client_order_id TEXT NOT NULL,
+                    exchange_order_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity_base REAL NOT NULL,
+                    limit_price REAL NOT NULL,
+                    quote_value REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    status_reason TEXT
+                );
+
+                INSERT INTO orders_new (
+                    id,
+                    recorded_at_ms,
+                    bot_order_id,
+                    client_order_id,
+                    exchange_order_id,
+                    symbol,
+                    side,
+                    quantity_base,
+                    limit_price,
+                    quote_value,
+                    status,
+                    status_reason
+                )
+                SELECT
+                    id,
+                    recorded_at_ms,
+                    bot_order_id,
+                    client_order_id,
+                    NULLIF(exchange_order_id, 0),
+                    symbol,
+                    side,
+                    quantity_base,
+                    limit_price,
+                    quote_value,
+                    status,
+                    status_reason
+                FROM orders;
+
+                DROP TABLE orders;
+                ALTER TABLE orders_new RENAME TO orders;
+                ",
+            )
+            .map_err(|error| {
+                BotError::Storage(format!(
+                    "failed to rebuild orders table for nullable exchange ids: {error}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
     fn now_ms() -> Result<i64> {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -151,6 +269,31 @@ impl SqliteStore {
         self.connection
             .query_row(&sql, [], |row| row.get(0))
             .map_err(|error| BotError::Storage(format!("failed to count rows: {error}")))
+    }
+
+    #[cfg(test)]
+    fn count_null_exchange_order_ids(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM orders WHERE exchange_order_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                BotError::Storage(format!("failed to count null exchange order ids: {error}"))
+            })
+    }
+
+    #[cfg(test)]
+    fn heartbeat_run_id(&self) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT run_id FROM heartbeat_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| BotError::Storage(format!("failed to load heartbeat: {error}")))
     }
 }
 
@@ -313,6 +456,23 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn save_heartbeat(&mut self, run_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "
+                INSERT INTO heartbeat_state (id, updated_at_ms, run_id)
+                VALUES (1, ?1, ?2)
+                ON CONFLICT(id) DO UPDATE SET
+                    updated_at_ms = excluded.updated_at_ms,
+                    run_id = excluded.run_id
+                ",
+                params![Self::now_ms()?, run_id],
+            )
+            .map_err(|error| BotError::Storage(format!("failed to save heartbeat: {error}")))?;
+
+        Ok(())
+    }
+
     fn record_market_event(&mut self, event: &MarketEvent) -> Result<()> {
         if !event.price().is_finite() {
             return Err(BotError::Storage(
@@ -342,6 +502,7 @@ impl Store for SqliteStore {
                 INSERT INTO orders (
                     recorded_at_ms,
                     bot_order_id,
+                    client_order_id,
                     exchange_order_id,
                     symbol,
                     side,
@@ -351,12 +512,13 @@ impl Store for SqliteStore {
                     status,
                     status_reason
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ",
                 params![
                     Self::now_ms()?,
                     order.id,
-                    order.exchange_order_id.unwrap_or(0),
+                    order.request.client_order_id.as_deref().unwrap_or(""),
+                    optional_i64(order.exchange_order_id)?,
                     order.request.symbol.as_str(),
                     side_name(order.request.side),
                     order.request.quantity_base,
@@ -377,6 +539,18 @@ fn side_name(side: Side) -> &'static str {
         Side::Buy => "buy",
         Side::Sell => "sell",
     }
+}
+
+fn optional_i64(value: Option<u64>) -> Result<Option<i64>> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                BotError::Storage(format!(
+                    "value is too large to store as sqlite integer: {value}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -407,8 +581,25 @@ mod tests {
                 side: Side::Buy,
                 quantity_base: 0.01,
                 limit_price: 100.0,
+                client_order_id: Some(format!("test-client-{id}")),
             },
             status: OrderStatus::Filled,
+            status_reason: None,
+        }
+    }
+
+    fn submitted_order(id: u64) -> Order {
+        Order {
+            id,
+            exchange_order_id: None,
+            request: OrderRequest {
+                symbol: "BTC-USD".to_string(),
+                side: Side::Buy,
+                quantity_base: 0.01,
+                limit_price: 100.0,
+                client_order_id: Some(format!("test-client-{id}")),
+            },
+            status: OrderStatus::Submitted,
             status_reason: None,
         }
     }
@@ -430,6 +621,26 @@ mod tests {
             1
         );
         assert_eq!(store.count_rows("orders").expect("count should work"), 1);
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn stores_missing_exchange_order_id_as_null() {
+        let path = db_path("nullable-exchange-order-id");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        store
+            .record_order(&submitted_order(1))
+            .expect("order should record");
+
+        assert_eq!(
+            store
+                .count_null_exchange_order_ids()
+                .expect("count should work"),
+            1
+        );
 
         drop(store);
         fs::remove_file(path).expect("test database should be removed");
@@ -518,6 +729,38 @@ mod tests {
         assert_eq!(
             store.load_replay_cursor().expect("cursor load should work"),
             Some(5)
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn saves_heartbeat_state() {
+        let path = db_path("heartbeat");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        assert_eq!(
+            store.heartbeat_run_id().expect("heartbeat should load"),
+            None
+        );
+
+        store
+            .save_heartbeat("run-test")
+            .expect("heartbeat should save");
+        store
+            .save_heartbeat("run-test-2")
+            .expect("heartbeat should update");
+
+        assert_eq!(
+            store.heartbeat_run_id().expect("heartbeat should load"),
+            Some("run-test-2".to_string())
+        );
+        assert_eq!(
+            store
+                .count_rows("heartbeat_state")
+                .expect("count should work"),
+            1
         );
 
         drop(store);

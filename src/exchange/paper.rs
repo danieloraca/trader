@@ -37,6 +37,9 @@ impl Exchange for PaperExchange {
 
     fn place_order(&mut self, request: OrderRequest) -> Result<ExchangeOrder> {
         let quote_value = request.quote_value();
+        let client_order_id = request.client_order_id.clone().ok_or_else(|| {
+            BotError::Exchange("order request missing client order id".to_string())
+        })?;
 
         match request.side {
             Side::Buy if self.portfolio.quote_balance < quote_value => {
@@ -66,6 +69,7 @@ impl Exchange for PaperExchange {
 
         let order = ExchangeOrder {
             exchange_order_id: self.next_id(),
+            client_order_id,
             status: OrderStatus::Filled,
         };
         self.orders.insert(order.exchange_order_id, order.clone());
@@ -87,6 +91,7 @@ impl Exchange for PaperExchange {
             OrderStatus::Submitted => {
                 let cancelled_order = ExchangeOrder {
                     exchange_order_id,
+                    client_order_id: order.client_order_id,
                     status: OrderStatus::Cancelled,
                 };
                 self.orders
@@ -117,6 +122,7 @@ mod tests {
             side: Side::Buy,
             quantity_base,
             limit_price,
+            client_order_id: Some("test-client-order".to_string()),
         }
     }
 
@@ -126,6 +132,7 @@ mod tests {
             side: Side::Sell,
             quantity_base,
             limit_price,
+            client_order_id: Some("test-client-order".to_string()),
         }
     }
 
@@ -139,6 +146,7 @@ mod tests {
             .expect("buy should fill");
 
         assert_eq!(order.exchange_order_id, 1);
+        assert_eq!(order.client_order_id, "test-client-order");
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(exchange.portfolio().base_balance, 0.5);
         assert_eq!(exchange.portfolio().quote_balance, 950.0);
@@ -187,6 +195,22 @@ mod tests {
         assert!(error.to_string().contains("insufficient quote balance"));
         assert_eq!(exchange.portfolio().base_balance, 0.0);
         assert_eq!(exchange.portfolio().quote_balance, 10.0);
+    }
+
+    #[test]
+    fn rejects_order_without_client_order_id() {
+        let portfolio = Portfolio::new("BTC", "USD", 1_000.0);
+        let mut exchange = PaperExchange::new(portfolio);
+        let mut request = buy_request(0.5, 100.0);
+        request.client_order_id = None;
+
+        let error = exchange
+            .place_order(request)
+            .expect_err("order should fail");
+
+        assert!(error.to_string().contains("missing client order id"));
+        assert_eq!(exchange.portfolio().base_balance, 0.0);
+        assert_eq!(exchange.portfolio().quote_balance, 1_000.0);
     }
 
     #[test]
