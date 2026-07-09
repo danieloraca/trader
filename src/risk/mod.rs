@@ -3,6 +3,7 @@ use crate::error::{BotError, Result};
 use crate::orders::{OrderRequest, Side};
 use crate::portfolio::Portfolio;
 use crate::strategy::Signal;
+use tracing::info;
 
 pub struct RiskManager {
     config: RiskConfig,
@@ -46,7 +47,14 @@ impl RiskManager {
             )));
         }
 
-        println!("approved signal: {}", signal.reason);
+        info!(
+            symbol = %signal.symbol,
+            side = ?signal.side,
+            quantity_base = signal.quantity_base,
+            price = signal.price,
+            reason = %signal.reason,
+            "approved signal"
+        );
         Ok(request)
     }
 }

@@ -7,6 +7,8 @@ use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
 use crate::storage::{SqliteStore, Store};
 use crate::strategy::{SimpleMomentumStrategy, Strategy};
+use crate::telemetry;
+use tracing::{debug, info, warn};
 
 pub struct App {
     config: Config,
@@ -14,6 +16,7 @@ pub struct App {
     market_data: ReplayMarketDataSource,
     order_manager: OrderManager,
     risk: RiskManager,
+    run_id: String,
     strategy: SimpleMomentumStrategy,
     store: SqliteStore,
 }
@@ -38,12 +41,22 @@ impl App {
 
         let exchange = PaperExchange::new(portfolio);
         let _synced_portfolio = exchange.sync_portfolio()?;
+        let run_id = telemetry::new_run_id();
+
+        info!(
+            run_id = %run_id,
+            symbol = %config.bot.symbol,
+            replay_cursor,
+            next_order_id,
+            "app initialized"
+        );
 
         Ok(Self {
             exchange,
             market_data,
             order_manager: OrderManager::new_at(next_order_id),
             risk: RiskManager::new(config.risk.clone()),
+            run_id,
             strategy: SimpleMomentumStrategy::new(),
             store,
             config,
@@ -51,12 +64,29 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        println!("starting trader for {}", self.config.bot.symbol);
+        info!(
+            run_id = %self.run_id,
+            symbol = %self.config.bot.symbol,
+            "trader started"
+        );
 
         while let Some(event) = self.market_data.next_event()? {
+            debug!(
+                run_id = %self.run_id,
+                symbol = %event.symbol(),
+                price = event.price(),
+                replay_cursor = self.market_data.cursor(),
+                "market event received"
+            );
             self.store.record_market_event(&event)?;
 
             let signals = self.strategy.on_market_event(&event);
+            debug!(
+                run_id = %self.run_id,
+                signal_count = signals.len(),
+                "strategy evaluated market event"
+            );
+
             for signal in signals {
                 let portfolio = self.exchange.portfolio();
                 let order_request: OrderRequest = self.risk.approve(&signal, portfolio)?;
@@ -65,21 +95,48 @@ impl App {
                     .submit_order(&mut self.exchange, order_request)?;
                 for order in transitions {
                     self.store.record_order(&order)?;
+                    let exchange_status = if let Some(exchange_order_id) = order.exchange_order_id {
+                        Some(self.exchange.order_status(exchange_order_id)?.status)
+                    } else {
+                        None
+                    };
+
                     match order.status {
                         OrderStatus::Filled => {
-                            if let Some(exchange_order_id) = order.exchange_order_id {
-                                let exchange_order =
-                                    self.exchange.order_status(exchange_order_id)?;
-                                println!(
-                                    "filled paper order: {order} ({:?})",
-                                    exchange_order.status
-                                );
-                            } else {
-                                println!("filled paper order: {order}");
-                            }
+                            info!(
+                                run_id = %self.run_id,
+                                bot_order_id = order.id,
+                                exchange_order_id = ?order.exchange_order_id,
+                                exchange_status = ?exchange_status,
+                                symbol = %order.request.symbol,
+                                side = ?order.request.side,
+                                quantity_base = order.request.quantity_base,
+                                limit_price = order.request.limit_price,
+                                quote_value = order.request.quote_value(),
+                                status = ?order.status,
+                                "order transition recorded"
+                            );
                         }
-                        OrderStatus::Rejected => println!("rejected paper order: {order}"),
-                        _ => {}
+                        OrderStatus::Rejected => {
+                            warn!(
+                                run_id = %self.run_id,
+                                bot_order_id = order.id,
+                                symbol = %order.request.symbol,
+                                side = ?order.request.side,
+                                status = ?order.status,
+                                reason = ?order.status_reason,
+                                "order transition recorded"
+                            );
+                        }
+                        _ => {
+                            debug!(
+                                run_id = %self.run_id,
+                                bot_order_id = order.id,
+                                exchange_order_id = ?order.exchange_order_id,
+                                status = ?order.status,
+                                "order transition recorded"
+                            );
+                        }
                     }
                 }
 
@@ -91,7 +148,15 @@ impl App {
             self.store.save_replay_cursor(self.market_data.cursor())?;
         }
 
-        println!("final paper portfolio: {}", self.exchange.portfolio());
+        let portfolio = self.exchange.portfolio();
+        info!(
+            run_id = %self.run_id,
+            base_currency = %portfolio.base_currency,
+            base_balance = portfolio.base_balance,
+            quote_currency = %portfolio.quote_currency,
+            quote_balance = portfolio.quote_balance,
+            "trader stopped"
+        );
         Ok(())
     }
 }
