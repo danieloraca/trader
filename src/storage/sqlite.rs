@@ -53,13 +53,15 @@ impl SqliteStore {
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     recorded_at_ms INTEGER NOT NULL,
+                    bot_order_id INTEGER NOT NULL,
                     exchange_order_id INTEGER NOT NULL,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     quantity_base REAL NOT NULL,
                     limit_price REAL NOT NULL,
                     quote_value REAL NOT NULL,
-                    status TEXT NOT NULL
+                    status TEXT NOT NULL,
+                    status_reason TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS portfolio_state (
@@ -80,7 +82,51 @@ impl SqliteStore {
             )
             .map_err(|error| BotError::Storage(format!("failed to migrate sqlite: {error}")))?;
 
+        self.ensure_orders_schema()?;
         Ok(())
+    }
+
+    fn ensure_orders_schema(&self) -> Result<()> {
+        if !self.column_exists("orders", "bot_order_id")? {
+            self.connection
+                .execute(
+                    "ALTER TABLE orders ADD COLUMN bot_order_id INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| {
+                    BotError::Storage(format!("failed to add bot_order_id column: {error}"))
+                })?;
+        }
+
+        if !self.column_exists("orders", "status_reason")? {
+            self.connection
+                .execute("ALTER TABLE orders ADD COLUMN status_reason TEXT", [])
+                .map_err(|error| {
+                    BotError::Storage(format!("failed to add status_reason column: {error}"))
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| BotError::Storage(format!("failed to inspect schema: {error}")))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| BotError::Storage(format!("failed to read schema: {error}")))?;
+
+        for name in columns {
+            if name.map_err(|error| BotError::Storage(format!("failed to read column: {error}")))?
+                == column
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     fn now_ms() -> Result<i64> {
@@ -230,25 +276,29 @@ impl Store for SqliteStore {
                 "
                 INSERT INTO orders (
                     recorded_at_ms,
+                    bot_order_id,
                     exchange_order_id,
                     symbol,
                     side,
                     quantity_base,
                     limit_price,
                     quote_value,
-                    status
+                    status,
+                    status_reason
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ",
                 params![
                     Self::now_ms()?,
                     order.id,
+                    order.exchange_order_id.unwrap_or(0),
                     order.request.symbol.as_str(),
                     side_name(order.request.side),
                     order.request.quantity_base,
                     order.request.limit_price,
                     order.request.quote_value(),
                     format!("{:?}", order.status),
+                    order.status_reason.as_deref(),
                 ],
             )
             .map_err(|error| BotError::Storage(format!("failed to record order: {error}")))?;
@@ -286,6 +336,7 @@ mod tests {
     fn order(id: u64) -> Order {
         Order {
             id,
+            exchange_order_id: Some(id),
             request: OrderRequest {
                 symbol: "BTC-USD".to_string(),
                 side: Side::Buy,
@@ -293,6 +344,7 @@ mod tests {
                 limit_price: 100.0,
             },
             status: OrderStatus::Filled,
+            status_reason: None,
         }
     }
 

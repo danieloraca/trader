@@ -1,6 +1,6 @@
 use crate::error::{BotError, Result};
 use crate::exchange::Exchange;
-use crate::orders::{Order, OrderRequest, OrderStatus, Side};
+use crate::orders::{ExchangeOrder, OrderRequest, OrderStatus, Side};
 use crate::portfolio::Portfolio;
 
 pub struct PaperExchange {
@@ -28,7 +28,7 @@ impl Exchange for PaperExchange {
         &self.portfolio
     }
 
-    fn place_order(&mut self, request: OrderRequest) -> Result<Order> {
+    fn place_order(&mut self, request: OrderRequest) -> Result<ExchangeOrder> {
         let quote_value = request.quote_value();
 
         match request.side {
@@ -57,9 +57,8 @@ impl Exchange for PaperExchange {
             }
         }
 
-        Ok(Order {
-            id: self.next_id(),
-            request,
+        Ok(ExchangeOrder {
+            exchange_order_id: self.next_id(),
             status: OrderStatus::Filled,
         })
     }
@@ -99,7 +98,7 @@ mod tests {
             .place_order(buy_request(0.5, 100.0))
             .expect("buy should fill");
 
-        assert_eq!(order.id, 1);
+        assert_eq!(order.exchange_order_id, 1);
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(exchange.portfolio().base_balance, 0.5);
         assert_eq!(exchange.portfolio().quote_balance, 950.0);
@@ -117,7 +116,7 @@ mod tests {
             .place_order(sell_request(0.2, 110.0))
             .expect("sell should fill");
 
-        assert_eq!(order.id, 2);
+        assert_eq!(order.exchange_order_id, 2);
         assert_eq!(exchange.portfolio().base_balance, 0.3);
         assert_eq!(exchange.portfolio().quote_balance, 972.0);
     }

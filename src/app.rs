@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::exchange::{Exchange, PaperExchange};
 use crate::market::{MarketDataSource, ReplayMarketDataSource};
-use crate::orders::OrderRequest;
+use crate::orders::{OrderManager, OrderRequest, OrderStatus};
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
 use crate::storage::{SqliteStore, Store};
@@ -12,6 +12,7 @@ pub struct App {
     config: Config,
     exchange: PaperExchange,
     market_data: ReplayMarketDataSource,
+    order_manager: OrderManager,
     risk: RiskManager,
     strategy: SimpleMomentumStrategy,
     store: SqliteStore,
@@ -37,6 +38,7 @@ impl App {
         Ok(Self {
             exchange: PaperExchange::new(portfolio),
             market_data,
+            order_manager: OrderManager::new(),
             risk: RiskManager::new(config.risk.clone()),
             strategy: SimpleMomentumStrategy::new(),
             store,
@@ -54,9 +56,17 @@ impl App {
             for signal in signals {
                 let portfolio = self.exchange.portfolio();
                 let order_request: OrderRequest = self.risk.approve(&signal, portfolio)?;
-                let order = self.exchange.place_order(order_request)?;
-                self.store.record_order(&order)?;
-                println!("placed paper order: {order}");
+                let transitions = self
+                    .order_manager
+                    .submit_order(&mut self.exchange, order_request)?;
+                for order in transitions {
+                    self.store.record_order(&order)?;
+                    match order.status {
+                        OrderStatus::Filled => println!("filled paper order: {order}"),
+                        OrderStatus::Rejected => println!("rejected paper order: {order}"),
+                        _ => {}
+                    }
+                }
             }
 
             self.store.save_portfolio(self.exchange.portfolio())?;
