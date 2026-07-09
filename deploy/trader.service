@@ -1,0 +1,23 @@
+[Unit]
+Description=Trader paper/live daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/trader
+EnvironmentFile=-/etc/trader/trader.env
+ExecStart=/opt/trader/trader --config /etc/trader/trader.toml
+Restart=on-failure
+RestartSec=10
+StateDirectory=trader
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trader
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,8 @@ pub struct Config {
     pub exchange: ExchangeConfig,
     pub market_data: MarketDataConfig,
     pub risk: RiskConfig,
+    #[serde(default)]
+    pub strategy: StrategyConfig,
     pub storage: StorageConfig,
     pub telemetry: TelemetryConfig,
 }
@@ -89,9 +91,21 @@ pub struct MarketDataConfig {
     pub kind: MarketDataKind,
     #[serde(default)]
     pub replay_prices: Vec<Decimal>,
+    #[serde(default = "default_market_data_idle_sleep_ms")]
     pub idle_sleep_ms: u64,
     #[serde(default)]
     pub kraken: KrakenMarketDataConfig,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            kind: MarketDataKind::Replay,
+            replay_prices: Vec::new(),
+            idle_sleep_ms: default_market_data_idle_sleep_ms(),
+            kraken: KrakenMarketDataConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -134,6 +148,58 @@ pub struct RiskConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct StrategyConfig {
+    #[serde(default)]
+    pub kind: StrategyKind,
+    #[serde(default)]
+    pub simple_momentum: SimpleMomentumConfig,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            kind: StrategyKind::SimpleMomentum,
+            simple_momentum: SimpleMomentumConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyKind {
+    SimpleMomentum,
+}
+
+impl Default for StrategyKind {
+    fn default() -> Self {
+        Self::SimpleMomentum
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimpleMomentumConfig {
+    #[serde(default = "default_simple_momentum_buy_threshold_bps")]
+    pub buy_threshold_bps: i64,
+    #[serde(default = "default_simple_momentum_sell_threshold_bps")]
+    pub sell_threshold_bps: i64,
+    #[serde(default = "default_simple_momentum_buy_quantity_base")]
+    pub buy_quantity_base: Decimal,
+    #[serde(default = "default_simple_momentum_sell_quantity_base")]
+    pub sell_quantity_base: Decimal,
+}
+
+impl Default for SimpleMomentumConfig {
+    fn default() -> Self {
+        Self {
+            buy_threshold_bps: default_simple_momentum_buy_threshold_bps(),
+            sell_threshold_bps: default_simple_momentum_sell_threshold_bps(),
+            buy_quantity_base: default_simple_momentum_buy_quantity_base(),
+            sell_quantity_base: default_simple_momentum_sell_quantity_base(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
     pub sqlite_path: String,
 }
@@ -143,12 +209,19 @@ pub struct TelemetryConfig {
     pub verbose: bool,
 }
 
-impl Config {
-    pub fn load_from_runtime() -> Result<Self> {
-        let path = config_path_from_args_and_env(env::args(), env::var(CONFIG_ENV_VAR).ok())?;
-        Self::load_from_path(path)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCommand {
+    Run,
+    Backtest,
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeOptions {
+    pub config_path: String,
+    pub command: RuntimeCommand,
+}
+
+impl Config {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path).map_err(|error| {
@@ -274,6 +347,30 @@ impl Config {
             ));
         }
 
+        if self.strategy.simple_momentum.buy_threshold_bps <= 0 {
+            return Err(BotError::Config(
+                "simple momentum buy threshold must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.simple_momentum.sell_threshold_bps >= 0 {
+            return Err(BotError::Config(
+                "simple momentum sell threshold must be negative".to_string(),
+            ));
+        }
+
+        if self.strategy.simple_momentum.buy_quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "simple momentum buy quantity must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.simple_momentum.sell_quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "simple momentum sell quantity must be positive".to_string(),
+            ));
+        }
+
         if self.storage.sqlite_path.trim().is_empty() {
             return Err(BotError::Config(
                 "sqlite path must not be empty".to_string(),
@@ -281,6 +378,40 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+impl RuntimeOptions {
+    pub fn from_runtime() -> Result<Self> {
+        Self::from_args_and_env(env::args(), env::var(CONFIG_ENV_VAR).ok())
+    }
+
+    fn from_args_and_env(
+        args: impl IntoIterator<Item = String>,
+        env_config_path: Option<String>,
+    ) -> Result<Self> {
+        let mut args = args.into_iter();
+        let _program = args.next();
+        let mut config_path = env_config_path.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+        let mut command = RuntimeCommand::Run;
+
+        while let Some(arg) = args.next() {
+            if arg == "--config" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config("--config requires a path".to_string()));
+                };
+                config_path = path;
+            } else if arg == "--backtest" {
+                command = RuntimeCommand::Backtest;
+            } else {
+                return Err(BotError::Config(format!("unknown argument: {arg}")));
+            }
+        }
+
+        Ok(Self {
+            config_path,
+            command,
+        })
     }
 }
 
@@ -304,26 +435,32 @@ fn default_kraken_ticker_poll_interval_ms() -> u64 {
     5_000
 }
 
+fn default_market_data_idle_sleep_ms() -> u64 {
+    1_000
+}
+
+fn default_simple_momentum_buy_threshold_bps() -> i64 {
+    50
+}
+
+fn default_simple_momentum_sell_threshold_bps() -> i64 {
+    -100
+}
+
+fn default_simple_momentum_buy_quantity_base() -> Decimal {
+    Decimal::from_micro_units(10_000)
+}
+
+fn default_simple_momentum_sell_quantity_base() -> Decimal {
+    Decimal::from_micro_units(5_000)
+}
+
+#[cfg(test)]
 fn config_path_from_args_and_env(
     args: impl IntoIterator<Item = String>,
     env_config_path: Option<String>,
 ) -> Result<String> {
-    let mut args = args.into_iter();
-    let _program = args.next();
-    let mut config_path = env_config_path.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
-
-    while let Some(arg) = args.next() {
-        if arg == "--config" {
-            let Some(path) = args.next() else {
-                return Err(BotError::Config("--config requires a path".to_string()));
-            };
-            config_path = path;
-        } else {
-            return Err(BotError::Config(format!("unknown argument: {arg}")));
-        }
-    }
-
-    Ok(config_path)
+    RuntimeOptions::from_args_and_env(args, env_config_path).map(|options| options.config_path)
 }
 
 #[cfg(test)]
@@ -361,6 +498,15 @@ poll_interval_ms = 5000
 max_order_quote_value = 500.0
 max_position_base = 0.25
 
+[strategy]
+kind = "simple_momentum"
+
+[strategy.simple_momentum]
+buy_threshold_bps = 50
+sell_threshold_bps = -100
+buy_quantity_base = 0.01
+sell_quantity_base = 0.005
+
 [storage]
 sqlite_path = "data/trader.sqlite"
 
@@ -394,6 +540,25 @@ verbose = true
         assert_eq!(config.market_data.kraken.poll_interval_ms, 5_000);
         assert_eq!(config.risk.max_order_quote_value.to_string(), "500");
         assert_eq!(config.risk.max_position_base.to_string(), "0.25");
+        assert_eq!(config.strategy.kind, super::StrategyKind::SimpleMomentum);
+        assert_eq!(config.strategy.simple_momentum.buy_threshold_bps, 50);
+        assert_eq!(config.strategy.simple_momentum.sell_threshold_bps, -100);
+        assert_eq!(
+            config
+                .strategy
+                .simple_momentum
+                .buy_quantity_base
+                .to_string(),
+            "0.01"
+        );
+        assert_eq!(
+            config
+                .strategy
+                .simple_momentum
+                .sell_quantity_base
+                .to_string(),
+            "0.005"
+        );
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
         assert!(config.telemetry.verbose);
     }

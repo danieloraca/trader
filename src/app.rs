@@ -7,7 +7,7 @@ use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
 use crate::shutdown::{Shutdown, sleep_or_shutdown};
 use crate::storage::{SqliteStore, Store};
-use crate::strategy::{SimpleMomentumStrategy, Strategy};
+use crate::strategy::{self, Strategy};
 use crate::telemetry;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -19,7 +19,7 @@ pub struct App {
     order_manager: OrderManager,
     risk: RiskManager,
     run_id: String,
-    strategy: SimpleMomentumStrategy,
+    strategy: Box<dyn Strategy>,
     store: SqliteStore,
 }
 
@@ -67,7 +67,7 @@ impl App {
             order_manager: OrderManager::new_at(next_order_id),
             risk: RiskManager::new(config.risk.clone()),
             run_id,
-            strategy: SimpleMomentumStrategy::new(),
+            strategy: strategy::from_config(&config.strategy),
             store,
             config,
         })
