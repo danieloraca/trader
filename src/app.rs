@@ -5,10 +5,10 @@ use crate::market::{KrakenTickerMarketDataSource, MarketDataSource, ReplayMarket
 use crate::orders::{OrderManager, OrderRequest, OrderStatus};
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
+use crate::shutdown::{Shutdown, sleep_or_shutdown};
 use crate::storage::{SqliteStore, Store};
 use crate::strategy::{SimpleMomentumStrategy, Strategy};
 use crate::telemetry;
-use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -73,7 +73,7 @@ impl App {
         })
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self, shutdown: &Shutdown) -> Result<()> {
         info!(
             run_id = %self.run_id,
             symbol = %self.config.bot.symbol,
@@ -84,7 +84,7 @@ impl App {
         let idle_sleep = Duration::from_millis(self.config.market_data.idle_sleep_ms);
         let mut logged_idle = false;
 
-        loop {
+        while !shutdown.is_requested() {
             let event = match self.market_data.next_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => {
@@ -99,7 +99,9 @@ impl App {
                         logged_idle = true;
                     }
 
-                    thread::sleep(idle_sleep);
+                    if sleep_or_shutdown(idle_sleep, shutdown) {
+                        break;
+                    }
                     continue;
                 }
                 Err(BotError::MarketData(message)) => {
@@ -110,7 +112,9 @@ impl App {
                         "market data source failed; retrying"
                     );
                     self.store.save_heartbeat(&self.run_id)?;
-                    thread::sleep(idle_sleep);
+                    if sleep_or_shutdown(idle_sleep, shutdown) {
+                        break;
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -177,6 +181,23 @@ impl App {
             }
             self.store.save_heartbeat(&self.run_id)?;
         }
+
+        self.flush_state_for_shutdown()?;
+        info!(
+            run_id = %self.run_id,
+            replay_cursor = ?self.market_data.replay_cursor(),
+            "trader shutdown complete"
+        );
+
+        Ok(())
+    }
+
+    fn flush_state_for_shutdown(&mut self) -> Result<()> {
+        self.store.save_portfolio(self.exchange.portfolio())?;
+        if let Some(replay_cursor) = self.market_data.replay_cursor() {
+            self.store.save_replay_cursor(replay_cursor)?;
+        }
+        self.store.save_heartbeat(&self.run_id)
     }
 
     fn log_order_transition(
