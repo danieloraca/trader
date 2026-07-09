@@ -41,6 +41,7 @@ pub struct SweepResult {
 pub struct CandleSweepReport {
     pub sqlite_path: String,
     pub result_count: usize,
+    pub skipped_under_warmed_count: usize,
     pub results: Vec<CandleSweepResult>,
 }
 
@@ -114,6 +115,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
     }
 
     let mut results = Vec::new();
+    let mut skipped_under_warmed_count = 0_usize;
 
     for interval_seconds in CANDLE_INTERVAL_SECONDS {
         let interval_ms = interval_seconds * 1_000;
@@ -126,6 +128,12 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
         for fast_window in FAST_WINDOWS {
             for slow_window in SLOW_WINDOWS {
                 if fast_window >= slow_window {
+                    continue;
+                }
+
+                let minimum_candles = slow_window + 1;
+                if candles.len() < minimum_candles {
+                    skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
                     continue;
                 }
 
@@ -162,6 +170,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
     Ok(CandleSweepReport {
         sqlite_path: sqlite_path.to_string(),
         result_count: results.len(),
+        skipped_under_warmed_count,
         results,
     })
 }
@@ -272,7 +281,19 @@ impl Display for CandleSweepReport {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Candle MA sweep report")?;
         writeln!(f, "SQLite source: {}", self.sqlite_path)?;
-        writeln!(f, "Combinations: {}", self.result_count)?;
+        writeln!(f, "Runnable combinations: {}", self.result_count)?;
+        writeln!(
+            f,
+            "Skipped under-warmed combinations: {}",
+            self.skipped_under_warmed_count
+        )?;
+        if self.results.is_empty() {
+            writeln!(
+                f,
+                "No runnable combinations yet. Let market data collect longer, then rerun the sweep."
+            )?;
+            return Ok(());
+        }
         writeln!(
             f,
             "{:>8} {:>7} {:>4} {:>4} {:>8} {:>12} {:>8} {:>12} {:>8} {:>7} {:>7} {:>7} {:>9} {:>10}",
@@ -442,9 +463,56 @@ mod tests {
         let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
             .expect("candle sweep should run");
 
-        assert_eq!(report.result_count, 96);
-        assert_eq!(report.results.len(), 96);
+        assert_eq!(report.result_count, 72);
+        assert_eq!(report.results.len(), 72);
+        assert_eq!(report.skipped_under_warmed_count, 24);
         assert!(report.results.iter().all(|result| result.candle_count > 0));
+
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn skips_moving_average_combinations_without_enough_candles() {
+        let path = db_path("sqlite-candles-short");
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute(
+                "
+                CREATE TABLE market_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                )
+                ",
+                [],
+            )
+            .expect("market events table should create");
+
+        for index in 0..20_i64 {
+            connection
+                .execute(
+                    "
+                    INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
+                    VALUES (?1, 'BTC-USD', ?2)
+                    ",
+                    (index * 60_000, 100_000_000 + (index * 100_000)),
+                )
+                .expect("market event should insert");
+        }
+        drop(connection);
+
+        let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
+            .expect("candle sweep should run");
+
+        assert!(report.result_count < 96);
+        assert!(report.skipped_under_warmed_count > 0);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.candle_count > result.slow_window)
+        );
 
         fs::remove_file(path).expect("test database should be removed");
     }
