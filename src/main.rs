@@ -11,6 +11,7 @@ mod risk;
 mod shutdown;
 mod storage;
 mod strategy;
+mod sweep;
 mod telemetry;
 
 use crate::config::RuntimeCommand;
@@ -31,6 +32,14 @@ fn main() -> Result<()> {
                 error::BotError::Config("--backtest-sqlite requires a sqlite path".to_string())
             })?;
             let report = backtest::run_from_sqlite(&config, sqlite_path)?;
+            println!("{report}");
+            return Ok(());
+        }
+        RuntimeCommand::SweepSqlite => {
+            let sqlite_path = runtime.sweep_sqlite_path.as_deref().ok_or_else(|| {
+                error::BotError::Config("--sweep-sqlite requires a sqlite path".to_string())
+            })?;
+            let report = sweep::run(&config, sqlite_path)?;
             println!("{report}");
             return Ok(());
         }

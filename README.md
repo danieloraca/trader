@@ -42,6 +42,12 @@ Backtest against recorded Pi market data:
 cargo run -- --config config/pi-paper-live.toml --backtest-sqlite /var/lib/trader/trader.sqlite
 ```
 
+Sweep simple momentum parameters against recorded Pi market data:
+
+```sh
+cargo run -- --config config/pi-paper-live.toml --sweep-sqlite /var/lib/trader/trader.sqlite
+```
+
 Configure cost assumptions and optional CSV output:
 
 ```toml

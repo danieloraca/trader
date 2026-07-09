@@ -236,6 +236,7 @@ pub enum RuntimeCommand {
     Run,
     Backtest,
     BacktestSqlite,
+    SweepSqlite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +244,7 @@ pub struct RuntimeOptions {
     pub config_path: String,
     pub command: RuntimeCommand,
     pub backtest_sqlite_path: Option<String>,
+    pub sweep_sqlite_path: Option<String>,
 }
 
 impl Config {
@@ -431,6 +433,7 @@ impl RuntimeOptions {
         let mut config_path = env_config_path.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
         let mut command = RuntimeCommand::Run;
         let mut backtest_sqlite_path = None;
+        let mut sweep_sqlite_path = None;
 
         while let Some(arg) = args.next() {
             if arg == "--config" {
@@ -448,6 +451,14 @@ impl RuntimeOptions {
                 };
                 command = RuntimeCommand::BacktestSqlite;
                 backtest_sqlite_path = Some(path);
+            } else if arg == "--sweep-sqlite" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--sweep-sqlite requires a sqlite path".to_string(),
+                    ));
+                };
+                command = RuntimeCommand::SweepSqlite;
+                sweep_sqlite_path = Some(path);
             } else {
                 return Err(BotError::Config(format!("unknown argument: {arg}")));
             }
@@ -457,6 +468,7 @@ impl RuntimeOptions {
             config_path,
             command,
             backtest_sqlite_path,
+            sweep_sqlite_path,
         })
     }
 }
@@ -768,6 +780,28 @@ verbose = true
         assert_eq!(options.command, RuntimeCommand::BacktestSqlite);
         assert_eq!(
             options.backtest_sqlite_path.as_deref(),
+            Some("/var/lib/trader/trader.sqlite")
+        );
+    }
+
+    #[test]
+    fn accepts_sweep_sqlite_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "/etc/trader.toml".to_string(),
+                "--sweep-sqlite".to_string(),
+                "/var/lib/trader/trader.sqlite".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.config_path, "/etc/trader.toml");
+        assert_eq!(options.command, RuntimeCommand::SweepSqlite);
+        assert_eq!(
+            options.sweep_sqlite_path.as_deref(),
             Some("/var/lib/trader/trader.sqlite")
         );
     }

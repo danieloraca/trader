@@ -79,12 +79,19 @@ pub fn run(config: &Config) -> Result<BacktestReport> {
 }
 
 pub fn run_from_sqlite(config: &Config, sqlite_path: &str) -> Result<BacktestReport> {
-    let prices = load_replay_prices_from_sqlite(sqlite_path, &config.bot.symbol)?;
+    let prices = load_prices_from_sqlite(sqlite_path, &config.bot.symbol)?;
+    run_from_prices(config, prices)
+}
+
+pub fn run_from_prices(
+    config: &Config,
+    prices: impl IntoIterator<Item = Decimal>,
+) -> Result<BacktestReport> {
+    let prices = prices.into_iter().collect::<Vec<_>>();
     if prices.is_empty() {
-        return Err(BotError::Config(format!(
-            "backtest sqlite source has no market events for {}",
-            config.bot.symbol
-        )));
+        return Err(BotError::Config(
+            "backtest price source is empty".to_string(),
+        ));
     }
 
     let market_data = ReplayMarketDataSource::from_prices_at_cursor(&config.bot.symbol, prices, 0);
@@ -251,7 +258,7 @@ fn run_with_source(
     Ok(report)
 }
 
-fn load_replay_prices_from_sqlite(sqlite_path: &str, symbol: &str) -> Result<Vec<Decimal>> {
+pub fn load_prices_from_sqlite(sqlite_path: &str, symbol: &str) -> Result<Vec<Decimal>> {
     let connection = Connection::open_with_flags(
         sqlite_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
