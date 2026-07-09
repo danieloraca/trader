@@ -3,6 +3,7 @@ use crate::candles;
 use crate::config::{Config, StrategyKind};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
+use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 
 const BUY_THRESHOLDS_BPS: [i64; 6] = [3, 5, 8, 10, 15, 20];
@@ -91,12 +92,7 @@ pub fn run(config: &Config, sqlite_path: &str) -> Result<SweepReport> {
         }
     }
 
-    results.sort_by(|lhs, rhs| {
-        rhs.net_profit_loss_quote
-            .cmp(&lhs.net_profit_loss_quote)
-            .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
-            .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
-    });
+    results.sort_by(compare_sweep_results);
 
     Ok(SweepReport {
         sqlite_path: sqlite_path.to_string(),
@@ -131,8 +127,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                     continue;
                 }
 
-                let minimum_candles = slow_window + 1;
-                if candles.len() < minimum_candles {
+                if candles.len() < slow_window + 1 {
                     skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
                     continue;
                 }
@@ -160,12 +155,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
         }
     }
 
-    results.sort_by(|lhs, rhs| {
-        rhs.net_profit_loss_quote
-            .cmp(&lhs.net_profit_loss_quote)
-            .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
-            .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
-    });
+    results.sort_by(compare_candle_sweep_results);
 
     Ok(CandleSweepReport {
         sqlite_path: sqlite_path.to_string(),
@@ -173,6 +163,24 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
         skipped_under_warmed_count,
         results,
     })
+}
+
+fn compare_sweep_results(lhs: &SweepResult, rhs: &SweepResult) -> Ordering {
+    rhs.net_profit_loss_quote
+        .cmp(&lhs.net_profit_loss_quote)
+        .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
+        .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
+}
+
+fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult) -> Ordering {
+    let lhs_traded = lhs.filled_order_count > 0;
+    let rhs_traded = rhs.filled_order_count > 0;
+
+    rhs_traded
+        .cmp(&lhs_traded)
+        .then_with(|| rhs.net_profit_loss_quote.cmp(&lhs.net_profit_loss_quote))
+        .then_with(|| lhs.max_drawdown_pct.total_cmp(&rhs.max_drawdown_pct))
+        .then_with(|| rhs.filled_order_count.cmp(&lhs.filled_order_count))
 }
 
 impl SweepResult {
@@ -512,6 +520,65 @@ mod tests {
                 .results
                 .iter()
                 .all(|result| result.candle_count > result.slow_window)
+        );
+
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn ranks_candle_sweep_rows_with_trades_before_no_trade_rows() {
+        let path = db_path("sqlite-candles-ranking");
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute(
+                "
+                CREATE TABLE market_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                )
+                ",
+                [],
+            )
+            .expect("market events table should create");
+
+        for index in 0..180_i64 {
+            let cycle = index % 30;
+            let price_micro_units = if cycle < 15 {
+                100_000_000 + (cycle * 500_000)
+            } else {
+                107_500_000 - ((cycle - 15) * 500_000)
+            };
+            connection
+                .execute(
+                    "
+                    INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
+                    VALUES (?1, 'BTC-USD', ?2)
+                    ",
+                    (index * 60_000, price_micro_units),
+                )
+                .expect("market event should insert");
+        }
+        drop(connection);
+
+        let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
+            .expect("candle sweep should run");
+        let first_zero_fill_index = report
+            .results
+            .iter()
+            .position(|result| result.filled_order_count == 0)
+            .unwrap_or(report.results.len());
+
+        assert!(
+            report.results[..first_zero_fill_index]
+                .iter()
+                .all(|result| result.filled_order_count > 0)
+        );
+        assert!(
+            report.results[first_zero_fill_index..]
+                .iter()
+                .all(|result| result.filled_order_count == 0)
         );
 
         fs::remove_file(path).expect("test database should be removed");
