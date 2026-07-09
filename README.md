@@ -71,6 +71,37 @@ sudo systemctl stop trader
 
 The systemd unit sends `SIGTERM`; the app handles it by flushing portfolio state, replay cursor when applicable, and heartbeat before exiting.
 
+## Dashboard
+
+The dashboard is a separate read-only binary. It does not control trading and only reads SQLite.
+
+Build it on the Pi:
+
+```sh
+cd /home/trader/Development/trader
+cargo build --release --bin dashboard
+```
+
+Run manually:
+
+```sh
+TRADER_DASHBOARD_ADDR=127.0.0.1:3040 \
+TRADER_DASHBOARD_DB=/var/lib/trader/trader.sqlite \
+target/release/dashboard
+```
+
+Install as a systemd service on your current Pi layout:
+
+```sh
+sudo cp deploy/trader-dashboard.service /etc/systemd/system/trader-dashboard.service
+sudo systemctl daemon-reload
+sudo systemctl enable trader-dashboard
+sudo systemctl start trader-dashboard
+journalctl -u trader-dashboard -f
+```
+
+If you want it reachable directly on your LAN, change `TRADER_DASHBOARD_ADDR` in the service to `0.0.0.0:3040`. Keep it behind your trusted local network; there is no authentication in v1.
+
 ## Safety Notes
 
 Keep `enable_order_placement = false` until the bot has run in paper-live mode for days. Watch order frequency, risk rejections, DB growth, heartbeat freshness, and restart behavior before considering tiny real orders.
