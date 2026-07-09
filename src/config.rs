@@ -25,6 +25,7 @@ pub struct BotConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketDataConfig {
     pub replay_prices: Vec<f64>,
+    pub idle_sleep_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +110,12 @@ impl Config {
             ));
         }
 
+        if self.market_data.idle_sleep_ms == 0 {
+            return Err(BotError::Config(
+                "market data idle sleep must be positive".to_string(),
+            ));
+        }
+
         if !self.risk.max_order_quote_value.is_finite() || self.risk.max_order_quote_value <= 0.0 {
             return Err(BotError::Config(
                 "max order quote value must be positive".to_string(),
@@ -144,6 +151,7 @@ paper_starting_quote_balance = 10000.0
 
 [market_data]
 replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
+idle_sleep_ms = 1000
 
 [risk]
 max_order_quote_value = 500.0
@@ -168,6 +176,7 @@ verbose = true
             config.market_data.replay_prices,
             vec![100.0, 101.0, 102.0, 101.5, 99.0]
         );
+        assert_eq!(config.market_data.idle_sleep_ms, 1_000);
         assert_eq!(config.risk.max_order_quote_value, 500.0);
         assert_eq!(config.risk.max_position_base, 0.25);
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
@@ -224,6 +233,18 @@ verbose = true
             error
                 .to_string()
                 .contains("replay prices must be positive finite values")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_market_data_idle_sleep() {
+        let invalid_config = VALID_CONFIG.replace("idle_sleep_ms = 1000", "idle_sleep_ms = 0");
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("market data idle sleep must be positive")
         );
     }
 

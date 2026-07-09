@@ -6,6 +6,7 @@ paper_starting_quote_balance = 10000.0
 
 [market_data]
 replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
+idle_sleep_ms = 1000
 
 [risk]
 max_order_quote_value = 500.0

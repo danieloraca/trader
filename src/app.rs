@@ -8,6 +8,8 @@ use crate::risk::RiskManager;
 use crate::storage::{SqliteStore, Store};
 use crate::strategy::{SimpleMomentumStrategy, Strategy};
 use crate::telemetry;
+use std::thread;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 pub struct App {
@@ -70,7 +72,26 @@ impl App {
             "trader started"
         );
 
-        while let Some(event) = self.market_data.next_event()? {
+        let idle_sleep = Duration::from_millis(self.config.market_data.idle_sleep_ms);
+        let mut logged_idle = false;
+
+        loop {
+            let Some(event) = self.market_data.next_event()? else {
+                if !logged_idle {
+                    info!(
+                        run_id = %self.run_id,
+                        replay_cursor = self.market_data.cursor(),
+                        idle_sleep_ms = self.config.market_data.idle_sleep_ms,
+                        "market data source idle"
+                    );
+                    logged_idle = true;
+                }
+
+                thread::sleep(idle_sleep);
+                continue;
+            };
+
+            logged_idle = false;
             debug!(
                 run_id = %self.run_id,
                 symbol = %event.symbol(),
@@ -147,16 +168,5 @@ impl App {
             self.store.save_portfolio(self.exchange.portfolio())?;
             self.store.save_replay_cursor(self.market_data.cursor())?;
         }
-
-        let portfolio = self.exchange.portfolio();
-        info!(
-            run_id = %self.run_id,
-            base_currency = %portfolio.base_currency,
-            base_balance = portfolio.base_balance,
-            quote_currency = %portfolio.quote_currency,
-            quote_balance = portfolio.quote_balance,
-            "trader stopped"
-        );
-        Ok(())
     }
 }
