@@ -25,7 +25,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Result<Self> {
-        let store = SqliteStore::open(&config.storage.sqlite_path)?;
+        let mut store = SqliteStore::open(&config.storage.sqlite_path)?;
         let portfolio = store.load_portfolio()?.unwrap_or_else(|| {
             Portfolio::new(
                 &config.bot.base_currency,
@@ -44,6 +44,7 @@ impl App {
         let exchange = PaperExchange::new(portfolio);
         let _synced_portfolio = exchange.sync_portfolio()?;
         let run_id = telemetry::new_run_id();
+        reconcile_unresolved_orders(&run_id, &mut store, &exchange)?;
 
         info!(
             run_id = %run_id,
@@ -197,4 +198,93 @@ impl App {
             }
         }
     }
+}
+
+fn reconcile_unresolved_orders(
+    run_id: &str,
+    store: &mut impl Store,
+    exchange: &impl Exchange,
+) -> Result<()> {
+    let unresolved_orders = store.load_unresolved_submitted_orders()?;
+
+    if unresolved_orders.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        run_id,
+        unresolved_order_count = unresolved_orders.len(),
+        "reconciling unresolved submitted orders"
+    );
+
+    for submitted_order in unresolved_orders {
+        let Some(client_order_id) = submitted_order.request.client_order_id.as_deref() else {
+            warn!(
+                run_id,
+                bot_order_id = submitted_order.id,
+                "unresolved submitted order missing client order id"
+            );
+            continue;
+        };
+
+        match exchange.order_status_by_client_id(client_order_id)? {
+            Some(exchange_order) => {
+                let reconciled_order = match exchange_order.status {
+                    OrderStatus::Filled => OrderStatus::Filled,
+                    OrderStatus::Rejected => OrderStatus::Rejected,
+                    OrderStatus::Cancelled => OrderStatus::Cancelled,
+                    OrderStatus::Submitted => {
+                        warn!(
+                            run_id,
+                            bot_order_id = submitted_order.id,
+                            client_order_id,
+                            "exchange still reports submitted order as open"
+                        );
+                        continue;
+                    }
+                };
+
+                let order = match reconciled_order {
+                    OrderStatus::Filled => crate::orders::Order::filled(
+                        submitted_order.id,
+                        exchange_order.exchange_order_id,
+                        submitted_order.request.clone(),
+                    ),
+                    OrderStatus::Rejected => crate::orders::Order::rejected(
+                        submitted_order.id,
+                        submitted_order.request.clone(),
+                        "reconciled exchange rejection".to_string(),
+                    ),
+                    OrderStatus::Cancelled => crate::orders::Order {
+                        id: submitted_order.id,
+                        exchange_order_id: Some(exchange_order.exchange_order_id),
+                        request: submitted_order.request.clone(),
+                        status: OrderStatus::Cancelled,
+                        status_reason: Some("reconciled exchange cancellation".to_string()),
+                    },
+                    OrderStatus::Submitted => unreachable!(),
+                };
+
+                store.record_order(&order)?;
+                info!(
+                    run_id,
+                    bot_order_id = order.id,
+                    client_order_id,
+                    exchange_order_id = exchange_order.exchange_order_id,
+                    status = ?order.status,
+                    "unresolved order reconciled"
+                );
+            }
+            None => {
+                warn!(
+                    run_id,
+                    bot_order_id = submitted_order.id,
+                    client_order_id,
+                    "unresolved submitted order not found on exchange"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }

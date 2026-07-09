@@ -11,6 +11,7 @@ pub trait Exchange {
     fn sync_portfolio(&self) -> Result<Portfolio>;
     fn place_order(&mut self, request: OrderRequest) -> Result<ExchangeOrder>;
     fn order_status(&self, exchange_order_id: u64) -> Result<ExchangeOrder>;
+    fn order_status_by_client_id(&self, client_order_id: &str) -> Result<Option<ExchangeOrder>>;
     #[allow(dead_code)]
     fn cancel_order(&mut self, exchange_order_id: u64) -> Result<ExchangeOrder>;
 }

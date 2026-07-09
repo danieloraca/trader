@@ -84,6 +84,14 @@ impl Exchange for PaperExchange {
             .ok_or_else(|| BotError::Exchange(format!("unknown order id {exchange_order_id}")))
     }
 
+    fn order_status_by_client_id(&self, client_order_id: &str) -> Result<Option<ExchangeOrder>> {
+        Ok(self
+            .orders
+            .values()
+            .find(|order| order.client_order_id == client_order_id)
+            .cloned())
+    }
+
     fn cancel_order(&mut self, exchange_order_id: u64) -> Result<ExchangeOrder> {
         let order = self.order_status(exchange_order_id)?;
 
@@ -258,6 +266,35 @@ mod tests {
             .expect_err("unknown order should fail");
 
         assert!(error.to_string().contains("unknown order id 99"));
+    }
+
+    #[test]
+    fn polls_order_status_by_client_order_id() {
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
+        let mut exchange = PaperExchange::new(portfolio);
+        let order = exchange
+            .place_order(buy_request(0.5, 100.0))
+            .expect("buy should fill");
+
+        let status = exchange
+            .order_status_by_client_id("test-client-order")
+            .expect("status should query")
+            .expect("status should exist");
+
+        assert_eq!(status.exchange_order_id, order.exchange_order_id);
+        assert_eq!(status.status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn returns_none_for_unknown_client_order_id() {
+        let portfolio = Portfolio::new("BTC", "USD", decimal(1_000.0));
+        let exchange = PaperExchange::new(portfolio);
+
+        let status = exchange
+            .order_status_by_client_id("missing-client-order")
+            .expect("status should query");
+
+        assert!(status.is_none());
     }
 
     #[test]

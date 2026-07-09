@@ -1,7 +1,7 @@
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use crate::market::MarketEvent;
-use crate::orders::{Order, Side};
+use crate::orders::{Order, OrderRequest, Side};
 use crate::portfolio::Portfolio;
 use crate::storage::Store;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -622,6 +622,87 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn load_unresolved_submitted_orders(&self) -> Result<Vec<Order>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "
+                SELECT
+                    submitted.bot_order_id,
+                    submitted.client_order_id,
+                    submitted.symbol,
+                    submitted.side,
+                    submitted.quantity_base_micro_units,
+                    submitted.limit_price_micro_units
+                FROM orders submitted
+                WHERE submitted.status = 'Submitted'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM orders terminal
+                      WHERE terminal.bot_order_id = submitted.bot_order_id
+                        AND terminal.status IN ('Filled', 'Rejected', 'Cancelled')
+                  )
+                ORDER BY submitted.bot_order_id ASC
+                ",
+            )
+            .map_err(|error| {
+                BotError::Storage(format!("failed to prepare unresolved order query: {error}"))
+            })?;
+
+        let orders = statement
+            .query_map([], |row| {
+                let bot_order_id: i64 = row.get(0)?;
+                let client_order_id: String = row.get(1)?;
+                let symbol: String = row.get(2)?;
+                let side: String = row.get(3)?;
+                let quantity_base_micro_units: i64 = row.get(4)?;
+                let limit_price_micro_units: i64 = row.get(5)?;
+
+                Ok((
+                    bot_order_id,
+                    client_order_id,
+                    symbol,
+                    side,
+                    quantity_base_micro_units,
+                    limit_price_micro_units,
+                ))
+            })
+            .map_err(|error| {
+                BotError::Storage(format!("failed to query unresolved orders: {error}"))
+            })?
+            .map(|row| {
+                let (
+                    bot_order_id,
+                    client_order_id,
+                    symbol,
+                    side,
+                    quantity_base_micro_units,
+                    limit_price_micro_units,
+                ) = row.map_err(|error| {
+                    BotError::Storage(format!("failed to read unresolved order row: {error}"))
+                })?;
+
+                let id = u64::try_from(bot_order_id).map_err(|_| {
+                    BotError::Storage(format!("stored bot order id is invalid: {bot_order_id}"))
+                })?;
+
+                let side = parse_side(&side)?;
+                Ok(Order::submitted(
+                    id,
+                    OrderRequest {
+                        symbol,
+                        side,
+                        quantity_base: Decimal::from_micro_units(quantity_base_micro_units),
+                        limit_price: Decimal::from_micro_units(limit_price_micro_units),
+                        client_order_id: Some(client_order_id),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(orders)
+    }
+
     fn record_market_event(&mut self, event: &MarketEvent) -> Result<()> {
         self.connection
             .execute(
@@ -681,6 +762,16 @@ fn side_name(side: Side) -> &'static str {
     match side {
         Side::Buy => "buy",
         Side::Sell => "sell",
+    }
+}
+
+fn parse_side(side: &str) -> Result<Side> {
+    match side {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        _ => Err(BotError::Storage(format!(
+            "stored order side is invalid: {side}"
+        ))),
     }
 }
 
@@ -792,6 +883,53 @@ mod tests {
                 .expect("count should work"),
             1
         );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn loads_unresolved_submitted_orders() {
+        let path = db_path("unresolved-orders");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        store
+            .record_order(&submitted_order(7))
+            .expect("submitted order should record");
+
+        let orders = store
+            .load_unresolved_submitted_orders()
+            .expect("unresolved orders should load");
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].id, 7);
+        assert_eq!(orders[0].status, OrderStatus::Submitted);
+        assert_eq!(
+            orders[0].request.client_order_id.as_deref(),
+            Some("test-client-7")
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn ignores_submitted_orders_with_terminal_transition() {
+        let path = db_path("resolved-orders");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+
+        store
+            .record_order(&submitted_order(7))
+            .expect("submitted order should record");
+        store
+            .record_order(&order(7))
+            .expect("terminal order should record");
+
+        let orders = store
+            .load_unresolved_submitted_orders()
+            .expect("unresolved orders should load");
+
+        assert!(orders.is_empty());
 
         drop(store);
         fs::remove_file(path).expect("test database should be removed");
