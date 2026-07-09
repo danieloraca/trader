@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{BotError, Result};
 use crate::exchange::{Exchange, PaperExchange};
 use crate::market::{MarketDataSource, ReplayMarketDataSource};
 use crate::orders::{OrderManager, OrderRequest, OrderStatus};
@@ -110,7 +110,23 @@ impl App {
 
             for signal in signals {
                 let portfolio = self.exchange.portfolio();
-                let order_request: OrderRequest = self.risk.approve(&signal, portfolio)?;
+                let order_request: OrderRequest = match self.risk.approve(&signal, portfolio) {
+                    Ok(order_request) => order_request,
+                    Err(BotError::Risk(message)) => {
+                        warn!(
+                            run_id = %self.run_id,
+                            symbol = %signal.symbol,
+                            side = ?signal.side,
+                            quantity_base = signal.quantity_base,
+                            price = signal.price,
+                            reason = %signal.reason,
+                            rejection = %message,
+                            "signal rejected by risk manager"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let transitions = self
                     .order_manager
                     .submit_order(&mut self.exchange, order_request)?;
