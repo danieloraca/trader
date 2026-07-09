@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::exchange::{Exchange, PaperExchange};
-use crate::market::{MarketEvent, PriceTick};
+use crate::market::{MarketDataSource, ReplayMarketDataSource};
 use crate::orders::OrderRequest;
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
@@ -11,6 +11,7 @@ use crate::strategy::{SimpleMomentumStrategy, Strategy};
 pub struct App {
     config: Config,
     exchange: PaperExchange,
+    market_data: ReplayMarketDataSource,
     risk: RiskManager,
     strategy: SimpleMomentumStrategy,
     store: InMemoryStore,
@@ -23,9 +24,14 @@ impl App {
             &config.bot.quote_currency,
             config.bot.paper_starting_quote_balance,
         );
+        let market_data = ReplayMarketDataSource::from_prices(
+            &config.bot.symbol,
+            config.market_data.replay_prices.clone(),
+        );
 
         Ok(Self {
             exchange: PaperExchange::new(portfolio),
+            market_data,
             risk: RiskManager::new(config.risk.clone()),
             strategy: SimpleMomentumStrategy::new(),
             store: InMemoryStore::new(),
@@ -36,8 +42,7 @@ impl App {
     pub fn run(&mut self) -> Result<()> {
         println!("starting trader for {}", self.config.bot.symbol);
 
-        for price in [100.0, 101.0, 102.0, 101.5, 99.0] {
-            let event = MarketEvent::PriceTick(PriceTick::new(&self.config.bot.symbol, price));
+        while let Some(event) = self.market_data.next_event()? {
             self.store.record_market_event(&event)?;
 
             let signals = self.strategy.on_market_event(&event);
