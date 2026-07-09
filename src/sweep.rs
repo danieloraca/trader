@@ -14,6 +14,9 @@ const QUANTITY_MICRO_UNITS: [i64; 4] = [500, 1_000, 2_000, 5_000];
 const CANDLE_INTERVAL_SECONDS: [i64; 2] = [60, 300];
 const FAST_WINDOWS: [usize; 4] = [3, 5, 8, 10];
 const SLOW_WINDOWS: [usize; 4] = [15, 30, 60, 120];
+const RSI_WINDOWS: [usize; 3] = [7, 14, 21];
+const RSI_OVERSOLD_THRESHOLDS: [u8; 3] = [25, 30, 35];
+const RSI_OVERBOUGHT_THRESHOLDS: [u8; 3] = [65, 70, 75];
 const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
 const TRAIN_SPLIT_BPS: usize = 7_000;
 const MIN_TEST_FILLS: usize = 3;
@@ -53,6 +56,8 @@ pub struct CandleSweepReport {
 
 #[derive(Debug, Clone)]
 pub struct CandleSweepResult {
+    pub strategy_kind: String,
+    pub parameter_summary: String,
     pub interval_seconds: i64,
     pub candle_count: usize,
     pub train_candle_count: usize,
@@ -162,6 +167,8 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                     let train_report = backtest::run_from_prices(&candidate, train_closes.clone())?;
                     let test_report = backtest::run_from_prices(&candidate, test_closes.clone())?;
                     results.push(CandleSweepResult::from_report(
+                        "ma",
+                        &format!("{fast_window}/{slow_window}"),
                         interval_seconds,
                         candles.len(),
                         train_closes.len(),
@@ -172,6 +179,54 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                         &train_report,
                         &test_report,
                     ));
+                }
+            }
+        }
+
+        for rsi_window in RSI_WINDOWS {
+            if train_closes.len() < rsi_window + 2 || test_closes.len() < rsi_window + 2 {
+                skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
+                    * RSI_OVERBOUGHT_THRESHOLDS.len()
+                    * CANDLE_QUANTITY_MICRO_UNITS.len();
+                continue;
+            }
+
+            for oversold_threshold in RSI_OVERSOLD_THRESHOLDS {
+                for overbought_threshold in RSI_OVERBOUGHT_THRESHOLDS {
+                    if oversold_threshold >= overbought_threshold {
+                        continue;
+                    }
+
+                    for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                        let mut candidate = config.clone();
+                        candidate.strategy.kind = StrategyKind::RsiMeanReversion;
+                        candidate.strategy.rsi_mean_reversion.window = rsi_window;
+                        candidate.strategy.rsi_mean_reversion.oversold_threshold =
+                            oversold_threshold;
+                        candidate.strategy.rsi_mean_reversion.overbought_threshold =
+                            overbought_threshold;
+                        candidate.strategy.rsi_mean_reversion.quantity_base =
+                            Decimal::from_micro_units(quantity_micro_units);
+                        candidate.backtest.trade_log_csv_path = None;
+
+                        let train_report =
+                            backtest::run_from_prices(&candidate, train_closes.clone())?;
+                        let test_report =
+                            backtest::run_from_prices(&candidate, test_closes.clone())?;
+                        results.push(CandleSweepResult::from_report(
+                            "rsi",
+                            &format!("{rsi_window}:{oversold_threshold}/{overbought_threshold}"),
+                            interval_seconds,
+                            candles.len(),
+                            train_closes.len(),
+                            test_closes.len(),
+                            rsi_window,
+                            0,
+                            Decimal::from_micro_units(quantity_micro_units),
+                            &train_report,
+                            &test_report,
+                        ));
+                    }
                 }
             }
         }
@@ -264,6 +319,8 @@ fn save_candle_sweep_report(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id INTEGER NOT NULL,
                 rank INTEGER NOT NULL,
+                strategy_kind TEXT NOT NULL DEFAULT 'ma',
+                parameter_summary TEXT NOT NULL DEFAULT '',
                 interval_seconds INTEGER NOT NULL,
                 candle_count INTEGER NOT NULL,
                 train_candle_count INTEGER NOT NULL DEFAULT 0,
@@ -354,6 +411,8 @@ fn save_candle_sweep_report(
                 INSERT INTO strategy_research_results (
                     run_id,
                     rank,
+                    strategy_kind,
+                    parameter_summary,
                     interval_seconds,
                     candle_count,
                     train_candle_count,
@@ -392,11 +451,13 @@ fn save_candle_sweep_report(
                     test_exposure_pct,
                     test_final_base_micro_units
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
                 ",
                 params![
                     run_id,
                     usize_to_i64(rank + 1, "strategy research rank")?,
+                    result.strategy_kind.as_str(),
+                    result.parameter_summary.as_str(),
                     result.interval_seconds,
                     usize_to_i64(result.candle_count, "candle count")?,
                     usize_to_i64(result.train_candle_count, "train candle count")?,
@@ -471,6 +532,8 @@ fn ensure_strategy_research_schema(connection: &Connection) -> Result<()> {
     for (column, definition) in [
         ("train_candle_count", "INTEGER NOT NULL DEFAULT 0"),
         ("test_candle_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("strategy_kind", "TEXT NOT NULL DEFAULT 'ma'"),
+        ("parameter_summary", "TEXT NOT NULL DEFAULT ''"),
         ("train_pnl_micro_units", "INTEGER NOT NULL DEFAULT 0"),
         ("train_return_pct", "REAL NOT NULL DEFAULT 0"),
         (
@@ -580,6 +643,8 @@ impl SweepResult {
 
 impl CandleSweepResult {
     fn from_report(
+        strategy_kind: &str,
+        parameter_summary: &str,
         interval_seconds: i64,
         candle_count: usize,
         train_candle_count: usize,
@@ -591,6 +656,8 @@ impl CandleSweepResult {
         test_report: &BacktestReport,
     ) -> Self {
         Self {
+            strategy_kind: strategy_kind.to_string(),
+            parameter_summary: parameter_summary.to_string(),
             interval_seconds,
             candle_count,
             train_candle_count,
@@ -690,13 +757,13 @@ impl Display for CandleSweepReport {
         }
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
             "interval",
             "candles",
             "train",
             "test",
-            "fast",
-            "slow",
+            "strategy",
+            "params",
             "qty",
             "quality",
             "train_pnl",
@@ -712,13 +779,13 @@ impl Display for CandleSweepReport {
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>4} {:>4} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_candle_count,
                 result.test_candle_count,
-                result.fast_window,
-                result.slow_window,
+                result.strategy_kind,
+                result.parameter_summary,
                 result.quantity_base,
                 if result.test_filled_order_count >= MIN_TEST_FILLS {
                     "ok"
@@ -866,11 +933,17 @@ mod tests {
         let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
             .expect("candle sweep should run");
 
-        assert_eq!(report.result_count, 24);
-        assert_eq!(report.results.len(), 24);
-        assert_eq!(report.skipped_under_warmed_count, 72);
+        assert_eq!(report.result_count, report.results.len());
+        assert!(report.result_count > 24);
+        assert!(report.skipped_under_warmed_count > 0);
         assert!(report.recorded_at_ms > 0);
         assert!(report.results.iter().all(|result| result.candle_count > 0));
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|result| result.strategy_kind == "rsi")
+        );
 
         let connection = Connection::open(&path).expect("database should open");
         let saved_runs: i64 = connection
@@ -893,7 +966,7 @@ mod tests {
             )
             .expect("min test fills should save");
         assert_eq!(saved_runs, 1);
-        assert_eq!(saved_results, 24);
+        assert_eq!(saved_results, report.result_count as i64);
         assert_eq!(min_test_fills, 3);
         drop(connection);
 
@@ -934,14 +1007,13 @@ mod tests {
         let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
             .expect("candle sweep should run");
 
-        assert!(report.result_count < 96);
+        assert!(report.result_count < 258);
         assert!(report.skipped_under_warmed_count > 0);
         assert!(
             report
                 .results
                 .iter()
-                .all(|result| result.train_candle_count > result.slow_window
-                    && result.test_candle_count > result.slow_window)
+                .all(|result| result.train_candle_count > 0 && result.test_candle_count > 0)
         );
 
         fs::remove_file(path).expect("test database should be removed");

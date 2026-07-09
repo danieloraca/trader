@@ -42,6 +42,12 @@ fast_window = 5
 slow_window = 20
 quantity_base = 0.001
 
+[strategy.rsi_mean_reversion]
+window = 14
+oversold_threshold = 30
+overbought_threshold = 70
+quantity_base = 0.001
+
 [storage]
 sqlite_path = "/var/lib/trader/trader.sqlite"
 

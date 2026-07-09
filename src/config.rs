@@ -177,6 +177,8 @@ pub struct StrategyConfig {
     pub simple_momentum: SimpleMomentumConfig,
     #[serde(default)]
     pub moving_average_crossover: MovingAverageCrossoverConfig,
+    #[serde(default)]
+    pub rsi_mean_reversion: RsiMeanReversionConfig,
 }
 
 impl Default for StrategyConfig {
@@ -185,6 +187,7 @@ impl Default for StrategyConfig {
             kind: StrategyKind::SimpleMomentum,
             simple_momentum: SimpleMomentumConfig::default(),
             moving_average_crossover: MovingAverageCrossoverConfig::default(),
+            rsi_mean_reversion: RsiMeanReversionConfig::default(),
         }
     }
 }
@@ -194,6 +197,7 @@ impl Default for StrategyConfig {
 pub enum StrategyKind {
     SimpleMomentum,
     MovingAverageCrossover,
+    RsiMeanReversion,
 }
 
 impl Default for StrategyKind {
@@ -222,6 +226,29 @@ pub struct MovingAverageCrossoverConfig {
     pub slow_window: usize,
     #[serde(default = "default_moving_average_quantity_base")]
     pub quantity_base: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RsiMeanReversionConfig {
+    #[serde(default = "default_rsi_window")]
+    pub window: usize,
+    #[serde(default = "default_rsi_oversold_threshold")]
+    pub oversold_threshold: u8,
+    #[serde(default = "default_rsi_overbought_threshold")]
+    pub overbought_threshold: u8,
+    #[serde(default = "default_rsi_quantity_base")]
+    pub quantity_base: Decimal,
+}
+
+impl Default for RsiMeanReversionConfig {
+    fn default() -> Self {
+        Self {
+            window: default_rsi_window(),
+            oversold_threshold: default_rsi_oversold_threshold(),
+            overbought_threshold: default_rsi_overbought_threshold(),
+            quantity_base: default_rsi_quantity_base(),
+        }
+    }
 }
 
 impl Default for MovingAverageCrossoverConfig {
@@ -461,6 +488,38 @@ impl Config {
             ));
         }
 
+        if self.strategy.rsi_mean_reversion.window == 0 {
+            return Err(BotError::Config(
+                "RSI mean reversion window must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_mean_reversion.oversold_threshold == 0 {
+            return Err(BotError::Config(
+                "RSI oversold threshold must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_mean_reversion.overbought_threshold >= 100 {
+            return Err(BotError::Config(
+                "RSI overbought threshold must be below 100".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_mean_reversion.oversold_threshold
+            >= self.strategy.rsi_mean_reversion.overbought_threshold
+        {
+            return Err(BotError::Config(
+                "RSI oversold threshold must be below overbought threshold".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_mean_reversion.quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "RSI mean reversion quantity must be positive".to_string(),
+            ));
+        }
+
         if self.storage.sqlite_path.trim().is_empty() {
             return Err(BotError::Config(
                 "sqlite path must not be empty".to_string(),
@@ -595,6 +654,22 @@ fn default_moving_average_quantity_base() -> Decimal {
     Decimal::from_micro_units(1_000)
 }
 
+fn default_rsi_window() -> usize {
+    14
+}
+
+fn default_rsi_oversold_threshold() -> u8 {
+    30
+}
+
+fn default_rsi_overbought_threshold() -> u8 {
+    70
+}
+
+fn default_rsi_quantity_base() -> Decimal {
+    Decimal::from_micro_units(1_000)
+}
+
 #[cfg(test)]
 fn config_path_from_args_and_env(
     args: impl IntoIterator<Item = String>,
@@ -655,6 +730,12 @@ sell_quantity_base = 0.005
 [strategy.moving_average_crossover]
 fast_window = 5
 slow_window = 20
+quantity_base = 0.001
+
+[strategy.rsi_mean_reversion]
+window = 14
+oversold_threshold = 30
+overbought_threshold = 70
 quantity_base = 0.001
 
 [storage]
@@ -723,6 +804,13 @@ verbose = true
                 .moving_average_crossover
                 .quantity_base
                 .to_string(),
+            "0.001"
+        );
+        assert_eq!(config.strategy.rsi_mean_reversion.window, 14);
+        assert_eq!(config.strategy.rsi_mean_reversion.oversold_threshold, 30);
+        assert_eq!(config.strategy.rsi_mean_reversion.overbought_threshold, 70);
+        assert_eq!(
+            config.strategy.rsi_mean_reversion.quantity_base.to_string(),
             "0.001"
         );
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");

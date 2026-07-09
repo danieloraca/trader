@@ -1,7 +1,9 @@
 mod moving_average;
+mod rsi;
 mod simple;
 
 pub use moving_average::MovingAverageCrossoverStrategy;
+pub use rsi::RsiMeanReversionStrategy;
 pub use simple::SimpleMomentumStrategy;
 
 use crate::config::{StrategyConfig, StrategyKind};
@@ -29,6 +31,9 @@ pub fn from_config(config: &StrategyConfig) -> Box<dyn Strategy> {
         }
         StrategyKind::MovingAverageCrossover => Box::new(MovingAverageCrossoverStrategy::new(
             config.moving_average_crossover.clone(),
+        )),
+        StrategyKind::RsiMeanReversion => Box::new(RsiMeanReversionStrategy::new(
+            config.rsi_mean_reversion.clone(),
         )),
     }
 }

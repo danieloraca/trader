@@ -80,12 +80,12 @@ struct StrategyResearchRunRow {
 #[derive(Debug)]
 struct StrategyResearchResultRow {
     rank: i64,
+    strategy_kind: String,
+    parameter_summary: String,
     interval_seconds: i64,
     candle_count: i64,
     train_candle_count: i64,
     test_candle_count: i64,
-    fast_window: i64,
-    slow_window: i64,
     quantity_base_micro_units: i64,
     train_pnl_micro_units: i64,
     train_return_pct: f64,
@@ -410,16 +410,29 @@ fn latest_strategy_research_results(
         return Ok(Vec::new());
     };
 
-    let mut statement = connection.prepare(
+    let strategy_kind_projection =
+        if column_exists(connection, "strategy_research_results", "strategy_kind")? {
+            "strategy_kind"
+        } else {
+            "'ma'"
+        };
+    let parameter_summary_projection =
+        if column_exists(connection, "strategy_research_results", "parameter_summary")? {
+            "parameter_summary"
+        } else {
+            "CAST(fast_window AS TEXT) || '/' || CAST(slow_window AS TEXT)"
+        };
+
+    let mut statement = connection.prepare(&format!(
         "
         SELECT
             rank,
+            {strategy_kind_projection},
+            {parameter_summary_projection},
             interval_seconds,
             candle_count,
             train_candle_count,
             test_candle_count,
-            fast_window,
-            slow_window,
             quantity_base_micro_units,
             train_pnl_micro_units,
             train_return_pct,
@@ -443,19 +456,19 @@ fn latest_strategy_research_results(
         WHERE run_id = ?1
         ORDER BY rank ASC
         LIMIT 10
-        ",
-    )?;
+        "
+    ))?;
 
     statement
         .query_map([run_id], |row| {
             Ok(StrategyResearchResultRow {
                 rank: row.get(0)?,
-                interval_seconds: row.get(1)?,
-                candle_count: row.get(2)?,
-                train_candle_count: row.get(3)?,
-                test_candle_count: row.get(4)?,
-                fast_window: row.get(5)?,
-                slow_window: row.get(6)?,
+                strategy_kind: row.get(1)?,
+                parameter_summary: row.get(2)?,
+                interval_seconds: row.get(3)?,
+                candle_count: row.get(4)?,
+                train_candle_count: row.get(5)?,
+                test_candle_count: row.get(6)?,
                 quantity_base_micro_units: row.get(7)?,
                 train_pnl_micro_units: row.get(8)?,
                 train_return_pct: row.get(9)?,
@@ -843,7 +856,8 @@ fn render_strategy_research(
 <th>Rank</th>
 <th>Interval</th>
 <th>Candles</th>
-<th>MA</th>
+<th>Strategy</th>
+<th>Params</th>
 <th>Qty</th>
 <th>Quality</th>
 <th>Train P/L</th>
@@ -884,7 +898,8 @@ fn render_strategy_research(
 <td>{}</td>
 <td>{}s</td>
 <td>{} <span class="muted">{} / {}</span></td>
-<td>{}/{}</td>
+<td>{}</td>
+<td>{}</td>
 <td>{}</td>
 <td><span class="{}">{}</span></td>
 <td>{}</td>
@@ -904,8 +919,8 @@ fn render_strategy_research(
                 result.candle_count,
                 result.train_candle_count,
                 result.test_candle_count,
-                result.fast_window,
-                result.slow_window,
+                escape_html(&result.strategy_kind),
+                escape_html(&result.parameter_summary),
                 escape_html(&format_micro_units(result.quantity_base_micro_units)),
                 quality_class,
                 quality_label,
