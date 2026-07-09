@@ -1,0 +1,12 @@
+[bot]
+symbol = "BTC-USD"
+base_currency = "BTC"
+quote_currency = "USD"
+paper_starting_quote_balance = 10000.0
+
+[risk]
+max_order_quote_value = 500.0
+max_position_base = 0.25
+
+[telemetry]
+verbose = true
