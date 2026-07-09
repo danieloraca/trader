@@ -15,39 +15,47 @@ impl OrderManager {
         self.next_order_id
     }
 
-    pub fn submit_order(
-        &mut self,
-        exchange: &mut impl Exchange,
-        mut request: OrderRequest,
-    ) -> Result<Vec<Order>> {
+    pub fn prepare_order(&mut self, mut request: OrderRequest) -> Order {
         let order_id = self.next_id();
         request.client_order_id = Some(client_order_id(order_id));
-        let mut transitions = vec![Order::submitted(order_id, request.clone())];
+        Order::submitted(order_id, request)
+    }
+
+    pub fn submit_prepared_order(
+        &self,
+        exchange: &mut impl Exchange,
+        submitted_order: &Order,
+    ) -> Result<Order> {
+        if submitted_order.status != OrderStatus::Submitted {
+            return Err(BotError::Exchange(format!(
+                "cannot submit local order {} with status {:?}",
+                submitted_order.id, submitted_order.status
+            )));
+        }
+
+        let request = submitted_order.request.clone();
 
         match exchange.place_order(request.clone()) {
-            Ok(exchange_order) => {
-                let final_order = match exchange_order.status {
-                    OrderStatus::Filled => {
-                        Order::filled(order_id, exchange_order.exchange_order_id, request)
-                    }
-                    OrderStatus::Rejected => {
-                        Order::rejected(order_id, request, "exchange rejected order".to_string())
-                    }
-                    status => {
-                        return Err(BotError::Exchange(format!(
-                            "paper exchange returned unsupported terminal status: {status:?}"
-                        )));
-                    }
-                };
-                transitions.push(final_order);
-            }
+            Ok(exchange_order) => match exchange_order.status {
+                OrderStatus::Filled => Ok(Order::filled(
+                    submitted_order.id,
+                    exchange_order.exchange_order_id,
+                    request,
+                )),
+                OrderStatus::Rejected => Ok(Order::rejected(
+                    submitted_order.id,
+                    request,
+                    "exchange rejected order".to_string(),
+                )),
+                status => Err(BotError::Exchange(format!(
+                    "paper exchange returned unsupported terminal status: {status:?}"
+                ))),
+            },
             Err(BotError::Exchange(message)) => {
-                transitions.push(Order::rejected(order_id, request, message));
+                Ok(Order::rejected(submitted_order.id, request, message))
             }
             Err(error) => return Err(error),
         }
-
-        Ok(transitions)
     }
 
     fn next_id(&mut self) -> u64 {
@@ -89,25 +97,23 @@ mod tests {
         let mut exchange = PaperExchange::new(portfolio);
         let mut manager = OrderManager::new_at(1);
 
-        let transitions = manager
-            .submit_order(&mut exchange, buy_request(0.5, 100.0))
+        let submitted = manager.prepare_order(buy_request(0.5, 100.0));
+        assert_eq!(submitted.id, 1);
+        assert_eq!(
+            submitted.request.client_order_id.as_deref(),
+            Some("trader-1")
+        );
+        assert_eq!(submitted.status, OrderStatus::Submitted);
+        assert_eq!(submitted.exchange_order_id, None);
+
+        let filled = manager
+            .submit_prepared_order(&mut exchange, &submitted)
             .expect("order should submit");
 
-        assert_eq!(transitions.len(), 2);
-        assert_eq!(transitions[0].id, 1);
-        assert_eq!(
-            transitions[0].request.client_order_id.as_deref(),
-            Some("trader-1")
-        );
-        assert_eq!(transitions[0].status, OrderStatus::Submitted);
-        assert_eq!(transitions[0].exchange_order_id, None);
-        assert_eq!(transitions[1].id, 1);
-        assert_eq!(
-            transitions[1].request.client_order_id.as_deref(),
-            Some("trader-1")
-        );
-        assert_eq!(transitions[1].status, OrderStatus::Filled);
-        assert_eq!(transitions[1].exchange_order_id, Some(1));
+        assert_eq!(filled.id, 1);
+        assert_eq!(filled.request.client_order_id.as_deref(), Some("trader-1"));
+        assert_eq!(filled.status, OrderStatus::Filled);
+        assert_eq!(filled.exchange_order_id, Some(1));
         assert_eq!(exchange.portfolio().base_balance.to_string(), "0.5");
         assert_eq!(exchange.portfolio().quote_balance.to_string(), "950");
     }
@@ -122,15 +128,15 @@ mod tests {
         let mut exchange = PaperExchange::new(portfolio);
         let mut manager = OrderManager::new_at(1);
 
-        let transitions = manager
-            .submit_order(&mut exchange, buy_request(1.0, 100.0))
+        let submitted = manager.prepare_order(buy_request(1.0, 100.0));
+        let rejected = manager
+            .submit_prepared_order(&mut exchange, &submitted)
             .expect("exchange rejection should be captured");
 
-        assert_eq!(transitions.len(), 2);
-        assert_eq!(transitions[0].status, OrderStatus::Submitted);
-        assert_eq!(transitions[1].status, OrderStatus::Rejected);
+        assert_eq!(submitted.status, OrderStatus::Submitted);
+        assert_eq!(rejected.status, OrderStatus::Rejected);
         assert!(
-            transitions[1]
+            rejected
                 .status_reason
                 .as_ref()
                 .expect("rejection should have a reason")

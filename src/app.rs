@@ -129,63 +129,72 @@ impl App {
                     }
                     Err(error) => return Err(error),
                 };
-                let transitions = self
+                let submitted_order = self.order_manager.prepare_order(order_request);
+                self.store.record_order(&submitted_order)?;
+                self.store
+                    .save_next_order_id(self.order_manager.next_order_id())?;
+                self.log_order_transition(&submitted_order, None);
+
+                let terminal_order = self
                     .order_manager
-                    .submit_order(&mut self.exchange, order_request)?;
-                for order in transitions {
-                    self.store.record_order(&order)?;
-                    let exchange_status = if let Some(exchange_order_id) = order.exchange_order_id {
+                    .submit_prepared_order(&mut self.exchange, &submitted_order)?;
+                self.store.record_order(&terminal_order)?;
+                let exchange_status =
+                    if let Some(exchange_order_id) = terminal_order.exchange_order_id {
                         Some(self.exchange.order_status(exchange_order_id)?.status)
                     } else {
                         None
                     };
-
-                    match order.status {
-                        OrderStatus::Filled => {
-                            info!(
-                                run_id = %self.run_id,
-                                bot_order_id = order.id,
-                                exchange_order_id = ?order.exchange_order_id,
-                                exchange_status = ?exchange_status,
-                                symbol = %order.request.symbol,
-                                side = ?order.request.side,
-                                quantity_base = %order.request.quantity_base,
-                                limit_price = %order.request.limit_price,
-                                quote_value = %order.request.quote_value(),
-                                status = ?order.status,
-                                "order transition recorded"
-                            );
-                        }
-                        OrderStatus::Rejected => {
-                            warn!(
-                                run_id = %self.run_id,
-                                bot_order_id = order.id,
-                                symbol = %order.request.symbol,
-                                side = ?order.request.side,
-                                status = ?order.status,
-                                reason = ?order.status_reason,
-                                "order transition recorded"
-                            );
-                        }
-                        _ => {
-                            debug!(
-                                run_id = %self.run_id,
-                                bot_order_id = order.id,
-                                exchange_order_id = ?order.exchange_order_id,
-                                status = ?order.status,
-                                "order transition recorded"
-                            );
-                        }
-                    }
-                }
-
-                self.store
-                    .save_next_order_id(self.order_manager.next_order_id())?;
+                self.log_order_transition(&terminal_order, exchange_status);
             }
 
             self.store.save_portfolio(self.exchange.portfolio())?;
             self.store.save_replay_cursor(self.market_data.cursor())?;
             self.store.save_heartbeat(&self.run_id)?;
+        }
+    }
+
+    fn log_order_transition(
+        &self,
+        order: &crate::orders::Order,
+        exchange_status: Option<OrderStatus>,
+    ) {
+        match order.status {
+            OrderStatus::Filled => {
+                info!(
+                    run_id = %self.run_id,
+                    bot_order_id = order.id,
+                    exchange_order_id = ?order.exchange_order_id,
+                    exchange_status = ?exchange_status,
+                    symbol = %order.request.symbol,
+                    side = ?order.request.side,
+                    quantity_base = %order.request.quantity_base,
+                    limit_price = %order.request.limit_price,
+                    quote_value = %order.request.quote_value(),
+                    status = ?order.status,
+                    "order transition recorded"
+                );
+            }
+            OrderStatus::Rejected => {
+                warn!(
+                    run_id = %self.run_id,
+                    bot_order_id = order.id,
+                    symbol = %order.request.symbol,
+                    side = ?order.request.side,
+                    status = ?order.status,
+                    reason = ?order.status_reason,
+                    "order transition recorded"
+                );
+            }
+            _ => {
+                debug!(
+                    run_id = %self.run_id,
+                    bot_order_id = order.id,
+                    exchange_order_id = ?order.exchange_order_id,
+                    status = ?order.status,
+                    "order transition recorded"
+                );
+            }
         }
     }
 }
