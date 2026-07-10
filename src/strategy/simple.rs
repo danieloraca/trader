@@ -1,8 +1,7 @@
 use crate::config::SimpleMomentumConfig;
 use crate::decimal::Decimal;
 use crate::market::MarketEvent;
-use crate::orders::Side;
-use crate::strategy::{Signal, Strategy};
+use crate::strategy::{Signal, Strategy, bearish_signal, bullish_signal};
 
 pub struct SimpleMomentumStrategy {
     config: SimpleMomentumConfig,
@@ -31,21 +30,25 @@ impl Strategy for SimpleMomentumStrategy {
         let change_bps = change * 10_000.0;
 
         if change_bps > self.config.buy_threshold_bps as f64 {
-            vec![Signal {
-                symbol: event.symbol().to_string(),
-                side: Side::Buy,
-                quantity_base: self.config.buy_quantity_base,
-                price: event.price(),
-                reason: format!("price rose {:.2}%", change * 100.0),
-            }]
+            bullish_signal(
+                self.config.direction,
+                event.symbol(),
+                self.config.buy_quantity_base,
+                event.price(),
+                format!("price rose {:.2}%", change * 100.0),
+            )
+            .into_iter()
+            .collect()
         } else if change_bps < self.config.sell_threshold_bps as f64 {
-            vec![Signal {
-                symbol: event.symbol().to_string(),
-                side: Side::Sell,
-                quantity_base: self.config.sell_quantity_base,
-                price: event.price(),
-                reason: format!("price fell {:.2}%", change * 100.0),
-            }]
+            bearish_signal(
+                self.config.direction,
+                event.symbol(),
+                self.config.sell_quantity_base,
+                event.price(),
+                format!("price fell {:.2}%", change * 100.0),
+            )
+            .into_iter()
+            .collect()
         } else {
             Vec::new()
         }
@@ -55,7 +58,7 @@ impl Strategy for SimpleMomentumStrategy {
 #[cfg(test)]
 mod tests {
     use super::SimpleMomentumStrategy;
-    use crate::config::SimpleMomentumConfig;
+    use crate::config::{SimpleMomentumConfig, StrategyDirection};
     use crate::decimal::Decimal;
     use crate::market::{MarketEvent, PriceTick};
     use crate::orders::Side;
@@ -126,6 +129,7 @@ mod tests {
             sell_threshold_bps: -300,
             buy_quantity_base: Decimal::from_micro_units(20_000),
             sell_quantity_base: Decimal::from_micro_units(10_000),
+            direction: StrategyDirection::LongOnly,
         });
 
         strategy.on_market_event(&tick(100.0));

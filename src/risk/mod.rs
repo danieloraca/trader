@@ -1,8 +1,8 @@
 use crate::config::RiskConfig;
 use crate::error::{BotError, Result};
-use crate::orders::{OrderRequest, Side};
+use crate::orders::OrderRequest;
 use crate::portfolio::Portfolio;
-use crate::strategy::Signal;
+use crate::strategy::{Signal, SignalIntent};
 use tracing::info;
 
 pub struct RiskManager {
@@ -31,7 +31,22 @@ impl RiskManager {
             )));
         }
 
-        if request.side == Side::Buy
+        if signal.intent == SignalIntent::IncreaseShort {
+            if !self.config.allow_short {
+                return Err(BotError::Risk(
+                    "signal rejected: short entries are disabled for this account".to_string(),
+                ));
+            }
+
+            if request.quantity_base > self.config.max_short_position_base {
+                return Err(BotError::Risk(format!(
+                    "signal rejected: short quantity {} exceeds max short {}",
+                    request.quantity_base, self.config.max_short_position_base
+                )));
+            }
+        }
+
+        if signal.intent == SignalIntent::IncreaseLong
             && portfolio.base_balance + request.quantity_base > self.config.max_position_base
         {
             return Err(BotError::Risk(format!(
@@ -41,7 +56,9 @@ impl RiskManager {
             )));
         }
 
-        if request.side == Side::Sell && portfolio.base_balance < request.quantity_base {
+        if signal.intent == SignalIntent::DecreaseLong
+            && portfolio.base_balance < request.quantity_base
+        {
             return Err(BotError::Risk(format!(
                 "signal rejected: sell quantity {} exceeds position {}",
                 request.quantity_base, portfolio.base_balance
@@ -51,6 +68,7 @@ impl RiskManager {
         info!(
             symbol = %signal.symbol,
             side = ?signal.side,
+            intent = ?signal.intent,
             quantity_base = %signal.quantity_base,
             price = %signal.price,
             reason = %signal.reason,
@@ -67,12 +85,14 @@ mod tests {
     use crate::decimal::Decimal;
     use crate::orders::Side;
     use crate::portfolio::Portfolio;
-    use crate::strategy::Signal;
+    use crate::strategy::{Signal, SignalIntent};
 
     fn risk_manager() -> RiskManager {
         RiskManager::new(RiskConfig {
             max_order_quote_value: Decimal::from_f64(500.0).expect("decimal should parse"),
             max_position_base: Decimal::from_f64(0.25).expect("decimal should parse"),
+            allow_short: false,
+            max_short_position_base: Decimal::ZERO,
         })
     }
 
@@ -90,10 +110,27 @@ mod tests {
         Signal {
             symbol: "BTC-USD".to_string(),
             side,
+            intent: if side == Side::Buy {
+                SignalIntent::IncreaseLong
+            } else {
+                SignalIntent::DecreaseLong
+            },
             quantity_base: Decimal::from_f64(quantity_base).expect("decimal should parse"),
             price: Decimal::from_f64(price).expect("decimal should parse"),
             reason: "test signal".to_string(),
         }
+    }
+
+    #[test]
+    fn rejects_short_entry_when_shorting_is_disabled() {
+        let mut short_signal = signal(Side::Sell, 0.01, 100.0);
+        short_signal.intent = SignalIntent::IncreaseShort;
+
+        let error = risk_manager()
+            .approve(&short_signal, &portfolio(0.0))
+            .expect_err("short signal should be rejected");
+
+        assert!(error.to_string().contains("short entries are disabled"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ const RSI_OVERBOUGHT_THRESHOLDS: [u8; 3] = [65, 70, 75];
 const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
 const DCA_PERIODS: [usize; 3] = [5, 15, 30];
 const TREND_WINDOWS: [usize; 3] = [15, 30, 60];
+const BREAKOUT_WINDOWS: [usize; 3] = [15, 30, 60];
 const TRAIN_SPLIT_BPS: usize = 7_000;
 const MIN_TEST_FILLS: usize = 3;
 #[cfg(test)]
@@ -33,7 +34,8 @@ const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
         + 1
         + CANDLE_QUANTITY_MICRO_UNITS.len()
         + (DCA_PERIODS.len() * CANDLE_QUANTITY_MICRO_UNITS.len())
-        + (TREND_WINDOWS.len() * DCA_PERIODS.len() * CANDLE_QUANTITY_MICRO_UNITS.len()));
+        + (TREND_WINDOWS.len() * DCA_PERIODS.len() * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (BREAKOUT_WINDOWS.len() * CANDLE_QUANTITY_MICRO_UNITS.len()));
 
 #[derive(Debug, Clone)]
 pub struct SweepReport {
@@ -252,6 +254,42 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                         ));
                     }
                 }
+            }
+        }
+
+        for breakout_window in BREAKOUT_WINDOWS {
+            if train_closes.len() < breakout_window + 1 || test_closes.len() < breakout_window + 1 {
+                skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
+                continue;
+            }
+
+            for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                let mut candidate = config.clone();
+                candidate.strategy.kind = StrategyKind::Breakout;
+                candidate.strategy.breakout.window = breakout_window;
+                candidate.strategy.breakout.quantity_base =
+                    Decimal::from_micro_units(quantity_micro_units);
+                candidate.backtest.trade_log_csv_path = None;
+
+                let train_report = backtest::run_from_prices(&candidate, train_closes.clone())?;
+                let test_report = backtest::run_from_prices(&candidate, test_closes.clone())?;
+                results.push(CandleSweepResult::from_report(
+                    "breakout",
+                    &breakout_window.to_string(),
+                    interval_seconds,
+                    candles.len(),
+                    train_closes.len(),
+                    test_closes.len(),
+                    breakout_window,
+                    0,
+                    Decimal::from_micro_units(quantity_micro_units),
+                    &train_report,
+                    &test_report,
+                    *train_closes
+                        .last()
+                        .expect("train closes should not be empty"),
+                    *test_closes.last().expect("test closes should not be empty"),
+                ));
             }
         }
 
@@ -1336,6 +1374,8 @@ mod tests {
             risk: RiskConfig {
                 max_order_quote_value: decimal("500"),
                 max_position_base: decimal("0.25"),
+                allow_short: false,
+                max_short_position_base: Decimal::ZERO,
             },
             strategy: StrategyConfig::default(),
             storage: StorageConfig {
@@ -1503,6 +1543,12 @@ mod tests {
                 .results
                 .iter()
                 .any(|result| result.strategy_kind == "rsi")
+        );
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|result| result.strategy_kind == "breakout")
         );
 
         let connection = Connection::open(&path).expect("database should open");

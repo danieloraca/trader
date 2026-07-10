@@ -524,6 +524,8 @@ mod tests {
             risk: RiskConfig {
                 max_order_quote_value: decimal("500"),
                 max_position_base: decimal("0.25"),
+                allow_short: false,
+                max_short_position_base: Decimal::ZERO,
             },
             strategy: StrategyConfig::default(),
             storage: StorageConfig {

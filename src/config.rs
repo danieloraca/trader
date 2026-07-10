@@ -167,6 +167,10 @@ impl Default for KrakenMarketDataConfig {
 pub struct RiskConfig {
     pub max_order_quote_value: Decimal,
     pub max_position_base: Decimal,
+    #[serde(default)]
+    pub allow_short: bool,
+    #[serde(default)]
+    pub max_short_position_base: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,6 +183,8 @@ pub struct StrategyConfig {
     pub moving_average_crossover: MovingAverageCrossoverConfig,
     #[serde(default)]
     pub rsi_mean_reversion: RsiMeanReversionConfig,
+    #[serde(default)]
+    pub breakout: BreakoutConfig,
 }
 
 impl Default for StrategyConfig {
@@ -188,6 +194,7 @@ impl Default for StrategyConfig {
             simple_momentum: SimpleMomentumConfig::default(),
             moving_average_crossover: MovingAverageCrossoverConfig::default(),
             rsi_mean_reversion: RsiMeanReversionConfig::default(),
+            breakout: BreakoutConfig::default(),
         }
     }
 }
@@ -198,6 +205,7 @@ pub enum StrategyKind {
     SimpleMomentum,
     MovingAverageCrossover,
     RsiMeanReversion,
+    Breakout,
 }
 
 impl Default for StrategyKind {
@@ -216,6 +224,8 @@ pub struct SimpleMomentumConfig {
     pub buy_quantity_base: Decimal,
     #[serde(default = "default_simple_momentum_sell_quantity_base")]
     pub sell_quantity_base: Decimal,
+    #[serde(default)]
+    pub direction: StrategyDirection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,6 +236,8 @@ pub struct MovingAverageCrossoverConfig {
     pub slow_window: usize,
     #[serde(default = "default_moving_average_quantity_base")]
     pub quantity_base: Decimal,
+    #[serde(default)]
+    pub direction: StrategyDirection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +250,32 @@ pub struct RsiMeanReversionConfig {
     pub overbought_threshold: u8,
     #[serde(default = "default_rsi_quantity_base")]
     pub quantity_base: Decimal,
+    #[serde(default)]
+    pub direction: StrategyDirection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BreakoutConfig {
+    #[serde(default = "default_breakout_window")]
+    pub window: usize,
+    #[serde(default = "default_breakout_quantity_base")]
+    pub quantity_base: Decimal,
+    #[serde(default)]
+    pub direction: StrategyDirection,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyDirection {
+    LongOnly,
+    ShortOnly,
+    LongShort,
+}
+
+impl Default for StrategyDirection {
+    fn default() -> Self {
+        Self::LongOnly
+    }
 }
 
 impl Default for RsiMeanReversionConfig {
@@ -247,6 +285,17 @@ impl Default for RsiMeanReversionConfig {
             oversold_threshold: default_rsi_oversold_threshold(),
             overbought_threshold: default_rsi_overbought_threshold(),
             quantity_base: default_rsi_quantity_base(),
+            direction: StrategyDirection::default(),
+        }
+    }
+}
+
+impl Default for BreakoutConfig {
+    fn default() -> Self {
+        Self {
+            window: default_breakout_window(),
+            quantity_base: default_breakout_quantity_base(),
+            direction: StrategyDirection::default(),
         }
     }
 }
@@ -257,6 +306,7 @@ impl Default for MovingAverageCrossoverConfig {
             fast_window: default_moving_average_fast_window(),
             slow_window: default_moving_average_slow_window(),
             quantity_base: default_moving_average_quantity_base(),
+            direction: StrategyDirection::default(),
         }
     }
 }
@@ -268,6 +318,7 @@ impl Default for SimpleMomentumConfig {
             sell_threshold_bps: default_simple_momentum_sell_threshold_bps(),
             buy_quantity_base: default_simple_momentum_buy_quantity_base(),
             sell_quantity_base: default_simple_momentum_sell_quantity_base(),
+            direction: StrategyDirection::default(),
         }
     }
 }
@@ -438,6 +489,12 @@ impl Config {
             ));
         }
 
+        if self.risk.allow_short && self.risk.max_short_position_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "max short position base must be positive when shorting is enabled".to_string(),
+            ));
+        }
+
         if self.strategy.simple_momentum.buy_threshold_bps <= 0 {
             return Err(BotError::Config(
                 "simple momentum buy threshold must be positive".to_string(),
@@ -517,6 +574,18 @@ impl Config {
         if self.strategy.rsi_mean_reversion.quantity_base <= Decimal::ZERO {
             return Err(BotError::Config(
                 "RSI mean reversion quantity must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.breakout.window == 0 {
+            return Err(BotError::Config(
+                "breakout window must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.breakout.quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "breakout quantity must be positive".to_string(),
             ));
         }
 
@@ -670,6 +739,14 @@ fn default_rsi_quantity_base() -> Decimal {
     Decimal::from_micro_units(1_000)
 }
 
+fn default_breakout_window() -> usize {
+    20
+}
+
+fn default_breakout_quantity_base() -> Decimal {
+    Decimal::from_micro_units(1_000)
+}
+
 #[cfg(test)]
 fn config_path_from_args_and_env(
     args: impl IntoIterator<Item = String>,
@@ -717,6 +794,8 @@ poll_interval_ms = 5000
 [risk]
 max_order_quote_value = 500.0
 max_position_base = 0.25
+allow_short = false
+max_short_position_base = 0.0
 
 [strategy]
 kind = "simple_momentum"
@@ -726,17 +805,25 @@ buy_threshold_bps = 50
 sell_threshold_bps = -100
 buy_quantity_base = 0.01
 sell_quantity_base = 0.005
+direction = "long_only"
 
 [strategy.moving_average_crossover]
 fast_window = 5
 slow_window = 20
 quantity_base = 0.001
+direction = "long_only"
 
 [strategy.rsi_mean_reversion]
 window = 14
 oversold_threshold = 30
 overbought_threshold = 70
 quantity_base = 0.001
+direction = "long_only"
+
+[strategy.breakout]
+window = 20
+quantity_base = 0.001
+direction = "long_only"
 
 [storage]
 sqlite_path = "data/trader.sqlite"
@@ -777,6 +864,8 @@ verbose = true
         assert_eq!(config.market_data.kraken.poll_interval_ms, 5_000);
         assert_eq!(config.risk.max_order_quote_value.to_string(), "500");
         assert_eq!(config.risk.max_position_base.to_string(), "0.25");
+        assert!(!config.risk.allow_short);
+        assert_eq!(config.risk.max_short_position_base.to_string(), "0");
         assert_eq!(config.strategy.kind, super::StrategyKind::SimpleMomentum);
         assert_eq!(config.strategy.simple_momentum.buy_threshold_bps, 50);
         assert_eq!(config.strategy.simple_momentum.sell_threshold_bps, -100);
@@ -812,6 +901,12 @@ verbose = true
         assert_eq!(
             config.strategy.rsi_mean_reversion.quantity_base.to_string(),
             "0.001"
+        );
+        assert_eq!(config.strategy.breakout.window, 20);
+        assert_eq!(config.strategy.breakout.quantity_base.to_string(), "0.001");
+        assert_eq!(
+            config.strategy.breakout.direction,
+            super::StrategyDirection::LongOnly
         );
         assert_eq!(config.storage.sqlite_path, "data/trader.sqlite");
         assert!(config.telemetry.verbose);

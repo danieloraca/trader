@@ -1,8 +1,7 @@
 use crate::config::RsiMeanReversionConfig;
 use crate::decimal::Decimal;
 use crate::market::MarketEvent;
-use crate::orders::Side;
-use crate::strategy::{Signal, Strategy};
+use crate::strategy::{Signal, Strategy, bearish_signal, bullish_signal};
 use std::collections::VecDeque;
 
 pub struct RsiMeanReversionStrategy {
@@ -49,26 +48,26 @@ impl Strategy for RsiMeanReversionStrategy {
         };
 
         let signal = match zone {
-            RsiZone::Oversold if self.previous_zone != RsiZone::Oversold => Some(Signal {
-                symbol: event.symbol().to_string(),
-                side: Side::Buy,
-                quantity_base: self.config.quantity_base,
-                price: event.price(),
-                reason: format!(
+            RsiZone::Oversold if self.previous_zone != RsiZone::Oversold => bullish_signal(
+                self.config.direction,
+                event.symbol(),
+                self.config.quantity_base,
+                event.price(),
+                format!(
                     "RSI {:.2} at/below oversold {}",
                     rsi, self.config.oversold_threshold
                 ),
-            }),
-            RsiZone::Overbought if self.previous_zone != RsiZone::Overbought => Some(Signal {
-                symbol: event.symbol().to_string(),
-                side: Side::Sell,
-                quantity_base: self.config.quantity_base,
-                price: event.price(),
-                reason: format!(
+            ),
+            RsiZone::Overbought if self.previous_zone != RsiZone::Overbought => bearish_signal(
+                self.config.direction,
+                event.symbol(),
+                self.config.quantity_base,
+                event.price(),
+                format!(
                     "RSI {:.2} at/above overbought {}",
                     rsi, self.config.overbought_threshold
                 ),
-            }),
+            ),
             _ => None,
         };
 
@@ -104,7 +103,7 @@ fn rsi(closes: &VecDeque<Decimal>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::RsiMeanReversionStrategy;
-    use crate::config::RsiMeanReversionConfig;
+    use crate::config::{RsiMeanReversionConfig, StrategyDirection};
     use crate::decimal::Decimal;
     use crate::market::{MarketEvent, PriceTick};
     use crate::orders::Side;
@@ -124,6 +123,7 @@ mod tests {
             oversold_threshold: 30,
             overbought_threshold: 70,
             quantity_base: decimal("0.001"),
+            direction: StrategyDirection::LongOnly,
         })
     }
 

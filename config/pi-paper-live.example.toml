@@ -27,6 +27,8 @@ poll_interval_ms = 5000
 [risk]
 max_order_quote_value = 500.0
 max_position_base = 0.25
+allow_short = false
+max_short_position_base = 0.0
 
 [strategy]
 kind = "simple_momentum"
@@ -36,17 +38,25 @@ buy_threshold_bps = 50
 sell_threshold_bps = -100
 buy_quantity_base = 0.01
 sell_quantity_base = 0.005
+direction = "long_only"
 
 [strategy.moving_average_crossover]
 fast_window = 5
 slow_window = 20
 quantity_base = 0.001
+direction = "long_only"
 
 [strategy.rsi_mean_reversion]
 window = 14
 oversold_threshold = 30
 overbought_threshold = 70
 quantity_base = 0.001
+direction = "long_only"
+
+[strategy.breakout]
+window = 20
+quantity_base = 0.001
+direction = "long_only"
 
 [storage]
 sqlite_path = "/var/lib/trader/trader.sqlite"

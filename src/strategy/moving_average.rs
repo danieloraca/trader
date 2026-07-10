@@ -1,8 +1,7 @@
 use crate::config::MovingAverageCrossoverConfig;
 use crate::decimal::Decimal;
 use crate::market::MarketEvent;
-use crate::orders::Side;
-use crate::strategy::{Signal, Strategy};
+use crate::strategy::{Signal, Strategy, bearish_signal, bullish_signal};
 use std::collections::VecDeque;
 
 pub struct MovingAverageCrossoverStrategy {
@@ -43,26 +42,30 @@ impl Strategy for MovingAverageCrossoverStrategy {
         let previous_fast_above_slow = self.previous_fast_above_slow.replace(fast_above_slow);
 
         match previous_fast_above_slow {
-            Some(false) if fast_above_slow => vec![Signal {
-                symbol: event.symbol().to_string(),
-                side: Side::Buy,
-                quantity_base: self.config.quantity_base,
-                price: event.price(),
-                reason: format!(
+            Some(false) if fast_above_slow => bullish_signal(
+                self.config.direction,
+                event.symbol(),
+                self.config.quantity_base,
+                event.price(),
+                format!(
                     "fast MA crossed above slow MA ({} > {})",
                     fast_average, slow_average
                 ),
-            }],
-            Some(true) if !fast_above_slow => vec![Signal {
-                symbol: event.symbol().to_string(),
-                side: Side::Sell,
-                quantity_base: self.config.quantity_base,
-                price: event.price(),
-                reason: format!(
+            )
+            .into_iter()
+            .collect(),
+            Some(true) if !fast_above_slow => bearish_signal(
+                self.config.direction,
+                event.symbol(),
+                self.config.quantity_base,
+                event.price(),
+                format!(
                     "fast MA crossed below slow MA ({} < {})",
                     fast_average, slow_average
                 ),
-            }],
+            )
+            .into_iter()
+            .collect(),
             _ => Vec::new(),
         }
     }
@@ -83,7 +86,7 @@ fn average(values: impl IntoIterator<Item = Decimal>) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::MovingAverageCrossoverStrategy;
-    use crate::config::MovingAverageCrossoverConfig;
+    use crate::config::{MovingAverageCrossoverConfig, StrategyDirection};
     use crate::decimal::Decimal;
     use crate::market::{MarketEvent, PriceTick};
     use crate::orders::Side;
@@ -102,6 +105,7 @@ mod tests {
             fast_window: 2,
             slow_window: 3,
             quantity_base: decimal("0.001"),
+            direction: StrategyDirection::LongOnly,
         })
     }
 

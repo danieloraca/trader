@@ -146,6 +146,7 @@ impl App {
                             run_id = %self.run_id,
                             symbol = %signal.symbol,
                             side = ?signal.side,
+                            intent = ?signal.intent,
                             quantity_base = %signal.quantity_base,
                             price = %signal.price,
                             reason = %signal.reason,
