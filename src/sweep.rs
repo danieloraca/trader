@@ -1,8 +1,9 @@
-use crate::backtest::{self, BacktestReport};
+use crate::backtest::{self, BacktestReport, TradeRecord};
 use crate::candles;
 use crate::config::{Config, StrategyKind};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
+use crate::orders::Side;
 use rusqlite::{Connection, params};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
@@ -81,6 +82,7 @@ pub struct CandleSweepResult {
     pub train_profit_loss_quote: Decimal,
     pub train_return_pct: f64,
     pub train_buy_and_hold_delta_quote: Decimal,
+    pub train_capital_matched_delta_quote: Decimal,
     pub train_max_drawdown_pct: f64,
     pub train_filled_order_count: usize,
     pub train_rejected_order_count: usize,
@@ -91,6 +93,7 @@ pub struct CandleSweepResult {
     pub test_profit_loss_quote: Decimal,
     pub test_return_pct: f64,
     pub test_buy_and_hold_delta_quote: Decimal,
+    pub test_capital_matched_delta_quote: Decimal,
     pub test_max_drawdown_pct: f64,
     pub test_filled_order_count: usize,
     pub test_rejected_order_count: usize,
@@ -191,6 +194,10 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                         Decimal::from_micro_units(quantity_micro_units),
                         &train_report,
                         &test_report,
+                        *train_closes
+                            .last()
+                            .expect("train closes should not be empty"),
+                        *test_closes.last().expect("test closes should not be empty"),
                     ));
                 }
             }
@@ -238,6 +245,10 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                             Decimal::from_micro_units(quantity_micro_units),
                             &train_report,
                             &test_report,
+                            *train_closes
+                                .last()
+                                .expect("train closes should not be empty"),
+                            *test_closes.last().expect("test closes should not be empty"),
                         ));
                     }
                 }
@@ -460,6 +471,10 @@ fn candle_baseline_result(
         quantity_base,
         &train_report,
         &test_report,
+        *train_closes
+            .last()
+            .expect("train closes should not be empty"),
+        *test_closes.last().expect("test closes should not be empty"),
     ))
 }
 
@@ -497,11 +512,13 @@ fn run_baseline_from_prices(
                 config.backtest.fee_bps,
                 config.backtest.slippage_bps,
             ) {
-                Ok((fee_quote, slippage_quote)) => {
+                Ok(mut trade) => {
                     report.filled_order_count += 1;
                     report.buy_count += 1;
-                    report.total_fees_quote += fee_quote;
-                    report.total_slippage_quote += slippage_quote;
+                    report.total_fees_quote += trade.fee_quote;
+                    report.total_slippage_quote += trade.slippage_quote;
+                    trade.event_index = index + 1;
+                    report.trades.push(trade);
                 }
                 Err(BotError::Risk(_)) => {
                     report.rejected_order_count += 1;
@@ -623,7 +640,7 @@ fn fill_baseline_buy(
     price: Decimal,
     fee_bps: i64,
     slippage_bps: i64,
-) -> Result<(Decimal, Decimal)> {
+) -> Result<TradeRecord> {
     let slippage = bps_value(price, slippage_bps);
     let fill_price = price + slippage;
     let gross_quote_value = quantity_base * fill_price;
@@ -640,7 +657,19 @@ fn fill_baseline_buy(
     portfolio.quote_balance -= total_quote_cost;
     portfolio.base_balance += quantity_base;
 
-    Ok((fee_quote, slippage_quote))
+    Ok(TradeRecord {
+        event_index: 0,
+        side: Side::Buy,
+        quantity_base,
+        signal_price: price,
+        fill_price,
+        gross_quote_value,
+        fee_quote,
+        slippage_quote,
+        equity_after: baseline_portfolio_value(portfolio, price),
+        realized_pnl_quote: Decimal::ZERO,
+        reason: "baseline buy".to_string(),
+    })
 }
 
 fn max_affordable_quantity(
@@ -674,6 +703,17 @@ fn simple_average(values: &[Decimal]) -> Decimal {
 
 fn bps_value(value: Decimal, bps: i64) -> Decimal {
     Decimal::from_micro_units(((value.micro_units() as i128 * bps as i128) / 10_000) as i64)
+}
+
+fn capital_matched_buy_hold_profit_loss(report: &BacktestReport, final_price: Decimal) -> Decimal {
+    report
+        .trades
+        .iter()
+        .filter(|trade| trade.side == Side::Buy)
+        .map(|trade| {
+            (trade.quantity_base * final_price) - (trade.gross_quote_value + trade.fee_quote)
+        })
+        .fold(Decimal::ZERO, |accumulator, value| accumulator + value)
 }
 
 fn save_candle_sweep_report(
@@ -731,6 +771,7 @@ fn save_candle_sweep_report(
                 train_pnl_micro_units INTEGER NOT NULL DEFAULT 0,
                 train_return_pct REAL NOT NULL DEFAULT 0,
                 train_buy_and_hold_delta_micro_units INTEGER NOT NULL DEFAULT 0,
+                train_capital_matched_delta_micro_units INTEGER NOT NULL DEFAULT 0,
                 train_max_drawdown_pct REAL NOT NULL DEFAULT 0,
                 train_filled_order_count INTEGER NOT NULL DEFAULT 0,
                 train_rejected_order_count INTEGER NOT NULL DEFAULT 0,
@@ -741,6 +782,7 @@ fn save_candle_sweep_report(
                 test_pnl_micro_units INTEGER NOT NULL DEFAULT 0,
                 test_return_pct REAL NOT NULL DEFAULT 0,
                 test_buy_and_hold_delta_micro_units INTEGER NOT NULL DEFAULT 0,
+                test_capital_matched_delta_micro_units INTEGER NOT NULL DEFAULT 0,
                 test_max_drawdown_pct REAL NOT NULL DEFAULT 0,
                 test_filled_order_count INTEGER NOT NULL DEFAULT 0,
                 test_rejected_order_count INTEGER NOT NULL DEFAULT 0,
@@ -823,6 +865,7 @@ fn save_candle_sweep_report(
                     train_pnl_micro_units,
                     train_return_pct,
                     train_buy_and_hold_delta_micro_units,
+                    train_capital_matched_delta_micro_units,
                     train_max_drawdown_pct,
                     train_filled_order_count,
                     train_rejected_order_count,
@@ -833,6 +876,7 @@ fn save_candle_sweep_report(
                     test_pnl_micro_units,
                     test_return_pct,
                     test_buy_and_hold_delta_micro_units,
+                    test_capital_matched_delta_micro_units,
                     test_max_drawdown_pct,
                     test_filled_order_count,
                     test_rejected_order_count,
@@ -841,7 +885,7 @@ fn save_candle_sweep_report(
                     test_exposure_pct,
                     test_final_base_micro_units
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)
                 ",
                 params![
                     run_id,
@@ -868,6 +912,7 @@ fn save_candle_sweep_report(
                     result.train_profit_loss_quote.micro_units(),
                     result.train_return_pct,
                     result.train_buy_and_hold_delta_quote.micro_units(),
+                    result.train_capital_matched_delta_quote.micro_units(),
                     result.train_max_drawdown_pct,
                     usize_to_i64(result.train_filled_order_count, "train filled order count")?,
                     usize_to_i64(result.train_rejected_order_count, "train rejected order count")?,
@@ -878,6 +923,7 @@ fn save_candle_sweep_report(
                     result.test_profit_loss_quote.micro_units(),
                     result.test_return_pct,
                     result.test_buy_and_hold_delta_quote.micro_units(),
+                    result.test_capital_matched_delta_quote.micro_units(),
                     result.test_max_drawdown_pct,
                     usize_to_i64(result.test_filled_order_count, "test filled order count")?,
                     usize_to_i64(result.test_rejected_order_count, "test rejected order count")?,
@@ -930,6 +976,10 @@ fn ensure_strategy_research_schema(connection: &Connection) -> Result<()> {
             "train_buy_and_hold_delta_micro_units",
             "INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "train_capital_matched_delta_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
         ("train_max_drawdown_pct", "REAL NOT NULL DEFAULT 0"),
         ("train_filled_order_count", "INTEGER NOT NULL DEFAULT 0"),
         ("train_rejected_order_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -941,6 +991,10 @@ fn ensure_strategy_research_schema(connection: &Connection) -> Result<()> {
         ("test_return_pct", "REAL NOT NULL DEFAULT 0"),
         (
             "test_buy_and_hold_delta_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "test_capital_matched_delta_micro_units",
             "INTEGER NOT NULL DEFAULT 0",
         ),
         ("test_max_drawdown_pct", "REAL NOT NULL DEFAULT 0"),
@@ -1044,7 +1098,14 @@ impl CandleSweepResult {
         quantity_base: Decimal,
         train_report: &BacktestReport,
         test_report: &BacktestReport,
+        train_final_price: Decimal,
+        test_final_price: Decimal,
     ) -> Self {
+        let train_capital_matched_profit_loss =
+            capital_matched_buy_hold_profit_loss(train_report, train_final_price);
+        let test_capital_matched_profit_loss =
+            capital_matched_buy_hold_profit_loss(test_report, test_final_price);
+
         Self {
             strategy_kind: strategy_kind.to_string(),
             parameter_summary: parameter_summary.to_string(),
@@ -1059,6 +1120,8 @@ impl CandleSweepResult {
             train_return_pct: train_report.return_pct,
             train_buy_and_hold_delta_quote: train_report.profit_loss_quote
                 - train_report.buy_and_hold_profit_loss_quote,
+            train_capital_matched_delta_quote: train_report.profit_loss_quote
+                - train_capital_matched_profit_loss,
             train_max_drawdown_pct: train_report.max_drawdown_pct,
             train_filled_order_count: train_report.filled_order_count,
             train_rejected_order_count: train_report.rejected_order_count,
@@ -1070,6 +1133,8 @@ impl CandleSweepResult {
             test_return_pct: test_report.return_pct,
             test_buy_and_hold_delta_quote: test_report.profit_loss_quote
                 - test_report.buy_and_hold_profit_loss_quote,
+            test_capital_matched_delta_quote: test_report.profit_loss_quote
+                - test_capital_matched_profit_loss,
             test_max_drawdown_pct: test_report.max_drawdown_pct,
             test_filled_order_count: test_report.filled_order_count,
             test_rejected_order_count: test_report.rejected_order_count,
@@ -1147,7 +1212,7 @@ impl Display for CandleSweepReport {
         }
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>7} {:>7}",
             "interval",
             "candles",
             "train",
@@ -1160,6 +1225,8 @@ impl Display for CandleSweepReport {
             "test_pnl",
             "train_alpha",
             "test_alpha",
+            "train_match",
+            "test_match",
             "tr_fill",
             "te_fill",
             "tr_b/s",
@@ -1169,7 +1236,7 @@ impl Display for CandleSweepReport {
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7} {:>7} {:>3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_candle_count,
@@ -1182,6 +1249,8 @@ impl Display for CandleSweepReport {
                 result.test_profit_loss_quote,
                 result.train_buy_and_hold_delta_quote,
                 result.test_buy_and_hold_delta_quote,
+                result.train_capital_matched_delta_quote,
+                result.test_capital_matched_delta_quote,
                 result.train_filled_order_count,
                 result.test_filled_order_count,
                 result.train_buy_count,
@@ -1264,6 +1333,7 @@ mod tests {
             train_profit_loss_quote: decimal("1"),
             train_return_pct: 0.01,
             train_buy_and_hold_delta_quote: decimal("1"),
+            train_capital_matched_delta_quote: decimal("1"),
             train_max_drawdown_pct: 0.0,
             train_filled_order_count: 3,
             train_rejected_order_count: 0,
@@ -1274,6 +1344,7 @@ mod tests {
             test_profit_loss_quote: decimal(test_pnl),
             test_return_pct: 0.01,
             test_buy_and_hold_delta_quote: decimal(test_alpha),
+            test_capital_matched_delta_quote: decimal(test_alpha),
             test_max_drawdown_pct: 0.0,
             test_filled_order_count: test_fills,
             test_rejected_order_count: 0,

@@ -27,6 +27,7 @@ struct Snapshot {
     latest_orders: Vec<OrderRow>,
     strategy_research_run: Option<StrategyResearchRunRow>,
     strategy_research_results: Vec<StrategyResearchResultRow>,
+    strategy_research_matched_results: Vec<StrategyResearchResultRow>,
 }
 
 #[derive(Debug)]
@@ -90,6 +91,7 @@ struct StrategyResearchResultRow {
     train_pnl_micro_units: i64,
     train_return_pct: f64,
     train_buy_and_hold_delta_micro_units: i64,
+    train_capital_matched_delta_micro_units: i64,
     train_max_drawdown_pct: f64,
     train_filled_order_count: i64,
     train_rejected_order_count: i64,
@@ -99,6 +101,7 @@ struct StrategyResearchResultRow {
     test_pnl_micro_units: i64,
     test_return_pct: f64,
     test_buy_and_hold_delta_micro_units: i64,
+    test_capital_matched_delta_micro_units: i64,
     test_max_drawdown_pct: f64,
     test_filled_order_count: i64,
     test_rejected_order_count: i64,
@@ -189,6 +192,9 @@ impl Dashboard {
             latest_orders: latest_orders(&connection)?,
             strategy_research_run: latest_strategy_research_run(&connection)?,
             strategy_research_results: latest_strategy_research_results(&connection)?,
+            strategy_research_matched_results: latest_strategy_research_matched_results(
+                &connection,
+            )?,
         })
     }
 }
@@ -388,6 +394,25 @@ fn latest_strategy_research_run(
 fn latest_strategy_research_results(
     connection: &Connection,
 ) -> rusqlite::Result<Vec<StrategyResearchResultRow>> {
+    latest_strategy_research_results_ordered(connection, StrategyResearchOrder::Strict)
+}
+
+fn latest_strategy_research_matched_results(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<StrategyResearchResultRow>> {
+    latest_strategy_research_results_ordered(connection, StrategyResearchOrder::CapitalMatched)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StrategyResearchOrder {
+    Strict,
+    CapitalMatched,
+}
+
+fn latest_strategy_research_results_ordered(
+    connection: &Connection,
+    order: StrategyResearchOrder,
+) -> rusqlite::Result<Vec<StrategyResearchResultRow>> {
     if !table_exists(connection, "strategy_research_runs")?
         || !table_exists(connection, "strategy_research_results")?
         || !column_exists(
@@ -422,6 +447,27 @@ fn latest_strategy_research_results(
         } else {
             "CAST(fast_window AS TEXT) || '/' || CAST(slow_window AS TEXT)"
         };
+    let has_capital_matched_columns = column_exists(
+        connection,
+        "strategy_research_results",
+        "test_capital_matched_delta_micro_units",
+    )?;
+    let train_capital_matched_delta_projection = if has_capital_matched_columns {
+        "train_capital_matched_delta_micro_units"
+    } else {
+        "0"
+    };
+    let test_capital_matched_delta_projection = if has_capital_matched_columns {
+        "test_capital_matched_delta_micro_units"
+    } else {
+        "0"
+    };
+    let order_by = match (order, has_capital_matched_columns) {
+        (StrategyResearchOrder::CapitalMatched, true) => {
+            "test_capital_matched_delta_micro_units DESC, test_pnl_micro_units DESC, rank ASC"
+        }
+        _ => "rank ASC",
+    };
 
     let mut statement = connection.prepare(&format!(
         "
@@ -437,6 +483,7 @@ fn latest_strategy_research_results(
             train_pnl_micro_units,
             train_return_pct,
             train_buy_and_hold_delta_micro_units,
+            {train_capital_matched_delta_projection},
             train_max_drawdown_pct,
             train_filled_order_count,
             train_rejected_order_count,
@@ -446,6 +493,7 @@ fn latest_strategy_research_results(
             test_pnl_micro_units,
             test_return_pct,
             test_buy_and_hold_delta_micro_units,
+            {test_capital_matched_delta_projection},
             test_max_drawdown_pct,
             test_filled_order_count,
             test_rejected_order_count,
@@ -454,7 +502,7 @@ fn latest_strategy_research_results(
             test_exposure_pct
         FROM strategy_research_results
         WHERE run_id = ?1
-        ORDER BY rank ASC
+        ORDER BY {order_by}
         LIMIT 10
         "
     ))?;
@@ -473,21 +521,23 @@ fn latest_strategy_research_results(
                 train_pnl_micro_units: row.get(8)?,
                 train_return_pct: row.get(9)?,
                 train_buy_and_hold_delta_micro_units: row.get(10)?,
-                train_max_drawdown_pct: row.get(11)?,
-                train_filled_order_count: row.get(12)?,
-                train_rejected_order_count: row.get(13)?,
-                train_buy_count: row.get(14)?,
-                train_sell_count: row.get(15)?,
-                train_exposure_pct: row.get(16)?,
-                test_pnl_micro_units: row.get(17)?,
-                test_return_pct: row.get(18)?,
-                test_buy_and_hold_delta_micro_units: row.get(19)?,
-                test_max_drawdown_pct: row.get(20)?,
-                test_filled_order_count: row.get(21)?,
-                test_rejected_order_count: row.get(22)?,
-                test_buy_count: row.get(23)?,
-                test_sell_count: row.get(24)?,
-                test_exposure_pct: row.get(25)?,
+                train_capital_matched_delta_micro_units: row.get(11)?,
+                train_max_drawdown_pct: row.get(12)?,
+                train_filled_order_count: row.get(13)?,
+                train_rejected_order_count: row.get(14)?,
+                train_buy_count: row.get(15)?,
+                train_sell_count: row.get(16)?,
+                train_exposure_pct: row.get(17)?,
+                test_pnl_micro_units: row.get(18)?,
+                test_return_pct: row.get(19)?,
+                test_buy_and_hold_delta_micro_units: row.get(20)?,
+                test_capital_matched_delta_micro_units: row.get(21)?,
+                test_max_drawdown_pct: row.get(22)?,
+                test_filled_order_count: row.get(23)?,
+                test_rejected_order_count: row.get(24)?,
+                test_buy_count: row.get(25)?,
+                test_sell_count: row.get(26)?,
+                test_exposure_pct: row.get(27)?,
             })
         })?
         .collect()
@@ -583,6 +633,7 @@ window.addEventListener("DOMContentLoaded", formatTimes);
         &mut html,
         snapshot.strategy_research_run.as_ref(),
         &snapshot.strategy_research_results,
+        &snapshot.strategy_research_matched_results,
     );
     render_orders(&mut html, &snapshot.latest_orders);
 
@@ -820,6 +871,7 @@ fn render_strategy_research(
     html: &mut String,
     run: Option<&StrategyResearchRunRow>,
     results: &[StrategyResearchResultRow],
+    matched_results: &[StrategyResearchResultRow],
 ) {
     html.push_str(r#"<h2>Strategy Research</h2>"#);
 
@@ -867,6 +919,8 @@ fn render_strategy_research(
 <th>Test Ret</th>
 <th>Train Alpha</th>
 <th>Test Alpha</th>
+<th>Train Match</th>
+<th>Test Match</th>
 <th>Train DD</th>
 <th>Test DD</th>
 <th>Train Fills</th>
@@ -879,7 +933,7 @@ fn render_strategy_research(
 
     if results.is_empty() {
         html.push_str(
-            r#"<tr><td colspan="17" class="muted">No runnable train/test sweep rows yet.</td></tr>"#,
+            r#"<tr><td colspan="20" class="muted">No runnable train/test sweep rows yet.</td></tr>"#,
         );
     } else {
         for result in results {
@@ -916,6 +970,8 @@ fn render_strategy_research(
 <td>{:.2}%</td>
 <td>{}</td>
 <td>{}</td>
+<td>{}</td>
+<td>{}</td>
 <td>{:.2}%</td>
 <td>{:.2}%</td>
 <td>{} <span class="muted">rej {}</span> <span class="muted">{} / {}</span></td>
@@ -942,6 +998,12 @@ fn render_strategy_research(
                 escape_html(&format_micro_units(
                     result.test_buy_and_hold_delta_micro_units
                 )),
+                escape_html(&format_micro_units(
+                    result.train_capital_matched_delta_micro_units
+                )),
+                escape_html(&format_micro_units(
+                    result.test_capital_matched_delta_micro_units
+                )),
                 result.train_max_drawdown_pct,
                 result.test_max_drawdown_pct,
                 result.train_filled_order_count,
@@ -954,6 +1016,86 @@ fn render_strategy_research(
                 result.test_sell_count,
                 result.train_exposure_pct,
                 result.test_exposure_pct,
+            );
+        }
+    }
+
+    html.push_str("</tbody></table>");
+
+    html.push_str(
+        r#"<h2>Top Capital-Matched Rows</h2>
+<table>
+<thead>
+<tr>
+<th>Strict Rank</th>
+<th>Interval</th>
+<th>Strategy</th>
+<th>Params</th>
+<th>Qty</th>
+<th>Quality</th>
+<th>Test P/L</th>
+<th>Test Alpha</th>
+<th>Test Match</th>
+<th>Test Fills</th>
+</tr>
+</thead>
+<tbody>"#,
+    );
+
+    if matched_results.is_empty() {
+        html.push_str(
+            r#"<tr><td colspan="10" class="muted">No capital-matched sweep rows yet.</td></tr>"#,
+        );
+    } else {
+        for result in matched_results {
+            let is_candidate = result.test_filled_order_count >= run.min_test_fills
+                && result.test_pnl_micro_units > 0
+                && result.test_buy_and_hold_delta_micro_units > 0;
+            let quality_class = if is_candidate {
+                "status candidate"
+            } else if result.test_filled_order_count >= run.min_test_fills {
+                "status"
+            } else {
+                "status thin"
+            };
+            let quality_label = if is_candidate {
+                "candidate"
+            } else if result.test_filled_order_count >= run.min_test_fills {
+                "ok"
+            } else {
+                "thin"
+            };
+            let _ = write!(
+                html,
+                r#"<tr>
+<td>{}</td>
+<td>{}s</td>
+<td>{}</td>
+<td>{}</td>
+<td>{}</td>
+<td><span class="{}">{}</span></td>
+<td>{}</td>
+<td>{}</td>
+<td>{}</td>
+<td>{} <span class="muted">{} / {}</span></td>
+</tr>"#,
+                result.rank,
+                result.interval_seconds,
+                escape_html(&result.strategy_kind),
+                escape_html(&result.parameter_summary),
+                escape_html(&format_micro_units(result.quantity_base_micro_units)),
+                quality_class,
+                quality_label,
+                escape_html(&format_micro_units(result.test_pnl_micro_units)),
+                escape_html(&format_micro_units(
+                    result.test_buy_and_hold_delta_micro_units
+                )),
+                escape_html(&format_micro_units(
+                    result.test_capital_matched_delta_micro_units
+                )),
+                result.test_filled_order_count,
+                result.test_buy_count,
+                result.test_sell_count,
             );
         }
     }
