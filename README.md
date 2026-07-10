@@ -54,7 +54,7 @@ Sweep moving-average crossover and RSI mean-reversion parameters against 1m/5m c
 cargo run -- --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/trader/trader.sqlite
 ```
 
-The candle sweep uses a chronological 70/30 train/test split, ranks rows with at least 3 test fills first, and saves its latest ranked results into SQLite. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
+The candle sweep uses a chronological 70/30 train/test split, ranks rows with at least 3 test fills first, and saves its latest ranked results into SQLite. It includes MA crossover, RSI mean reversion, all-in hold, fixed-size hold, DCA, and trend-filtered DCA research rows. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
 Sweep alpha means strategy P/L minus buy-and-hold P/L over the same train or test slice.
 A candidate row requires at least 3 test fills, positive test P/L, and positive test alpha.
 

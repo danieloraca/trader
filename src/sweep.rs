@@ -18,8 +18,21 @@ const RSI_WINDOWS: [usize; 3] = [7, 14, 21];
 const RSI_OVERSOLD_THRESHOLDS: [u8; 3] = [25, 30, 35];
 const RSI_OVERBOUGHT_THRESHOLDS: [u8; 3] = [65, 70, 75];
 const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
+const DCA_PERIODS: [usize; 3] = [5, 15, 30];
+const TREND_WINDOWS: [usize; 3] = [15, 30, 60];
 const TRAIN_SPLIT_BPS: usize = 7_000;
 const MIN_TEST_FILLS: usize = 3;
+#[cfg(test)]
+const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
+    * ((FAST_WINDOWS.len() * SLOW_WINDOWS.len() * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (RSI_WINDOWS.len()
+            * RSI_OVERSOLD_THRESHOLDS.len()
+            * RSI_OVERBOUGHT_THRESHOLDS.len()
+            * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + 1
+        + CANDLE_QUANTITY_MICRO_UNITS.len()
+        + (DCA_PERIODS.len() * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (TREND_WINDOWS.len() * DCA_PERIODS.len() * CANDLE_QUANTITY_MICRO_UNITS.len()));
 
 #[derive(Debug, Clone)]
 pub struct SweepReport {
@@ -230,6 +243,89 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                 }
             }
         }
+
+        results.push(candle_baseline_result(
+            config,
+            "hold_all",
+            "all-in",
+            interval_seconds,
+            candles.len(),
+            &train_closes,
+            &test_closes,
+            0,
+            0,
+            Decimal::ZERO,
+            BaselinePlan::HoldAll,
+        )?);
+
+        for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+            let quantity_base = Decimal::from_micro_units(quantity_micro_units);
+            results.push(candle_baseline_result(
+                config,
+                "hold_fixed",
+                "first",
+                interval_seconds,
+                candles.len(),
+                &train_closes,
+                &test_closes,
+                0,
+                0,
+                quantity_base,
+                BaselinePlan::HoldFixed { quantity_base },
+            )?);
+        }
+
+        for period in DCA_PERIODS {
+            for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                let quantity_base = Decimal::from_micro_units(quantity_micro_units);
+                results.push(candle_baseline_result(
+                    config,
+                    "dca",
+                    &format!("every-{period}"),
+                    interval_seconds,
+                    candles.len(),
+                    &train_closes,
+                    &test_closes,
+                    period,
+                    0,
+                    quantity_base,
+                    BaselinePlan::Dca {
+                        period,
+                        quantity_base,
+                    },
+                )?);
+            }
+        }
+
+        for trend_window in TREND_WINDOWS {
+            if train_closes.len() < trend_window || test_closes.len() < trend_window {
+                skipped_under_warmed_count += DCA_PERIODS.len() * CANDLE_QUANTITY_MICRO_UNITS.len();
+                continue;
+            }
+
+            for period in DCA_PERIODS {
+                for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                    let quantity_base = Decimal::from_micro_units(quantity_micro_units);
+                    results.push(candle_baseline_result(
+                        config,
+                        "trend_dca",
+                        &format!("{trend_window}/every-{period}"),
+                        interval_seconds,
+                        candles.len(),
+                        &train_closes,
+                        &test_closes,
+                        trend_window,
+                        period,
+                        quantity_base,
+                        BaselinePlan::TrendDca {
+                            trend_window,
+                            period,
+                            quantity_base,
+                        },
+                    )?);
+                }
+            }
+        }
     }
 
     results.sort_by(compare_candle_sweep_results);
@@ -311,6 +407,273 @@ fn split_train_test(prices: &[Decimal]) -> (Vec<Decimal>, Vec<Decimal>) {
         prices[..split_index].to_vec(),
         prices[split_index..].to_vec(),
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BaselinePlan {
+    HoldAll,
+    HoldFixed {
+        quantity_base: Decimal,
+    },
+    Dca {
+        period: usize,
+        quantity_base: Decimal,
+    },
+    TrendDca {
+        trend_window: usize,
+        period: usize,
+        quantity_base: Decimal,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BaselinePortfolio {
+    base_balance: Decimal,
+    quote_balance: Decimal,
+}
+
+fn candle_baseline_result(
+    config: &Config,
+    strategy_kind: &str,
+    parameter_summary: &str,
+    interval_seconds: i64,
+    candle_count: usize,
+    train_closes: &[Decimal],
+    test_closes: &[Decimal],
+    fast_window: usize,
+    slow_window: usize,
+    quantity_base: Decimal,
+    plan: BaselinePlan,
+) -> Result<CandleSweepResult> {
+    let train_report = run_baseline_from_prices(config, train_closes, plan)?;
+    let test_report = run_baseline_from_prices(config, test_closes, plan)?;
+
+    Ok(CandleSweepResult::from_report(
+        strategy_kind,
+        parameter_summary,
+        interval_seconds,
+        candle_count,
+        train_closes.len(),
+        test_closes.len(),
+        fast_window,
+        slow_window,
+        quantity_base,
+        &train_report,
+        &test_report,
+    ))
+}
+
+fn run_baseline_from_prices(
+    config: &Config,
+    prices: &[Decimal],
+    plan: BaselinePlan,
+) -> Result<BacktestReport> {
+    if prices.is_empty() {
+        return Err(BotError::Config(
+            "baseline backtest price source is empty".to_string(),
+        ));
+    }
+
+    let mut portfolio = BaselinePortfolio {
+        base_balance: Decimal::ZERO,
+        quote_balance: config.bot.paper_starting_quote_balance,
+    };
+    let mut report = baseline_report(config, prices.len());
+    let mut peak_value = report.initial_value_quote;
+    let mut exposed_events = 0_usize;
+
+    for (index, price) in prices.iter().copied().enumerate() {
+        if portfolio.base_balance > Decimal::ZERO {
+            exposed_events += 1;
+        }
+
+        if let Some(quantity_base) = baseline_buy_quantity(index, prices, &portfolio, plan, config)
+        {
+            report.signal_count += 1;
+            match fill_baseline_buy(
+                &mut portfolio,
+                quantity_base,
+                price,
+                config.backtest.fee_bps,
+                config.backtest.slippage_bps,
+            ) {
+                Ok((fee_quote, slippage_quote)) => {
+                    report.filled_order_count += 1;
+                    report.buy_count += 1;
+                    report.total_fees_quote += fee_quote;
+                    report.total_slippage_quote += slippage_quote;
+                }
+                Err(BotError::Risk(_)) => {
+                    report.rejected_order_count += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let value = baseline_portfolio_value(&portfolio, price);
+        if value > peak_value {
+            peak_value = value;
+        }
+        if peak_value > Decimal::ZERO {
+            let drawdown = (peak_value - value).ratio_to(peak_value) * 100.0;
+            if drawdown > report.max_drawdown_pct {
+                report.max_drawdown_pct = drawdown;
+            }
+        }
+    }
+
+    let first_price = prices[0];
+    let last_price = prices[prices.len() - 1];
+    report.final_base_balance = portfolio.base_balance;
+    report.final_quote_balance = portfolio.quote_balance;
+    report.final_value_quote = baseline_portfolio_value(&portfolio, last_price);
+    report.profit_loss_quote = report.final_value_quote - report.initial_value_quote;
+    report.return_pct = report
+        .profit_loss_quote
+        .ratio_to(report.initial_value_quote)
+        * 100.0;
+    report.buy_and_hold_value_quote = (report.initial_value_quote / first_price) * last_price;
+    report.buy_and_hold_profit_loss_quote =
+        report.buy_and_hold_value_quote - report.initial_value_quote;
+    report.buy_and_hold_return_pct = report
+        .buy_and_hold_profit_loss_quote
+        .ratio_to(report.initial_value_quote)
+        * 100.0;
+    report.exposure_pct = exposed_events as f64 / prices.len() as f64 * 100.0;
+
+    Ok(report)
+}
+
+fn baseline_report(config: &Config, event_count: usize) -> BacktestReport {
+    BacktestReport {
+        symbol: config.bot.symbol.clone(),
+        event_count,
+        signal_count: 0,
+        filled_order_count: 0,
+        rejected_order_count: 0,
+        buy_count: 0,
+        sell_count: 0,
+        initial_value_quote: config.bot.paper_starting_quote_balance,
+        final_value_quote: config.bot.paper_starting_quote_balance,
+        profit_loss_quote: Decimal::ZERO,
+        return_pct: 0.0,
+        buy_and_hold_value_quote: config.bot.paper_starting_quote_balance,
+        buy_and_hold_profit_loss_quote: Decimal::ZERO,
+        buy_and_hold_return_pct: 0.0,
+        max_drawdown_pct: 0.0,
+        total_fees_quote: Decimal::ZERO,
+        total_slippage_quote: Decimal::ZERO,
+        average_trade_return_pct: 0.0,
+        win_count: 0,
+        loss_count: 0,
+        exposure_pct: 0.0,
+        final_base_balance: Decimal::ZERO,
+        final_quote_balance: config.bot.paper_starting_quote_balance,
+        trade_log_csv_path: None,
+        trades: Vec::new(),
+    }
+}
+
+fn baseline_buy_quantity(
+    index: usize,
+    prices: &[Decimal],
+    portfolio: &BaselinePortfolio,
+    plan: BaselinePlan,
+    config: &Config,
+) -> Option<Decimal> {
+    match plan {
+        BaselinePlan::HoldAll => {
+            if index == 0 {
+                Some(max_affordable_quantity(
+                    portfolio.quote_balance,
+                    prices[index],
+                    config.backtest.fee_bps,
+                    config.backtest.slippage_bps,
+                ))
+            } else {
+                None
+            }
+        }
+        BaselinePlan::HoldFixed { quantity_base } => (index == 0).then_some(quantity_base),
+        BaselinePlan::Dca {
+            period,
+            quantity_base,
+        } => (index % period == 0).then_some(quantity_base),
+        BaselinePlan::TrendDca {
+            trend_window,
+            period,
+            quantity_base,
+        } => {
+            if index % period == 0
+                && index + 1 >= trend_window
+                && prices[index] > simple_average(&prices[index + 1 - trend_window..=index])
+            {
+                Some(quantity_base)
+            } else {
+                None
+            }
+        }
+    }
+    .filter(|quantity_base| *quantity_base > Decimal::ZERO)
+}
+
+fn fill_baseline_buy(
+    portfolio: &mut BaselinePortfolio,
+    quantity_base: Decimal,
+    price: Decimal,
+    fee_bps: i64,
+    slippage_bps: i64,
+) -> Result<(Decimal, Decimal)> {
+    let slippage = bps_value(price, slippage_bps);
+    let fill_price = price + slippage;
+    let gross_quote_value = quantity_base * fill_price;
+    let fee_quote = bps_value(gross_quote_value, fee_bps);
+    let slippage_quote = quantity_base * slippage;
+    let total_quote_cost = gross_quote_value + fee_quote;
+
+    if portfolio.quote_balance < total_quote_cost {
+        return Err(BotError::Risk(format!(
+            "baseline rejected: insufficient quote balance for cost {total_quote_cost}"
+        )));
+    }
+
+    portfolio.quote_balance -= total_quote_cost;
+    portfolio.base_balance += quantity_base;
+
+    Ok((fee_quote, slippage_quote))
+}
+
+fn max_affordable_quantity(
+    quote_balance: Decimal,
+    price: Decimal,
+    fee_bps: i64,
+    slippage_bps: i64,
+) -> Decimal {
+    let slippage = bps_value(price, slippage_bps);
+    let fill_price = price + slippage;
+    let total_cost_per_base = fill_price + bps_value(fill_price, fee_bps);
+
+    if total_cost_per_base <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    quote_balance / total_cost_per_base
+}
+
+fn baseline_portfolio_value(portfolio: &BaselinePortfolio, price: Decimal) -> Decimal {
+    portfolio.quote_balance + (portfolio.base_balance * price)
+}
+
+fn simple_average(values: &[Decimal]) -> Decimal {
+    let total = values
+        .iter()
+        .copied()
+        .fold(Decimal::ZERO, |accumulator, value| accumulator + value);
+    total / Decimal::from_micro_units(values.len() as i64 * 1_000_000)
+}
+
+fn bps_value(value: Decimal, bps: i64) -> Decimal {
+    Decimal::from_micro_units(((value.micro_units() as i128 * bps as i128) / 10_000) as i64)
 }
 
 fn save_candle_sweep_report(
@@ -766,7 +1129,7 @@ impl Display for SweepReport {
 
 impl Display for CandleSweepReport {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Candle MA sweep report")?;
+        writeln!(f, "Candle strategy sweep report")?;
         writeln!(f, "SQLite source: {}", self.sqlite_path)?;
         writeln!(f, "Runnable combinations: {}", self.result_count)?;
         writeln!(
@@ -835,7 +1198,8 @@ impl Display for CandleSweepReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandleSweepResult, MIN_TEST_FILLS, compare_candle_sweep_results, run, run_candles,
+        CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
+        compare_candle_sweep_results, run, run_candles,
     };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
@@ -1087,7 +1451,7 @@ mod tests {
         let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
             .expect("candle sweep should run");
 
-        assert!(report.result_count < 258);
+        assert!(report.result_count < MAX_CANDLE_SWEEP_COMBINATIONS);
         assert!(report.skipped_under_warmed_count > 0);
         assert!(
             report
@@ -1095,6 +1459,53 @@ mod tests {
                 .iter()
                 .all(|result| result.train_candle_count > 0 && result.test_candle_count > 0)
         );
+
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn includes_baseline_strategy_families_in_candle_sweep() {
+        let path = db_path("sqlite-candles-baselines");
+        let connection = Connection::open(&path).expect("database should open");
+        connection
+            .execute(
+                "
+                CREATE TABLE market_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price_micro_units INTEGER NOT NULL
+                )
+                ",
+                [],
+            )
+            .expect("market events table should create");
+
+        for index in 0..240_i64 {
+            connection
+                .execute(
+                    "
+                    INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
+                    VALUES (?1, 'BTC-USD', ?2)
+                    ",
+                    (index * 60_000, 100_000_000 + (index * 50_000)),
+                )
+                .expect("market event should insert");
+        }
+        drop(connection);
+
+        let report = run_candles(&config(), path.to_str().expect("path should be utf8"))
+            .expect("candle sweep should run");
+
+        for strategy_kind in ["hold_all", "hold_fixed", "dca", "trend_dca"] {
+            assert!(
+                report
+                    .results
+                    .iter()
+                    .any(|result| result.strategy_kind == strategy_kind),
+                "expected {strategy_kind} rows"
+            );
+        }
 
         fs::remove_file(path).expect("test database should be removed");
     }
