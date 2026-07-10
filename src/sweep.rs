@@ -706,10 +706,35 @@ fn bps_value(value: Decimal, bps: i64) -> Decimal {
 }
 
 fn capital_matched_buy_hold_profit_loss(report: &BacktestReport, final_price: Decimal) -> Decimal {
-    report
+    let buy_trades = report
         .trades
         .iter()
         .filter(|trade| trade.side == Side::Buy)
+        .collect::<Vec<_>>();
+
+    if buy_trades.is_empty() {
+        return Decimal::ZERO;
+    }
+
+    if report.sell_count == 0 {
+        let deployed_quote = buy_trades
+            .iter()
+            .map(|trade| trade.gross_quote_value + trade.fee_quote)
+            .fold(Decimal::ZERO, |accumulator, value| accumulator + value);
+        let first_buy = buy_trades[0];
+        let first_buy_cost_per_base =
+            (first_buy.gross_quote_value + first_buy.fee_quote) / first_buy.quantity_base;
+
+        if first_buy_cost_per_base <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        let benchmark_base = deployed_quote / first_buy_cost_per_base;
+        return (benchmark_base * final_price) - deployed_quote;
+    }
+
+    buy_trades
+        .into_iter()
         .map(|trade| {
             (trade.quantity_base * final_price) - (trade.gross_quote_value + trade.fee_quote)
         })
@@ -1267,8 +1292,9 @@ impl Display for CandleSweepReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
-        compare_candle_sweep_results, run, run_candles,
+        BaselinePlan, CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
+        capital_matched_buy_hold_profit_loss, compare_candle_sweep_results, run,
+        run_baseline_from_prices, run_candles,
     };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
@@ -1353,6 +1379,25 @@ mod tests {
             test_exposure_pct: 10.0,
             test_final_base_balance: Decimal::ZERO,
         }
+    }
+
+    #[test]
+    fn buy_only_capital_matched_benchmark_deploys_at_first_buy() {
+        let report = run_baseline_from_prices(
+            &config(),
+            &[decimal("100"), decimal("110"), decimal("120")],
+            BaselinePlan::Dca {
+                period: 1,
+                quantity_base: decimal("0.001"),
+            },
+        )
+        .expect("baseline backtest should run");
+
+        let matched_profit_loss = capital_matched_buy_hold_profit_loss(&report, decimal("120"));
+
+        assert_eq!(report.buy_count, 3);
+        assert_eq!(report.sell_count, 0);
+        assert_ne!(matched_profit_loss, report.profit_loss_quote);
     }
 
     #[test]
