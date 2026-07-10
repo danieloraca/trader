@@ -110,6 +110,17 @@ struct StrategyResearchResultRow {
     test_exposure_pct: f64,
 }
 
+#[derive(Debug)]
+struct ResearchSummary {
+    signal_class: &'static str,
+    signal_value: String,
+    signal_detail: String,
+    strict_value: String,
+    strict_detail: String,
+    matched_value: String,
+    matched_detail: String,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = env::var("TRADER_DASHBOARD_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let db_path = env::var("TRADER_DASHBOARD_DB").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
@@ -717,10 +728,18 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
             )
         })
         .unwrap_or_else(|| "n/a".to_string());
+    let research = research_summary(
+        snapshot.strategy_research_run.as_ref(),
+        &snapshot.strategy_research_results,
+        &snapshot.strategy_research_matched_results,
+    );
 
     let _ = write!(
         html,
         r#"<section class="grid">
+<div class="tile {}"><div class="label">Research Signal</div><div class="value">{}</div><div class="muted">{}</div></div>
+<div class="tile"><div class="label">Best Strict</div><div class="value">{}</div><div class="muted">{}</div></div>
+<div class="tile"><div class="label">Best Match</div><div class="value">{}</div><div class="muted">{}</div></div>
 <div class="tile"><div class="label">Market Events</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Events Last Hour</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Orders</div><div class="value">{}</div></div>
@@ -731,6 +750,13 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
 <div class="tile"><div class="label">Portfolio</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
 <div class="tile"><div class="label">Marked Value</div><div class="value">{}</div></div>
 </section>"#,
+        research.signal_class,
+        escape_html(&research.signal_value),
+        escape_html(&research.signal_detail),
+        escape_html(&research.strict_value),
+        escape_html(&research.strict_detail),
+        escape_html(&research.matched_value),
+        escape_html(&research.matched_detail),
         snapshot.market_event_count,
         snapshot.market_events_last_hour,
         snapshot.order_count,
@@ -749,6 +775,89 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
         escape_html(&time_fallback(portfolio_time_ms)),
         escape_html(&marked_value),
     );
+}
+
+fn research_summary(
+    run: Option<&StrategyResearchRunRow>,
+    strict_results: &[StrategyResearchResultRow],
+    matched_results: &[StrategyResearchResultRow],
+) -> ResearchSummary {
+    let Some(run) = run else {
+        return ResearchSummary {
+            signal_class: "warn",
+            signal_value: "No sweep".to_string(),
+            signal_detail: "Run the candle sweep".to_string(),
+            strict_value: "n/a".to_string(),
+            strict_detail: "No cached research rows".to_string(),
+            matched_value: "n/a".to_string(),
+            matched_detail: "No cached matched rows".to_string(),
+        };
+    };
+
+    let candidate = strict_results
+        .iter()
+        .find(|result| is_research_candidate(result, run.min_test_fills));
+    let (signal_class, signal_value, signal_detail) = if let Some(result) = candidate {
+        (
+            "ok",
+            "Candidate".to_string(),
+            format!(
+                "{} {} P/L {}, alpha {}, match {}",
+                result.strategy_kind,
+                result.parameter_summary,
+                format_micro_units(result.test_pnl_micro_units),
+                format_micro_units(result.test_buy_and_hold_delta_micro_units),
+                format_micro_units(result.test_capital_matched_delta_micro_units),
+            ),
+        )
+    } else {
+        (
+            "warn",
+            "No candidate".to_string(),
+            format!(
+                "Latest sweep {}; min fills {}",
+                time_fallback(Some(run.recorded_at_ms)),
+                run.min_test_fills
+            ),
+        )
+    };
+
+    let (strict_value, strict_detail) = strict_results
+        .first()
+        .map(research_result_summary)
+        .unwrap_or_else(|| ("n/a".to_string(), "No strict rows".to_string()));
+    let (matched_value, matched_detail) = matched_results
+        .first()
+        .map(research_result_summary)
+        .unwrap_or_else(|| ("n/a".to_string(), "No matched rows".to_string()));
+
+    ResearchSummary {
+        signal_class,
+        signal_value,
+        signal_detail,
+        strict_value,
+        strict_detail,
+        matched_value,
+        matched_detail,
+    }
+}
+
+fn research_result_summary(result: &StrategyResearchResultRow) -> (String, String) {
+    (
+        format!("{} {}", result.strategy_kind, result.parameter_summary),
+        format!(
+            "P/L {}, alpha {}, match {}",
+            format_micro_units(result.test_pnl_micro_units),
+            format_micro_units(result.test_buy_and_hold_delta_micro_units),
+            format_micro_units(result.test_capital_matched_delta_micro_units),
+        ),
+    )
+}
+
+fn is_research_candidate(result: &StrategyResearchResultRow, min_test_fills: i64) -> bool {
+    result.test_filled_order_count >= min_test_fills
+        && result.test_pnl_micro_units > 0
+        && result.test_buy_and_hold_delta_micro_units > 0
 }
 
 fn render_price_chart(html: &mut String, prices: &[MarketEventRow]) {
@@ -937,9 +1046,7 @@ fn render_strategy_research(
         );
     } else {
         for result in results {
-            let is_candidate = result.test_filled_order_count >= run.min_test_fills
-                && result.test_pnl_micro_units > 0
-                && result.test_buy_and_hold_delta_micro_units > 0;
+            let is_candidate = is_research_candidate(result, run.min_test_fills);
             let quality_class = if is_candidate {
                 "status candidate"
             } else if result.test_filled_order_count >= run.min_test_fills {
@@ -1048,9 +1155,7 @@ fn render_strategy_research(
         );
     } else {
         for result in matched_results {
-            let is_candidate = result.test_filled_order_count >= run.min_test_fills
-                && result.test_pnl_micro_units > 0
-                && result.test_buy_and_hold_delta_micro_units > 0;
+            let is_candidate = is_research_candidate(result, run.min_test_fills);
             let quality_class = if is_candidate {
                 "status candidate"
             } else if result.test_filled_order_count >= run.min_test_fills {
