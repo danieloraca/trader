@@ -107,6 +107,37 @@ pub struct CandleSweepResult {
     pub test_final_base_balance: Decimal,
 }
 
+#[derive(Debug, Clone)]
+pub struct WalkForwardReport {
+    pub sqlite_path: String,
+    pub result_count: usize,
+    pub skipped_under_warmed_count: usize,
+    pub results: Vec<WalkForwardResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalkForwardResult {
+    pub strategy_kind: String,
+    pub parameter_summary: String,
+    pub interval_seconds: i64,
+    pub candle_count: usize,
+    pub train_window_candles: usize,
+    pub test_window_candles: usize,
+    pub quantity_base: Decimal,
+    pub window_count: usize,
+    pub candidate_window_count: usize,
+    pub profitable_window_count: usize,
+    pub total_test_profit_loss_quote: Decimal,
+    pub average_test_profit_loss_quote: Decimal,
+    pub worst_test_profit_loss_quote: Decimal,
+    pub average_test_alpha_quote: Decimal,
+    pub average_test_match_quote: Decimal,
+    pub worst_test_drawdown_pct: f64,
+    pub total_test_filled_order_count: usize,
+    pub total_test_buy_count: usize,
+    pub total_test_sell_count: usize,
+}
+
 pub fn run(config: &Config, sqlite_path: &str) -> Result<SweepReport> {
     let prices = backtest::load_prices_from_sqlite(sqlite_path, &config.bot.symbol)?;
     let mut results = Vec::new();
@@ -393,6 +424,126 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
     Ok(report)
 }
 
+pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwardReport> {
+    let recorded_prices =
+        backtest::load_recorded_prices_from_sqlite(sqlite_path, &config.bot.symbol)?;
+    if recorded_prices.is_empty() {
+        return Err(BotError::Config(
+            "walk-forward price source is empty".to_string(),
+        ));
+    }
+
+    let mut results = Vec::new();
+    let mut skipped_under_warmed_count = 0_usize;
+
+    for interval_seconds in CANDLE_INTERVAL_SECONDS {
+        let interval_ms = interval_seconds * 1_000;
+        let candles = candles::aggregate_prices_to_candles(&recorded_prices, interval_ms)?;
+        let candle_closes = candles
+            .iter()
+            .map(|candle| candle.close)
+            .collect::<Vec<_>>();
+        let Some(plan) = walk_forward_plan(candle_closes.len()) else {
+            skipped_under_warmed_count += walk_forward_strategy_count();
+            continue;
+        };
+
+        for fast_window in FAST_WINDOWS {
+            for slow_window in SLOW_WINDOWS {
+                if fast_window >= slow_window {
+                    continue;
+                }
+
+                if plan.train_window_candles < slow_window + 1
+                    || plan.test_window_candles < slow_window + 1
+                {
+                    skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
+                    continue;
+                }
+
+                for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                    results.push(walk_forward_strategy_result(
+                        config,
+                        "ma",
+                        &format!("{fast_window}/{slow_window}"),
+                        interval_seconds,
+                        &candle_closes,
+                        plan,
+                        fast_window,
+                        slow_window,
+                        Decimal::from_micro_units(quantity_micro_units),
+                    )?);
+                }
+            }
+        }
+
+        for rsi_window in RSI_WINDOWS {
+            if plan.train_window_candles < rsi_window + 2
+                || plan.test_window_candles < rsi_window + 2
+            {
+                skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
+                    * RSI_OVERBOUGHT_THRESHOLDS.len()
+                    * CANDLE_QUANTITY_MICRO_UNITS.len();
+                continue;
+            }
+
+            for oversold_threshold in RSI_OVERSOLD_THRESHOLDS {
+                for overbought_threshold in RSI_OVERBOUGHT_THRESHOLDS {
+                    if oversold_threshold >= overbought_threshold {
+                        continue;
+                    }
+
+                    for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                        results.push(walk_forward_strategy_result(
+                            config,
+                            "rsi",
+                            &format!("{rsi_window}:{oversold_threshold}/{overbought_threshold}"),
+                            interval_seconds,
+                            &candle_closes,
+                            plan,
+                            rsi_window,
+                            0,
+                            Decimal::from_micro_units(quantity_micro_units),
+                        )?);
+                    }
+                }
+            }
+        }
+
+        for breakout_window in BREAKOUT_WINDOWS {
+            if plan.train_window_candles < breakout_window + 1
+                || plan.test_window_candles < breakout_window + 1
+            {
+                skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
+                continue;
+            }
+
+            for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                results.push(walk_forward_strategy_result(
+                    config,
+                    "breakout",
+                    &breakout_window.to_string(),
+                    interval_seconds,
+                    &candle_closes,
+                    plan,
+                    breakout_window,
+                    0,
+                    Decimal::from_micro_units(quantity_micro_units),
+                )?);
+            }
+        }
+    }
+
+    results.sort_by(compare_walk_forward_results);
+
+    Ok(WalkForwardReport {
+        sqlite_path: sqlite_path.to_string(),
+        result_count: results.len(),
+        skipped_under_warmed_count,
+        results,
+    })
+}
+
 fn compare_sweep_results(lhs: &SweepResult, rhs: &SweepResult) -> Ordering {
     rhs.net_profit_loss_quote
         .cmp(&lhs.net_profit_loss_quote)
@@ -451,6 +602,37 @@ fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult
         })
 }
 
+fn compare_walk_forward_results(lhs: &WalkForwardResult, rhs: &WalkForwardResult) -> Ordering {
+    let lhs_is_candidate = is_walk_forward_candidate(lhs);
+    let rhs_is_candidate = is_walk_forward_candidate(rhs);
+    let lhs_consistency = lhs.candidate_window_count * 10_000 / lhs.window_count.max(1);
+    let rhs_consistency = rhs.candidate_window_count * 10_000 / rhs.window_count.max(1);
+
+    rhs_is_candidate
+        .cmp(&lhs_is_candidate)
+        .then_with(|| rhs_consistency.cmp(&lhs_consistency))
+        .then_with(|| {
+            rhs.average_test_profit_loss_quote
+                .cmp(&lhs.average_test_profit_loss_quote)
+        })
+        .then_with(|| {
+            rhs.worst_test_profit_loss_quote
+                .cmp(&lhs.worst_test_profit_loss_quote)
+        })
+        .then_with(|| {
+            rhs.average_test_match_quote
+                .cmp(&lhs.average_test_match_quote)
+        })
+        .then_with(|| {
+            lhs.worst_test_drawdown_pct
+                .total_cmp(&rhs.worst_test_drawdown_pct)
+        })
+        .then_with(|| {
+            rhs.total_test_filled_order_count
+                .cmp(&lhs.total_test_filled_order_count)
+        })
+}
+
 fn is_candidate(result: &CandleSweepResult) -> bool {
     result.test_filled_order_count >= MIN_TEST_FILLS
         && result.test_profit_loss_quote > Decimal::ZERO
@@ -459,9 +641,31 @@ fn is_candidate(result: &CandleSweepResult) -> bool {
         && train_loss_is_acceptable(result)
 }
 
+fn is_walk_forward_candidate(result: &WalkForwardResult) -> bool {
+    result.window_count >= 3
+        && result.candidate_window_count * 10 >= result.window_count * 7
+        && result.average_test_profit_loss_quote > Decimal::ZERO
+        && result.worst_test_profit_loss_quote > Decimal::ZERO
+        && result.average_test_alpha_quote > Decimal::ZERO
+        && result.average_test_match_quote > Decimal::ZERO
+        && result.total_test_filled_order_count >= MIN_TEST_FILLS * result.window_count
+}
+
 fn train_loss_is_acceptable(result: &CandleSweepResult) -> bool {
     result.train_profit_loss_quote
         >= Decimal::from_micro_units(-MAX_CANDIDATE_TRAIN_LOSS_QUOTE * MICRO_UNITS_PER_UNIT)
+}
+
+fn walk_forward_quality_label(result: &WalkForwardResult) -> &'static str {
+    if is_walk_forward_candidate(result) {
+        "candidate"
+    } else if result.average_test_profit_loss_quote > Decimal::ZERO
+        && result.average_test_match_quote > Decimal::ZERO
+    {
+        "watch"
+    } else {
+        "ok"
+    }
 }
 
 fn quality_label(result: &CandleSweepResult) -> &'static str {
@@ -472,6 +676,255 @@ fn quality_label(result: &CandleSweepResult) -> &'static str {
     } else {
         "thin"
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WalkForwardPlan {
+    train_window_candles: usize,
+    test_window_candles: usize,
+    step_candles: usize,
+}
+
+fn walk_forward_plan(candle_count: usize) -> Option<WalkForwardPlan> {
+    if candle_count < 80 {
+        return None;
+    }
+
+    let test_window_candles = (candle_count / 10).max(30);
+    let train_window_candles = test_window_candles * 3;
+    if candle_count < train_window_candles + test_window_candles {
+        return None;
+    }
+
+    Some(WalkForwardPlan {
+        train_window_candles,
+        test_window_candles,
+        step_candles: test_window_candles,
+    })
+}
+
+fn walk_forward_strategy_count() -> usize {
+    (FAST_WINDOWS
+        .iter()
+        .flat_map(|fast| SLOW_WINDOWS.iter().map(move |slow| (*fast, *slow)))
+        .filter(|(fast, slow)| fast < slow)
+        .count()
+        * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (RSI_WINDOWS.len()
+            * RSI_OVERSOLD_THRESHOLDS.len()
+            * RSI_OVERBOUGHT_THRESHOLDS.len()
+            * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (BREAKOUT_WINDOWS.len() * CANDLE_QUANTITY_MICRO_UNITS.len())
+}
+
+fn walk_forward_windows(
+    candle_count: usize,
+    plan: WalkForwardPlan,
+) -> impl Iterator<Item = (usize, usize, usize)> {
+    let mut train_start = 0_usize;
+    std::iter::from_fn(move || {
+        let train_end = train_start + plan.train_window_candles;
+        let test_end = train_end + plan.test_window_candles;
+        if test_end > candle_count {
+            return None;
+        }
+        let window = (train_start, train_end, test_end);
+        train_start += plan.step_candles;
+        Some(window)
+    })
+}
+
+fn walk_forward_strategy_result(
+    config: &Config,
+    strategy_kind: &str,
+    parameter_summary: &str,
+    interval_seconds: i64,
+    closes: &[Decimal],
+    plan: WalkForwardPlan,
+    fast_window: usize,
+    slow_window: usize,
+    quantity_base: Decimal,
+) -> Result<WalkForwardResult> {
+    let mut candidate_window_count = 0_usize;
+    let mut profitable_window_count = 0_usize;
+    let mut total_test_profit_loss_quote = Decimal::ZERO;
+    let mut total_test_alpha_quote = Decimal::ZERO;
+    let mut total_test_match_quote = Decimal::ZERO;
+    let mut worst_test_profit_loss_quote: Option<Decimal> = None;
+    let mut worst_test_drawdown_pct = 0.0_f64;
+    let mut total_test_filled_order_count = 0_usize;
+    let mut total_test_buy_count = 0_usize;
+    let mut total_test_sell_count = 0_usize;
+    let mut window_count = 0_usize;
+
+    for (train_start, train_end, test_end) in walk_forward_windows(closes.len(), plan) {
+        let train_closes = closes[train_start..train_end].to_vec();
+        let test_closes = closes[train_end..test_end].to_vec();
+        let result = strategy_candle_result(
+            config,
+            strategy_kind,
+            parameter_summary,
+            interval_seconds,
+            closes.len(),
+            &train_closes,
+            &test_closes,
+            fast_window,
+            slow_window,
+            quantity_base,
+        )?;
+
+        if is_candidate(&result) {
+            candidate_window_count += 1;
+        }
+        if result.test_profit_loss_quote > Decimal::ZERO {
+            profitable_window_count += 1;
+        }
+
+        total_test_profit_loss_quote += result.test_profit_loss_quote;
+        total_test_alpha_quote += result.test_buy_and_hold_delta_quote;
+        total_test_match_quote += result.test_capital_matched_delta_quote;
+        worst_test_profit_loss_quote = Some(
+            worst_test_profit_loss_quote
+                .map(|worst| worst.min(result.test_profit_loss_quote))
+                .unwrap_or(result.test_profit_loss_quote),
+        );
+        if result.test_max_drawdown_pct > worst_test_drawdown_pct {
+            worst_test_drawdown_pct = result.test_max_drawdown_pct;
+        }
+        total_test_filled_order_count += result.test_filled_order_count;
+        total_test_buy_count += result.test_buy_count;
+        total_test_sell_count += result.test_sell_count;
+        window_count += 1;
+    }
+
+    let average_test_profit_loss_quote = total_test_profit_loss_quote
+        / Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
+    let average_test_alpha_quote = total_test_alpha_quote
+        / Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
+    let average_test_match_quote = total_test_match_quote
+        / Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
+
+    Ok(WalkForwardResult {
+        strategy_kind: strategy_kind.to_string(),
+        parameter_summary: parameter_summary.to_string(),
+        interval_seconds,
+        candle_count: closes.len(),
+        train_window_candles: plan.train_window_candles,
+        test_window_candles: plan.test_window_candles,
+        quantity_base,
+        window_count,
+        candidate_window_count,
+        profitable_window_count,
+        total_test_profit_loss_quote,
+        average_test_profit_loss_quote,
+        worst_test_profit_loss_quote: worst_test_profit_loss_quote.unwrap_or(Decimal::ZERO),
+        average_test_alpha_quote,
+        average_test_match_quote,
+        worst_test_drawdown_pct,
+        total_test_filled_order_count,
+        total_test_buy_count,
+        total_test_sell_count,
+    })
+}
+
+fn strategy_candle_result(
+    config: &Config,
+    strategy_kind: &str,
+    parameter_summary: &str,
+    interval_seconds: i64,
+    candle_count: usize,
+    train_closes: &[Decimal],
+    test_closes: &[Decimal],
+    fast_window: usize,
+    slow_window: usize,
+    quantity_base: Decimal,
+) -> Result<CandleSweepResult> {
+    let mut candidate = config.clone();
+    candidate.backtest.trade_log_csv_path = None;
+
+    match strategy_kind {
+        "ma" => {
+            candidate.strategy.kind = StrategyKind::MovingAverageCrossover;
+            candidate.strategy.moving_average_crossover.fast_window = fast_window;
+            candidate.strategy.moving_average_crossover.slow_window = slow_window;
+            candidate.strategy.moving_average_crossover.quantity_base = quantity_base;
+        }
+        "rsi" => {
+            let (window, oversold_threshold, overbought_threshold) =
+                parse_rsi_parameter_summary(parameter_summary)?;
+            candidate.strategy.kind = StrategyKind::RsiMeanReversion;
+            candidate.strategy.rsi_mean_reversion.window = window;
+            candidate.strategy.rsi_mean_reversion.oversold_threshold = oversold_threshold;
+            candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
+            candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
+        }
+        "breakout" => {
+            let breakout_window = parameter_summary.parse::<usize>().map_err(|error| {
+                BotError::Config(format!(
+                    "invalid breakout parameter summary {parameter_summary}: {error}"
+                ))
+            })?;
+            candidate.strategy.kind = StrategyKind::Breakout;
+            candidate.strategy.breakout.window = breakout_window;
+            candidate.strategy.breakout.quantity_base = quantity_base;
+        }
+        _ => {
+            return Err(BotError::Config(format!(
+                "unsupported walk-forward strategy kind: {strategy_kind}"
+            )));
+        }
+    }
+
+    let train_report = backtest::run_from_prices(&candidate, train_closes.to_vec())?;
+    let test_report = backtest::run_from_prices(&candidate, test_closes.to_vec())?;
+    Ok(CandleSweepResult::from_report(
+        strategy_kind,
+        parameter_summary,
+        interval_seconds,
+        candle_count,
+        train_closes.len(),
+        test_closes.len(),
+        fast_window,
+        slow_window,
+        quantity_base,
+        &train_report,
+        &test_report,
+        *train_closes
+            .last()
+            .expect("train closes should not be empty"),
+        *test_closes.last().expect("test closes should not be empty"),
+    ))
+}
+
+fn parse_rsi_parameter_summary(parameter_summary: &str) -> Result<(usize, u8, u8)> {
+    let Some((window, thresholds)) = parameter_summary.split_once(':') else {
+        return Err(BotError::Config(format!(
+            "invalid RSI parameter summary: {parameter_summary}"
+        )));
+    };
+    let Some((oversold, overbought)) = thresholds.split_once('/') else {
+        return Err(BotError::Config(format!(
+            "invalid RSI parameter summary: {parameter_summary}"
+        )));
+    };
+
+    let window = window.parse::<usize>().map_err(|error| {
+        BotError::Config(format!(
+            "invalid RSI window in parameter summary {parameter_summary}: {error}"
+        ))
+    })?;
+    let oversold = oversold.parse::<u8>().map_err(|error| {
+        BotError::Config(format!(
+            "invalid RSI oversold threshold in parameter summary {parameter_summary}: {error}"
+        ))
+    })?;
+    let overbought = overbought.parse::<u8>().map_err(|error| {
+        BotError::Config(format!(
+            "invalid RSI overbought threshold in parameter summary {parameter_summary}: {error}"
+        ))
+    })?;
+
+    Ok((window, oversold, overbought))
 }
 
 fn split_train_test(prices: &[Decimal]) -> (Vec<Decimal>, Vec<Decimal>) {
@@ -1349,6 +1802,83 @@ impl Display for CandleSweepReport {
                 result.train_sell_count,
                 result.test_buy_count,
                 result.test_sell_count,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Display for WalkForwardReport {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Walk-forward strategy report")?;
+        writeln!(f, "SQLite source: {}", self.sqlite_path)?;
+        writeln!(f, "Runnable combinations: {}", self.result_count)?;
+        writeln!(
+            f,
+            "Skipped under-warmed combinations: {}",
+            self.skipped_under_warmed_count
+        )?;
+        writeln!(
+            f,
+            "Candidate requires >=70% candidate windows, avg/worst test P/L > 0, avg alpha > 0, avg match > 0"
+        )?;
+        if self.results.is_empty() {
+            writeln!(
+                f,
+                "No runnable walk-forward combinations yet. Let market data collect longer, then rerun."
+            )?;
+            return Ok(());
+        }
+
+        writeln!(
+            f,
+            "{:>8} {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>7}",
+            "interval",
+            "candles",
+            "train",
+            "test",
+            "strategy",
+            "params",
+            "qty",
+            "quality",
+            "cand_win",
+            "prof_win",
+            "avg_pnl",
+            "worst_pnl",
+            "avg_alpha",
+            "avg_match",
+            "total_pnl",
+            "worst_dd",
+            "fills",
+            "b/s"
+        )?;
+
+        for result in self.results.iter().take(25) {
+            writeln!(
+                f,
+                "{:>7}s {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}",
+                result.interval_seconds,
+                result.candle_count,
+                result.train_window_candles,
+                result.test_window_candles,
+                result.strategy_kind,
+                result.parameter_summary,
+                result.quantity_base,
+                walk_forward_quality_label(result),
+                result.candidate_window_count,
+                result.window_count,
+                result.profitable_window_count,
+                result.window_count,
+                result.average_test_profit_loss_quote,
+                result.worst_test_profit_loss_quote,
+                result.average_test_alpha_quote,
+                result.average_test_match_quote,
+                result.total_test_profit_loss_quote,
+                result.worst_test_drawdown_pct,
+                result.total_test_filled_order_count,
+                result.total_test_buy_count,
+                result.total_test_sell_count,
             )?;
         }
 

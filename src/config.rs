@@ -358,6 +358,7 @@ pub enum RuntimeCommand {
     BacktestSqlite,
     SweepSqlite,
     SweepCandlesSqlite,
+    WalkForwardSqlite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +368,7 @@ pub struct RuntimeOptions {
     pub backtest_sqlite_path: Option<String>,
     pub sweep_sqlite_path: Option<String>,
     pub sweep_candles_sqlite_path: Option<String>,
+    pub walk_forward_sqlite_path: Option<String>,
 }
 
 impl Config {
@@ -641,6 +643,7 @@ impl RuntimeOptions {
         let mut backtest_sqlite_path = None;
         let mut sweep_sqlite_path = None;
         let mut sweep_candles_sqlite_path = None;
+        let mut walk_forward_sqlite_path = None;
 
         while let Some(arg) = args.next() {
             if arg == "--config" {
@@ -674,6 +677,14 @@ impl RuntimeOptions {
                 };
                 command = RuntimeCommand::SweepCandlesSqlite;
                 sweep_candles_sqlite_path = Some(path);
+            } else if arg == "--walk-forward-sqlite" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--walk-forward-sqlite requires a sqlite path".to_string(),
+                    ));
+                };
+                command = RuntimeCommand::WalkForwardSqlite;
+                walk_forward_sqlite_path = Some(path);
             } else {
                 return Err(BotError::Config(format!("unknown argument: {arg}")));
             }
@@ -685,6 +696,7 @@ impl RuntimeOptions {
             backtest_sqlite_path,
             sweep_sqlite_path,
             sweep_candles_sqlite_path,
+            walk_forward_sqlite_path,
         })
     }
 }
@@ -1126,6 +1138,28 @@ verbose = true
         assert_eq!(options.command, RuntimeCommand::SweepCandlesSqlite);
         assert_eq!(
             options.sweep_candles_sqlite_path.as_deref(),
+            Some("/var/lib/trader/trader.sqlite")
+        );
+    }
+
+    #[test]
+    fn accepts_walk_forward_sqlite_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "/etc/trader.toml".to_string(),
+                "--walk-forward-sqlite".to_string(),
+                "/var/lib/trader/trader.sqlite".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.config_path, "/etc/trader.toml");
+        assert_eq!(options.command, RuntimeCommand::WalkForwardSqlite);
+        assert_eq!(
+            options.walk_forward_sqlite_path.as_deref(),
             Some("/var/lib/trader/trader.sqlite")
         );
     }

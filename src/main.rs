@@ -57,6 +57,14 @@ fn main() -> Result<()> {
             println!("{report}");
             return Ok(());
         }
+        RuntimeCommand::WalkForwardSqlite => {
+            let sqlite_path = runtime.walk_forward_sqlite_path.as_deref().ok_or_else(|| {
+                error::BotError::Config("--walk-forward-sqlite requires a sqlite path".to_string())
+            })?;
+            let report = sweep::run_walk_forward(&config, sqlite_path)?;
+            println!("{report}");
+            return Ok(());
+        }
         RuntimeCommand::Run => {}
     }
 
