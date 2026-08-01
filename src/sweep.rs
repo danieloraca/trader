@@ -131,6 +131,9 @@ pub struct WalkForwardReport {
 pub struct WalkForwardResult {
     pub strategy_kind: String,
     pub parameter_summary: String,
+    pub cost_profile: String,
+    pub assumed_fee_bps: i64,
+    pub assumed_slippage_bps: i64,
     pub interval_seconds: i64,
     pub candle_count: usize,
     pub train_window_candles: usize,
@@ -565,6 +568,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
 
     let mut results = Vec::new();
     let mut skipped_under_warmed_count = 0_usize;
+    let cost_profile_count = walk_forward_cost_profiles(config).len();
 
     for interval_seconds in CANDLE_INTERVAL_SECONDS {
         let interval_ms = interval_seconds * 1_000;
@@ -574,7 +578,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
             .map(|candle| candle.close)
             .collect::<Vec<_>>();
         let Some(plan) = walk_forward_plan(candle_closes.len()) else {
-            skipped_under_warmed_count += walk_forward_strategy_count();
+            skipped_under_warmed_count += walk_forward_strategy_count() * cost_profile_count;
             continue;
         };
 
@@ -587,12 +591,13 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                 if plan.train_window_candles < slow_window + 1
                     || plan.test_window_candles < slow_window + 1
                 {
-                    skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
+                    skipped_under_warmed_count +=
+                        CANDLE_QUANTITY_MICRO_UNITS.len() * cost_profile_count;
                     continue;
                 }
 
                 for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
-                    results.push(walk_forward_strategy_result(
+                    results.extend(walk_forward_strategy_results(
                         config,
                         "ma",
                         &format!("{fast_window}/{slow_window}"),
@@ -613,7 +618,8 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
             {
                 skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
                     * RSI_OVERBOUGHT_THRESHOLDS.len()
-                    * CANDLE_QUANTITY_MICRO_UNITS.len();
+                    * CANDLE_QUANTITY_MICRO_UNITS.len()
+                    * cost_profile_count;
                 continue;
             }
 
@@ -624,7 +630,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                     }
 
                     for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
-                        results.push(walk_forward_strategy_result(
+                        results.extend(walk_forward_strategy_results(
                             config,
                             "rsi",
                             &format!("{rsi_window}:{oversold_threshold}/{overbought_threshold}"),
@@ -649,7 +655,8 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                     skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
                         * RSI_OVERBOUGHT_THRESHOLDS.len()
                         * RSI_EXIT_PROFILES.len()
-                        * CANDLE_QUANTITY_MICRO_UNITS.len();
+                        * CANDLE_QUANTITY_MICRO_UNITS.len()
+                        * cost_profile_count;
                     continue;
                 }
 
@@ -657,7 +664,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                     for overbought_threshold in RSI_OVERBOUGHT_THRESHOLDS {
                         for exit_profile in RSI_EXIT_PROFILES {
                             for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
-                                results.push(walk_forward_strategy_result(
+                                results.extend(walk_forward_strategy_results(
                                 config,
                                 "rsi_regime",
                                 &format!(
@@ -682,12 +689,13 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
             if plan.train_window_candles < breakout_window + 1
                 || plan.test_window_candles < breakout_window + 1
             {
-                skipped_under_warmed_count += CANDLE_QUANTITY_MICRO_UNITS.len();
+                skipped_under_warmed_count +=
+                    CANDLE_QUANTITY_MICRO_UNITS.len() * cost_profile_count;
                 continue;
             }
 
             for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
-                results.push(walk_forward_strategy_result(
+                results.extend(walk_forward_strategy_results(
                     config,
                     "breakout",
                     &breakout_window.to_string(),
@@ -908,6 +916,82 @@ fn walk_forward_windows(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WalkForwardCostProfile {
+    label: &'static str,
+    fee_bps: i64,
+    slippage_bps: i64,
+}
+
+fn walk_forward_cost_profiles(config: &Config) -> Vec<WalkForwardCostProfile> {
+    if config.exchange.kind != crate::config::ExchangeKind::PaperFutures {
+        let (fee_bps, slippage_bps) = config.backtest.execution_costs(config.exchange.kind);
+        return vec![WalkForwardCostProfile {
+            label: "configured",
+            fee_bps,
+            slippage_bps,
+        }];
+    }
+
+    let base = WalkForwardCostProfile {
+        label: "base",
+        fee_bps: config.backtest.futures_fee_bps,
+        slippage_bps: config.backtest.futures_slippage_bps,
+    };
+    let stress = WalkForwardCostProfile {
+        label: "stress",
+        fee_bps: config.backtest.futures_stress_fee_bps,
+        slippage_bps: config.backtest.futures_stress_slippage_bps,
+    };
+    if base.fee_bps == stress.fee_bps && base.slippage_bps == stress.slippage_bps {
+        vec![base]
+    } else {
+        vec![base, stress]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_forward_strategy_results(
+    config: &Config,
+    strategy_kind: &str,
+    parameter_summary: &str,
+    interval_seconds: i64,
+    closes: &[Decimal],
+    plan: WalkForwardPlan,
+    fast_window: usize,
+    slow_window: usize,
+    quantity_base: Decimal,
+) -> Result<Vec<WalkForwardResult>> {
+    walk_forward_cost_profiles(config)
+        .into_iter()
+        .map(|profile| {
+            let mut scenario_config = config.clone();
+            if scenario_config.exchange.kind == crate::config::ExchangeKind::PaperFutures {
+                scenario_config.backtest.futures_fee_bps = profile.fee_bps;
+                scenario_config.backtest.futures_slippage_bps = profile.slippage_bps;
+            } else {
+                scenario_config.backtest.fee_bps = profile.fee_bps;
+                scenario_config.backtest.slippage_bps = profile.slippage_bps;
+            }
+            let mut result = walk_forward_strategy_result(
+                &scenario_config,
+                strategy_kind,
+                parameter_summary,
+                interval_seconds,
+                closes,
+                plan,
+                fast_window,
+                slow_window,
+                quantity_base,
+            )?;
+            result.cost_profile = profile.label.to_string();
+            result.assumed_fee_bps = profile.fee_bps;
+            result.assumed_slippage_bps = profile.slippage_bps;
+            Ok(result)
+        })
+        .collect()
+}
+
 fn walk_forward_strategy_result(
     config: &Config,
     strategy_kind: &str,
@@ -998,6 +1082,9 @@ fn walk_forward_strategy_result(
     Ok(WalkForwardResult {
         strategy_kind: strategy_kind.to_string(),
         parameter_summary: parameter_summary.to_string(),
+        cost_profile: "configured".to_string(),
+        assumed_fee_bps: config.backtest.execution_costs(config.exchange.kind).0,
+        assumed_slippage_bps: config.backtest.execution_costs(config.exchange.kind).1,
         interval_seconds,
         candle_count: closes.len(),
         train_window_candles: plan.train_window_candles,
@@ -2096,6 +2183,10 @@ impl Display for WalkForwardReport {
             f,
             "Candidate requires >=70% candidate windows, avg/worst test P/L > 0, avg alpha > 0, avg match > 0"
         )?;
+        writeln!(
+            f,
+            "Cost profiles show fee/slippage bps per fill; perpetual funding is not modeled"
+        )?;
         if self.results.is_empty() {
             writeln!(
                 f,
@@ -2106,7 +2197,7 @@ impl Display for WalkForwardReport {
 
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>15} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>15} {:>7}",
             "interval",
             "candles",
             "train",
@@ -2114,6 +2205,8 @@ impl Display for WalkForwardReport {
             "strategy",
             "params",
             "qty",
+            "cost",
+            "fee/slip",
             "quality",
             "cand_win",
             "prof_win",
@@ -2134,7 +2227,7 @@ impl Display for WalkForwardReport {
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>7} {:>3}/{:<4} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_window_candles,
@@ -2142,6 +2235,9 @@ impl Display for WalkForwardReport {
                 result.strategy_kind,
                 result.parameter_summary,
                 result.quantity_base,
+                result.cost_profile,
+                result.assumed_fee_bps,
+                result.assumed_slippage_bps,
                 walk_forward_quality_label(result),
                 result.candidate_window_count,
                 result.window_count,
@@ -2211,6 +2307,10 @@ mod tests {
             backtest: BacktestConfig {
                 fee_bps: 26,
                 slippage_bps: 5,
+                futures_fee_bps: 5,
+                futures_slippage_bps: 5,
+                futures_stress_fee_bps: 5,
+                futures_stress_slippage_bps: 10,
                 trade_log_csv_path: None,
             },
             exchange: ExchangeConfig::default(),
@@ -2269,6 +2369,9 @@ mod tests {
         WalkForwardResult {
             strategy_kind: "test".to_string(),
             parameter_summary: "x".to_string(),
+            cost_profile: "base".to_string(),
+            assumed_fee_bps: 5,
+            assumed_slippage_bps: 5,
             interval_seconds: 300,
             candle_count: 1000,
             train_window_candles: 300,
@@ -2303,6 +2406,9 @@ mod tests {
         different_diagnostics.average_test_gross_profit_loss_quote = decimal("999");
         different_diagnostics.average_test_fee_quote = decimal("998");
         different_diagnostics.average_test_slippage_quote = decimal("0.9");
+        different_diagnostics.cost_profile = "stress".to_string();
+        different_diagnostics.assumed_fee_bps = 99;
+        different_diagnostics.assumed_slippage_bps = 99;
         different_diagnostics.take_profit_exit_count = 999;
         different_diagnostics.stop_loss_exit_count = 999;
         different_diagnostics.max_holding_exit_count = 999;
@@ -2335,6 +2441,20 @@ mod tests {
         assert_eq!(diagnostics.stop_loss_exit_count, 1);
         assert_eq!(diagnostics.max_holding_exit_count, 1);
         assert_eq!(diagnostics.regime_exit_count, 1);
+    }
+
+    #[test]
+    fn futures_walk_forward_uses_base_and_stress_cost_profiles() {
+        let mut config = config();
+        config.exchange.kind = crate::config::ExchangeKind::PaperFutures;
+
+        let profiles = super::walk_forward_cost_profiles(&config);
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].label, "base");
+        assert_eq!((profiles[0].fee_bps, profiles[0].slippage_bps), (5, 5));
+        assert_eq!(profiles[1].label, "stress");
+        assert_eq!((profiles[1].fee_bps, profiles[1].slippage_bps), (5, 10));
     }
 
     #[test]

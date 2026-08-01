@@ -4,6 +4,14 @@ base_currency = "BTC"
 quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
+[backtest]
+fee_bps = 26
+slippage_bps = 5
+futures_fee_bps = 5
+futures_slippage_bps = 5
+futures_stress_fee_bps = 5
+futures_stress_slippage_bps = 10
+
 [exchange]
 kind = "paper_futures"
 

@@ -37,6 +37,14 @@ pub struct BacktestConfig {
     pub fee_bps: i64,
     #[serde(default = "default_backtest_slippage_bps")]
     pub slippage_bps: i64,
+    #[serde(default = "default_futures_taker_fee_bps")]
+    pub futures_fee_bps: i64,
+    #[serde(default = "default_futures_slippage_bps")]
+    pub futures_slippage_bps: i64,
+    #[serde(default = "default_futures_stress_fee_bps")]
+    pub futures_stress_fee_bps: i64,
+    #[serde(default = "default_futures_stress_slippage_bps")]
+    pub futures_stress_slippage_bps: i64,
     #[serde(default)]
     pub trade_log_csv_path: Option<String>,
 }
@@ -46,7 +54,21 @@ impl Default for BacktestConfig {
         Self {
             fee_bps: default_backtest_fee_bps(),
             slippage_bps: default_backtest_slippage_bps(),
+            futures_fee_bps: default_futures_taker_fee_bps(),
+            futures_slippage_bps: default_futures_slippage_bps(),
+            futures_stress_fee_bps: default_futures_stress_fee_bps(),
+            futures_stress_slippage_bps: default_futures_stress_slippage_bps(),
             trade_log_csv_path: None,
+        }
+    }
+}
+
+impl BacktestConfig {
+    pub fn execution_costs(&self, exchange_kind: ExchangeKind) -> (i64, i64) {
+        if exchange_kind == ExchangeKind::PaperFutures {
+            (self.futures_fee_bps, self.futures_slippage_bps)
+        } else {
+            (self.fee_bps, self.slippage_bps)
         }
     }
 }
@@ -471,6 +493,16 @@ impl Config {
             ));
         }
 
+        if self.backtest.futures_fee_bps < 0
+            || self.backtest.futures_slippage_bps < 0
+            || self.backtest.futures_stress_fee_bps < 0
+            || self.backtest.futures_stress_slippage_bps < 0
+        {
+            return Err(BotError::Config(
+                "futures backtest fees and slippage must not be negative".to_string(),
+            ));
+        }
+
         if self.exchange.kind == ExchangeKind::Kraken {
             if self.exchange.kraken.base_url.trim().is_empty() {
                 return Err(BotError::Config(
@@ -804,6 +836,22 @@ fn default_backtest_slippage_bps() -> i64 {
     5
 }
 
+fn default_futures_taker_fee_bps() -> i64 {
+    5
+}
+
+fn default_futures_slippage_bps() -> i64 {
+    5
+}
+
+fn default_futures_stress_fee_bps() -> i64 {
+    5
+}
+
+fn default_futures_stress_slippage_bps() -> i64 {
+    10
+}
+
 fn default_kraken_pair() -> String {
     "XBTUSD".to_string()
 }
@@ -910,7 +958,10 @@ fn config_path_from_args_and_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, RuntimeCommand, RuntimeOptions, config_path_from_args_and_env};
+    use super::{
+        BacktestConfig, Config, ExchangeKind, RuntimeCommand, RuntimeOptions,
+        config_path_from_args_and_env,
+    };
 
     const VALID_CONFIG: &str = r#"
 [bot]
@@ -922,6 +973,10 @@ paper_starting_quote_balance = 10000.0
 [backtest]
 fee_bps = 26
 slippage_bps = 5
+futures_fee_bps = 5
+futures_slippage_bps = 5
+futures_stress_fee_bps = 5
+futures_stress_slippage_bps = 10
 trade_log_csv_path = "data/backtest-trades.csv"
 
 [exchange]
@@ -986,6 +1041,14 @@ verbose = true
 "#;
 
     #[test]
+    fn selects_costs_by_exchange_kind() {
+        let costs = BacktestConfig::default();
+
+        assert_eq!(costs.execution_costs(ExchangeKind::Paper), (26, 5));
+        assert_eq!(costs.execution_costs(ExchangeKind::PaperFutures), (5, 5));
+    }
+
+    #[test]
     fn parses_valid_config() {
         let config = Config::from_toml_str(VALID_CONFIG).expect("config should parse");
 
@@ -995,6 +1058,10 @@ verbose = true
         assert_eq!(config.bot.paper_starting_quote_balance.to_string(), "10000");
         assert_eq!(config.backtest.fee_bps, 26);
         assert_eq!(config.backtest.slippage_bps, 5);
+        assert_eq!(config.backtest.futures_fee_bps, 5);
+        assert_eq!(config.backtest.futures_slippage_bps, 5);
+        assert_eq!(config.backtest.futures_stress_fee_bps, 5);
+        assert_eq!(config.backtest.futures_stress_slippage_bps, 10);
         assert_eq!(
             config.backtest.trade_log_csv_path.as_deref(),
             Some("data/backtest-trades.csv")

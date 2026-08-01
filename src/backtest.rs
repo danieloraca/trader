@@ -136,6 +136,7 @@ fn run_with_source(
     };
     let mut strategy = strategy::from_config(&config.strategy);
     let risk = RiskManager::new(config.risk.clone());
+    let (fee_bps, slippage_bps) = config.backtest.execution_costs(config.exchange.kind);
 
     let mut report = BacktestReport {
         symbol: config.bot.symbol.clone(),
@@ -196,8 +197,8 @@ fn run_with_source(
             match fill_order(
                 &mut portfolio,
                 &order_request,
-                config.backtest.fee_bps,
-                config.backtest.slippage_bps,
+                fee_bps,
+                slippage_bps,
                 config.exchange.paper_futures.leverage,
             ) {
                 Ok(mut trade) => {
@@ -738,6 +739,10 @@ mod tests {
             backtest: BacktestConfig {
                 fee_bps: 26,
                 slippage_bps: 5,
+                futures_fee_bps: 5,
+                futures_slippage_bps: 5,
+                futures_stress_fee_bps: 5,
+                futures_stress_slippage_bps: 10,
                 trade_log_csv_path: None,
             },
             exchange: ExchangeConfig::default(),
