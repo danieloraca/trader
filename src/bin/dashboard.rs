@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:3040";
 const DEFAULT_DB_PATH: &str = "/var/lib/trader/trader.sqlite";
+const MAX_CANDIDATE_TRAIN_LOSS_MICRO_UNITS: i64 = 10_000_000;
 
 #[derive(Debug)]
 struct Dashboard {
@@ -815,7 +816,7 @@ fn research_summary(
             "warn",
             "No candidate".to_string(),
             format!(
-                "Latest sweep {}; min fills {}",
+                "Latest sweep {}; min fills {}; needs P/L, alpha, match > 0",
                 time_fallback(Some(run.recorded_at_ms)),
                 run.min_test_fills
             ),
@@ -858,6 +859,8 @@ fn is_research_candidate(result: &StrategyResearchResultRow, min_test_fills: i64
     result.test_filled_order_count >= min_test_fills
         && result.test_pnl_micro_units > 0
         && result.test_buy_and_hold_delta_micro_units > 0
+        && result.test_capital_matched_delta_micro_units > 0
+        && result.train_pnl_micro_units >= -MAX_CANDIDATE_TRAIN_LOSS_MICRO_UNITS
 }
 
 fn render_price_chart(html: &mut String, prices: &[MarketEventRow]) {

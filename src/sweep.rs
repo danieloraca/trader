@@ -24,6 +24,8 @@ const TREND_WINDOWS: [usize; 3] = [15, 30, 60];
 const BREAKOUT_WINDOWS: [usize; 3] = [15, 30, 60];
 const TRAIN_SPLIT_BPS: usize = 7_000;
 const MIN_TEST_FILLS: usize = 3;
+const MAX_CANDIDATE_TRAIN_LOSS_QUOTE: i64 = 10;
+const MICRO_UNITS_PER_UNIT: i64 = 1_000_000;
 #[cfg(test)]
 const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
     * ((FAST_WINDOWS.len() * SLOW_WINDOWS.len() * CANDLE_QUANTITY_MICRO_UNITS.len())
@@ -405,11 +407,28 @@ fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult
     let rhs_traded = rhs.train_filled_order_count > 0 && rhs.test_filled_order_count > 0;
     let lhs_has_enough_test_fills = lhs.test_filled_order_count >= MIN_TEST_FILLS;
     let rhs_has_enough_test_fills = rhs.test_filled_order_count >= MIN_TEST_FILLS;
+    let lhs_profitable = lhs.test_profit_loss_quote > Decimal::ZERO;
+    let rhs_profitable = rhs.test_profit_loss_quote > Decimal::ZERO;
+    let lhs_has_alpha = lhs.test_buy_and_hold_delta_quote > Decimal::ZERO;
+    let rhs_has_alpha = rhs.test_buy_and_hold_delta_quote > Decimal::ZERO;
+    let lhs_has_matched_alpha = lhs.test_capital_matched_delta_quote > Decimal::ZERO;
+    let rhs_has_matched_alpha = rhs.test_capital_matched_delta_quote > Decimal::ZERO;
+    let lhs_train_loss_ok = train_loss_is_acceptable(lhs);
+    let rhs_train_loss_ok = train_loss_is_acceptable(rhs);
 
     rhs_is_candidate
         .cmp(&lhs_is_candidate)
         .then_with(|| rhs_has_enough_test_fills.cmp(&lhs_has_enough_test_fills))
+        .then_with(|| rhs_profitable.cmp(&lhs_profitable))
+        .then_with(|| rhs_has_alpha.cmp(&lhs_has_alpha))
+        .then_with(|| rhs_has_matched_alpha.cmp(&lhs_has_matched_alpha))
+        .then_with(|| rhs_train_loss_ok.cmp(&lhs_train_loss_ok))
         .then_with(|| rhs_traded.cmp(&lhs_traded))
+        .then_with(|| rhs.test_profit_loss_quote.cmp(&lhs.test_profit_loss_quote))
+        .then_with(|| {
+            rhs.test_capital_matched_delta_quote
+                .cmp(&lhs.test_capital_matched_delta_quote)
+        })
         .then_with(|| {
             rhs.test_buy_and_hold_delta_quote
                 .cmp(&lhs.test_buy_and_hold_delta_quote)
@@ -418,7 +437,6 @@ fn compare_candle_sweep_results(lhs: &CandleSweepResult, rhs: &CandleSweepResult
             rhs.train_buy_and_hold_delta_quote
                 .cmp(&lhs.train_buy_and_hold_delta_quote)
         })
-        .then_with(|| rhs.test_profit_loss_quote.cmp(&lhs.test_profit_loss_quote))
         .then_with(|| {
             rhs.train_profit_loss_quote
                 .cmp(&lhs.train_profit_loss_quote)
@@ -437,6 +455,13 @@ fn is_candidate(result: &CandleSweepResult) -> bool {
     result.test_filled_order_count >= MIN_TEST_FILLS
         && result.test_profit_loss_quote > Decimal::ZERO
         && result.test_buy_and_hold_delta_quote > Decimal::ZERO
+        && result.test_capital_matched_delta_quote > Decimal::ZERO
+        && train_loss_is_acceptable(result)
+}
+
+fn train_loss_is_acceptable(result: &CandleSweepResult) -> bool {
+    result.train_profit_loss_quote
+        >= Decimal::from_micro_units(-MAX_CANDIDATE_TRAIN_LOSS_QUOTE * MICRO_UNITS_PER_UNIT)
 }
 
 fn quality_label(result: &CandleSweepResult) -> &'static str {
@@ -1266,6 +1291,10 @@ impl Display for CandleSweepReport {
             self.skipped_under_warmed_count
         )?;
         writeln!(f, "Minimum test fills for ranking: {MIN_TEST_FILLS}")?;
+        writeln!(
+            f,
+            "Candidate requires test P/L > 0, test alpha > 0, test match > 0, and train P/L >= -{MAX_CANDIDATE_TRAIN_LOSS_QUOTE}"
+        )?;
         if self.results.is_empty() {
             writeln!(
                 f,
@@ -1331,7 +1360,7 @@ impl Display for CandleSweepReport {
 mod tests {
     use super::{
         BaselinePlan, CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
-        capital_matched_buy_hold_profit_loss, compare_candle_sweep_results, run,
+        capital_matched_buy_hold_profit_loss, compare_candle_sweep_results, is_candidate, run,
         run_baseline_from_prices, run_candles,
     };
     use crate::config::{
@@ -1478,7 +1507,15 @@ mod tests {
         let candidate = candle_result("1", "1", MIN_TEST_FILLS);
         let no_profit = candle_result("-1", "10", MIN_TEST_FILLS);
         let no_alpha = candle_result("10", "-1", MIN_TEST_FILLS);
+        let mut no_match = candle_result("10", "10", MIN_TEST_FILLS);
+        no_match.test_capital_matched_delta_quote = decimal("-1");
+        let mut bad_train = candle_result("10", "10", MIN_TEST_FILLS);
+        bad_train.train_profit_loss_quote = decimal("-10.000001");
         let thin = candle_result("10", "10", MIN_TEST_FILLS - 1);
+
+        assert!(is_candidate(&candidate));
+        assert!(!is_candidate(&no_match));
+        assert!(!is_candidate(&bad_train));
 
         assert_eq!(
             compare_candle_sweep_results(&candidate, &no_profit),
@@ -1489,7 +1526,26 @@ mod tests {
             std::cmp::Ordering::Less
         );
         assert_eq!(
+            compare_candle_sweep_results(&candidate, &no_match),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_candle_sweep_results(&candidate, &bad_train),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
             compare_candle_sweep_results(&candidate, &thin),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn ranks_profitable_non_candidates_before_unprofitable_defensive_rows() {
+        let profitable_without_alpha = candle_result("1", "-10", MIN_TEST_FILLS);
+        let unprofitable_with_alpha = candle_result("-1", "10", MIN_TEST_FILLS);
+
+        assert_eq!(
+            compare_candle_sweep_results(&profitable_without_alpha, &unprofitable_with_alpha),
             std::cmp::Ordering::Less
         );
     }
