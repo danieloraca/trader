@@ -224,6 +224,8 @@ pub struct StrategyConfig {
     #[serde(default)]
     pub rsi_mean_reversion: RsiMeanReversionConfig,
     #[serde(default)]
+    pub managed_rsi: ManagedRsiConfig,
+    #[serde(default)]
     pub rsi_regime: RsiRegimeConfig,
     #[serde(default)]
     pub breakout: BreakoutConfig,
@@ -236,6 +238,7 @@ impl Default for StrategyConfig {
             simple_momentum: SimpleMomentumConfig::default(),
             moving_average_crossover: MovingAverageCrossoverConfig::default(),
             rsi_mean_reversion: RsiMeanReversionConfig::default(),
+            managed_rsi: ManagedRsiConfig::default(),
             rsi_regime: RsiRegimeConfig::default(),
             breakout: BreakoutConfig::default(),
         }
@@ -248,6 +251,7 @@ pub enum StrategyKind {
     SimpleMomentum,
     MovingAverageCrossover,
     RsiMeanReversion,
+    ManagedRsi,
     RsiRegime,
     Breakout,
 }
@@ -294,6 +298,28 @@ pub struct RsiMeanReversionConfig {
     pub overbought_threshold: u8,
     #[serde(default = "default_rsi_quantity_base")]
     pub quantity_base: Decimal,
+    #[serde(default)]
+    pub direction: StrategyDirection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagedRsiConfig {
+    #[serde(default = "default_rsi_window")]
+    pub window: usize,
+    #[serde(default = "default_rsi_oversold_threshold")]
+    pub oversold_threshold: u8,
+    #[serde(default = "default_rsi_overbought_threshold")]
+    pub overbought_threshold: u8,
+    #[serde(default = "default_rsi_quantity_base")]
+    pub quantity_base: Decimal,
+    #[serde(default = "default_rsi_regime_take_profit_bps")]
+    pub take_profit_bps: i64,
+    #[serde(default = "default_rsi_regime_stop_loss_bps")]
+    pub stop_loss_bps: i64,
+    #[serde(default = "default_rsi_regime_max_holding_events")]
+    pub max_holding_events: usize,
+    #[serde(default = "default_managed_rsi_cooldown_events")]
+    pub cooldown_events: usize,
     #[serde(default)]
     pub direction: StrategyDirection,
 }
@@ -353,6 +379,22 @@ impl Default for RsiMeanReversionConfig {
             oversold_threshold: default_rsi_oversold_threshold(),
             overbought_threshold: default_rsi_overbought_threshold(),
             quantity_base: default_rsi_quantity_base(),
+            direction: StrategyDirection::default(),
+        }
+    }
+}
+
+impl Default for ManagedRsiConfig {
+    fn default() -> Self {
+        Self {
+            window: default_rsi_window(),
+            oversold_threshold: default_rsi_oversold_threshold(),
+            overbought_threshold: default_rsi_overbought_threshold(),
+            quantity_base: default_rsi_quantity_base(),
+            take_profit_bps: default_rsi_regime_take_profit_bps(),
+            stop_loss_bps: default_rsi_regime_stop_loss_bps(),
+            max_holding_events: default_rsi_regime_max_holding_events(),
+            cooldown_events: default_managed_rsi_cooldown_events(),
             direction: StrategyDirection::default(),
         }
     }
@@ -682,6 +724,54 @@ impl Config {
             ));
         }
 
+        if self.strategy.managed_rsi.window == 0 {
+            return Err(BotError::Config(
+                "managed RSI window must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.managed_rsi.oversold_threshold == 0
+            || self.strategy.managed_rsi.overbought_threshold >= 100
+            || self.strategy.managed_rsi.oversold_threshold
+                >= self.strategy.managed_rsi.overbought_threshold
+        {
+            return Err(BotError::Config(
+                "managed RSI thresholds must satisfy 0 < oversold < overbought < 100".to_string(),
+            ));
+        }
+
+        if self.strategy.managed_rsi.quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "managed RSI quantity must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.managed_rsi.take_profit_bps <= 0 {
+            return Err(BotError::Config(
+                "managed RSI take-profit bps must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.managed_rsi.stop_loss_bps <= 0 {
+            return Err(BotError::Config(
+                "managed RSI stop-loss bps must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.managed_rsi.max_holding_events == 0 {
+            return Err(BotError::Config(
+                "managed RSI maximum holding events must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.kind == StrategyKind::ManagedRsi
+            && self.exchange.kind != ExchangeKind::PaperFutures
+        {
+            return Err(BotError::Config(
+                "managed RSI requires the paper_futures exchange".to_string(),
+            ));
+        }
+
         if self.strategy.rsi_regime.window == 0 {
             return Err(BotError::Config(
                 "regime RSI window must be positive".to_string(),
@@ -936,6 +1026,10 @@ fn default_rsi_regime_max_holding_events() -> usize {
     24
 }
 
+fn default_managed_rsi_cooldown_events() -> usize {
+    1
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1122,6 +1216,10 @@ verbose = true
             config.strategy.rsi_mean_reversion.quantity_base.to_string(),
             "0.001"
         );
+        assert_eq!(config.strategy.managed_rsi.window, 14);
+        assert_eq!(config.strategy.managed_rsi.cooldown_events, 1);
+        assert_eq!(config.strategy.managed_rsi.take_profit_bps, 200);
+        assert_eq!(config.strategy.managed_rsi.stop_loss_bps, 100);
         assert_eq!(config.strategy.breakout.window, 20);
         assert_eq!(config.strategy.breakout.quantity_base.to_string(), "0.001");
         assert_eq!(
@@ -1208,6 +1306,20 @@ verbose = true
             error
                 .to_string()
                 .contains("market data idle sleep must be positive")
+        );
+    }
+
+    #[test]
+    fn rejects_managed_rsi_with_spot_exchange() {
+        let invalid_config =
+            VALID_CONFIG.replace("kind = \"simple_momentum\"", "kind = \"managed_rsi\"");
+
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed RSI requires the paper_futures exchange")
         );
     }
 

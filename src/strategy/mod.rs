@@ -1,10 +1,12 @@
 mod breakout;
+mod managed_rsi;
 mod moving_average;
 mod rsi;
 mod rsi_regime;
 mod simple;
 
 pub use breakout::BreakoutStrategy;
+pub use managed_rsi::ManagedRsiStrategy;
 pub use moving_average::MovingAverageCrossoverStrategy;
 pub use rsi::RsiMeanReversionStrategy;
 pub use rsi_regime::RsiRegimeStrategy;
@@ -57,6 +59,7 @@ pub fn from_config(config: &StrategyConfig) -> Box<dyn Strategy> {
         StrategyKind::RsiMeanReversion => Box::new(RsiMeanReversionStrategy::new(
             config.rsi_mean_reversion.clone(),
         )),
+        StrategyKind::ManagedRsi => Box::new(ManagedRsiStrategy::new(config.managed_rsi.clone())),
         StrategyKind::RsiRegime => Box::new(RsiRegimeStrategy::new(config.rsi_regime.clone())),
         StrategyKind::Breakout => Box::new(BreakoutStrategy::new(config.breakout.clone())),
     }

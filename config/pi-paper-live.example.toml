@@ -56,6 +56,17 @@ overbought_threshold = 70
 quantity_base = 0.001
 direction = "long_only"
 
+[strategy.managed_rsi]
+window = 21
+oversold_threshold = 30
+overbought_threshold = 65
+quantity_base = 0.0005
+take_profit_bps = 200
+stop_loss_bps = 100
+max_holding_events = 24
+cooldown_events = 1
+direction = "long_only"
+
 [strategy.rsi_regime]
 window = 21
 oversold_threshold = 25
