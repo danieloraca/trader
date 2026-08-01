@@ -321,6 +321,8 @@ pub struct ManagedRsiConfig {
     #[serde(default = "default_managed_rsi_cooldown_events")]
     pub cooldown_events: usize,
     #[serde(default)]
+    pub exit_on_opposite_signal: bool,
+    #[serde(default)]
     pub direction: StrategyDirection,
 }
 
@@ -395,6 +397,7 @@ impl Default for ManagedRsiConfig {
             stop_loss_bps: default_rsi_regime_stop_loss_bps(),
             max_holding_events: default_rsi_regime_max_holding_events(),
             cooldown_events: default_managed_rsi_cooldown_events(),
+            exit_on_opposite_signal: false,
             direction: StrategyDirection::default(),
         }
     }
@@ -1220,6 +1223,7 @@ verbose = true
         assert_eq!(config.strategy.managed_rsi.cooldown_events, 1);
         assert_eq!(config.strategy.managed_rsi.take_profit_bps, 200);
         assert_eq!(config.strategy.managed_rsi.stop_loss_bps, 100);
+        assert!(!config.strategy.managed_rsi.exit_on_opposite_signal);
         assert_eq!(config.strategy.breakout.window, 20);
         assert_eq!(config.strategy.breakout.quantity_base.to_string(), "0.001");
         assert_eq!(

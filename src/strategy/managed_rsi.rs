@@ -61,6 +61,13 @@ impl ManagedRsiStrategy {
             RsiZone::Neutral
         };
 
+        if let Some(portfolio) = futures_portfolio {
+            if let Some(signal) = self.opposite_signal_exit(event, portfolio, zone, rsi) {
+                self.previous_zone = zone;
+                return vec![signal];
+            }
+        }
+
         let can_enter = match futures_portfolio {
             Some(portfolio) if portfolio.futures_position_side != FuturesPositionSide::Flat => {
                 false
@@ -161,6 +168,31 @@ impl ManagedRsiStrategy {
 
         Some(close_signal(event, portfolio, reason))
     }
+
+    fn opposite_signal_exit(
+        &self,
+        event: &MarketEvent,
+        portfolio: &Portfolio,
+        zone: RsiZone,
+        rsi: f64,
+    ) -> Option<Signal> {
+        if !self.config.exit_on_opposite_signal {
+            return None;
+        }
+
+        let opposite_transition = match portfolio.futures_position_side {
+            FuturesPositionSide::Long => {
+                zone == RsiZone::Overbought && self.previous_zone != RsiZone::Overbought
+            }
+            FuturesPositionSide::Short => {
+                zone == RsiZone::Oversold && self.previous_zone != RsiZone::Oversold
+            }
+            FuturesPositionSide::Flat => false,
+        };
+
+        opposite_transition
+            .then(|| close_signal(event, portfolio, format!("opposite RSI exit at {rsi:.2}")))
+    }
 }
 
 impl Strategy for ManagedRsiStrategy {
@@ -245,6 +277,7 @@ mod tests {
             stop_loss_bps: 100,
             max_holding_events: 24,
             cooldown_events: 2,
+            exit_on_opposite_signal: false,
             direction: StrategyDirection::LongShort,
         })
     }
@@ -376,5 +409,64 @@ mod tests {
         assert_eq!(strategy.cooldown_remaining, 1);
         strategy.on_market_event_with_portfolio(&tick("101"), &flat);
         assert_eq!(strategy.cooldown_remaining, 0);
+    }
+
+    #[test]
+    fn closes_long_on_overbought_transition_when_enabled() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        strategy.config.exit_on_opposite_signal = true;
+        let long = position(FuturesPositionSide::Long, "100");
+        for price in ["100", "101", "102"] {
+            assert!(
+                strategy
+                    .on_market_event_with_portfolio(&tick(price), &long)
+                    .is_empty()
+            );
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &long);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseLong);
+        assert!(signals[0].reason.starts_with("opposite RSI exit"));
+    }
+
+    #[test]
+    fn keeps_position_open_on_opposite_transition_when_disabled() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        let long = position(FuturesPositionSide::Long, "100");
+        for price in ["100", "101", "102"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &long);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &long);
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn closes_short_on_oversold_transition_when_enabled() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        strategy.config.exit_on_opposite_signal = true;
+        let short = position(FuturesPositionSide::Short, "100");
+        for price in ["100", "99", "98"] {
+            assert!(
+                strategy
+                    .on_market_event_with_portfolio(&tick(price), &short)
+                    .is_empty()
+            );
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("97"), &short);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseShort);
+        assert!(signals[0].reason.starts_with("opposite RSI exit"));
     }
 }

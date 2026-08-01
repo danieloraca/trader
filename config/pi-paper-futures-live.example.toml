@@ -73,6 +73,7 @@ take_profit_bps = 200
 stop_loss_bps = 100
 max_holding_events = 24
 cooldown_events = 1
+exit_on_opposite_signal = false
 direction = "long_short"
 
 [strategy.rsi_regime]
