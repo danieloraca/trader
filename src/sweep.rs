@@ -141,6 +141,9 @@ pub struct WalkForwardResult {
     pub profitable_window_count: usize,
     pub total_test_profit_loss_quote: Decimal,
     pub average_test_profit_loss_quote: Decimal,
+    pub average_test_gross_profit_loss_quote: Decimal,
+    pub average_test_fee_quote: Decimal,
+    pub average_test_slippage_quote: Decimal,
     pub worst_test_profit_loss_quote: Decimal,
     pub average_test_alpha_quote: Decimal,
     pub average_test_match_quote: Decimal,
@@ -148,6 +151,62 @@ pub struct WalkForwardResult {
     pub total_test_filled_order_count: usize,
     pub total_test_buy_count: usize,
     pub total_test_sell_count: usize,
+    pub take_profit_exit_count: usize,
+    pub stop_loss_exit_count: usize,
+    pub max_holding_exit_count: usize,
+    pub regime_exit_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WalkForwardWindowDiagnostics {
+    gross_profit_loss_quote: Decimal,
+    fees_quote: Decimal,
+    slippage_quote: Decimal,
+    take_profit_exit_count: usize,
+    stop_loss_exit_count: usize,
+    max_holding_exit_count: usize,
+    regime_exit_count: usize,
+}
+
+impl WalkForwardWindowDiagnostics {
+    fn from_report(report: &BacktestReport) -> Self {
+        let mut diagnostics = Self {
+            gross_profit_loss_quote: gross_profit_loss_quote(
+                report.profit_loss_quote,
+                report.total_fees_quote,
+                report.total_slippage_quote,
+            ),
+            fees_quote: report.total_fees_quote,
+            slippage_quote: report.total_slippage_quote,
+            ..Self::default()
+        };
+
+        for trade in &report.trades {
+            diagnostics.record_exit_reason(&trade.reason);
+        }
+
+        diagnostics
+    }
+
+    fn record_exit_reason(&mut self, reason: &str) {
+        if reason.starts_with("take profit at") {
+            self.take_profit_exit_count += 1;
+        } else if reason.starts_with("stop loss at") {
+            self.stop_loss_exit_count += 1;
+        } else if reason.starts_with("maximum holding period") {
+            self.max_holding_exit_count += 1;
+        } else if reason.contains("regime invalidated") {
+            self.regime_exit_count += 1;
+        }
+    }
+}
+
+fn gross_profit_loss_quote(
+    net_profit_loss_quote: Decimal,
+    fees_quote: Decimal,
+    slippage_quote: Decimal,
+) -> Decimal {
+    net_profit_loss_quote + fees_quote + slippage_quote
 }
 
 pub fn run(config: &Config, sqlite_path: &str) -> Result<SweepReport> {
@@ -863,6 +922,9 @@ fn walk_forward_strategy_result(
     let mut candidate_window_count = 0_usize;
     let mut profitable_window_count = 0_usize;
     let mut total_test_profit_loss_quote = Decimal::ZERO;
+    let mut total_test_gross_profit_loss_quote = Decimal::ZERO;
+    let mut total_test_fees_quote = Decimal::ZERO;
+    let mut total_test_slippage_quote = Decimal::ZERO;
     let mut total_test_alpha_quote = Decimal::ZERO;
     let mut total_test_match_quote = Decimal::ZERO;
     let mut worst_test_profit_loss_quote: Option<Decimal> = None;
@@ -870,12 +932,16 @@ fn walk_forward_strategy_result(
     let mut total_test_filled_order_count = 0_usize;
     let mut total_test_buy_count = 0_usize;
     let mut total_test_sell_count = 0_usize;
+    let mut take_profit_exit_count = 0_usize;
+    let mut stop_loss_exit_count = 0_usize;
+    let mut max_holding_exit_count = 0_usize;
+    let mut regime_exit_count = 0_usize;
     let mut window_count = 0_usize;
 
     for (train_start, train_end, test_end) in walk_forward_windows(closes.len(), plan) {
         let train_closes = closes[train_start..train_end].to_vec();
         let test_closes = closes[train_end..test_end].to_vec();
-        let result = strategy_candle_result(
+        let (result, diagnostics) = strategy_candle_result(
             config,
             strategy_kind,
             parameter_summary,
@@ -896,6 +962,9 @@ fn walk_forward_strategy_result(
         }
 
         total_test_profit_loss_quote += result.test_profit_loss_quote;
+        total_test_gross_profit_loss_quote += diagnostics.gross_profit_loss_quote;
+        total_test_fees_quote += diagnostics.fees_quote;
+        total_test_slippage_quote += diagnostics.slippage_quote;
         total_test_alpha_quote += result.test_buy_and_hold_delta_quote;
         total_test_match_quote += result.test_capital_matched_delta_quote;
         worst_test_profit_loss_quote = Some(
@@ -909,15 +978,22 @@ fn walk_forward_strategy_result(
         total_test_filled_order_count += result.test_filled_order_count;
         total_test_buy_count += result.test_buy_count;
         total_test_sell_count += result.test_sell_count;
+        take_profit_exit_count += diagnostics.take_profit_exit_count;
+        stop_loss_exit_count += diagnostics.stop_loss_exit_count;
+        max_holding_exit_count += diagnostics.max_holding_exit_count;
+        regime_exit_count += diagnostics.regime_exit_count;
         window_count += 1;
     }
 
-    let average_test_profit_loss_quote = total_test_profit_loss_quote
-        / Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
-    let average_test_alpha_quote = total_test_alpha_quote
-        / Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
-    let average_test_match_quote = total_test_match_quote
-        / Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
+    let window_count_decimal =
+        Decimal::from_micro_units(window_count as i64 * MICRO_UNITS_PER_UNIT);
+    let average_test_profit_loss_quote = total_test_profit_loss_quote / window_count_decimal;
+    let average_test_gross_profit_loss_quote =
+        total_test_gross_profit_loss_quote / window_count_decimal;
+    let average_test_fee_quote = total_test_fees_quote / window_count_decimal;
+    let average_test_slippage_quote = total_test_slippage_quote / window_count_decimal;
+    let average_test_alpha_quote = total_test_alpha_quote / window_count_decimal;
+    let average_test_match_quote = total_test_match_quote / window_count_decimal;
 
     Ok(WalkForwardResult {
         strategy_kind: strategy_kind.to_string(),
@@ -932,6 +1008,9 @@ fn walk_forward_strategy_result(
         profitable_window_count,
         total_test_profit_loss_quote,
         average_test_profit_loss_quote,
+        average_test_gross_profit_loss_quote,
+        average_test_fee_quote,
+        average_test_slippage_quote,
         worst_test_profit_loss_quote: worst_test_profit_loss_quote.unwrap_or(Decimal::ZERO),
         average_test_alpha_quote,
         average_test_match_quote,
@@ -939,6 +1018,10 @@ fn walk_forward_strategy_result(
         total_test_filled_order_count,
         total_test_buy_count,
         total_test_sell_count,
+        take_profit_exit_count,
+        stop_loss_exit_count,
+        max_holding_exit_count,
+        regime_exit_count,
     })
 }
 
@@ -953,7 +1036,7 @@ fn strategy_candle_result(
     fast_window: usize,
     slow_window: usize,
     quantity_base: Decimal,
-) -> Result<CandleSweepResult> {
+) -> Result<(CandleSweepResult, WalkForwardWindowDiagnostics)> {
     let mut candidate = config.clone();
     candidate.backtest.trade_log_csv_path = None;
 
@@ -1005,7 +1088,8 @@ fn strategy_candle_result(
 
     let train_report = backtest::run_from_prices(&candidate, train_closes.to_vec())?;
     let test_report = backtest::run_from_prices(&candidate, test_closes.to_vec())?;
-    Ok(CandleSweepResult::from_report(
+    let diagnostics = WalkForwardWindowDiagnostics::from_report(&test_report);
+    let result = CandleSweepResult::from_report(
         strategy_kind,
         parameter_summary,
         interval_seconds,
@@ -1021,7 +1105,8 @@ fn strategy_candle_result(
             .last()
             .expect("train closes should not be empty"),
         *test_closes.last().expect("test closes should not be empty"),
-    ))
+    );
+    Ok((result, diagnostics))
 }
 
 fn parse_rsi_parameter_summary(parameter_summary: &str) -> Result<(usize, u8, u8)> {
@@ -2021,7 +2106,7 @@ impl Display for WalkForwardReport {
 
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>15} {:>7}",
             "interval",
             "candles",
             "train",
@@ -2034,18 +2119,22 @@ impl Display for WalkForwardReport {
             "prof_win",
             "avg_pnl",
             "worst_pnl",
+            "avg_gross",
+            "avg_fee",
+            "avg_slip",
             "avg_alpha",
             "avg_match",
             "total_pnl",
             "worst_dd",
             "fills",
+            "exits tp/sl/t/r",
             "b/s"
         )?;
 
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>8} {:>12} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_window_candles,
@@ -2060,11 +2149,18 @@ impl Display for WalkForwardReport {
                 result.window_count,
                 result.average_test_profit_loss_quote,
                 result.worst_test_profit_loss_quote,
+                result.average_test_gross_profit_loss_quote,
+                result.average_test_fee_quote,
+                result.average_test_slippage_quote,
                 result.average_test_alpha_quote,
                 result.average_test_match_quote,
                 result.total_test_profit_loss_quote,
                 result.worst_test_drawdown_pct,
                 result.total_test_filled_order_count,
+                result.take_profit_exit_count,
+                result.stop_loss_exit_count,
+                result.max_holding_exit_count,
+                result.regime_exit_count,
                 result.total_test_buy_count,
                 result.total_test_sell_count,
             )?;
@@ -2078,8 +2174,9 @@ impl Display for WalkForwardReport {
 mod tests {
     use super::{
         BaselinePlan, CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
-        capital_matched_buy_hold_profit_loss, compare_candle_sweep_results, is_candidate, run,
-        run_baseline_from_prices, run_candles,
+        WalkForwardResult, WalkForwardWindowDiagnostics, capital_matched_buy_hold_profit_loss,
+        compare_candle_sweep_results, compare_walk_forward_results, gross_profit_loss_quote,
+        is_candidate, run, run_baseline_from_prices, run_candles,
     };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
@@ -2166,6 +2263,78 @@ mod tests {
             test_exposure_pct: 10.0,
             test_final_base_balance: Decimal::ZERO,
         }
+    }
+
+    fn walk_forward_result() -> WalkForwardResult {
+        WalkForwardResult {
+            strategy_kind: "test".to_string(),
+            parameter_summary: "x".to_string(),
+            interval_seconds: 300,
+            candle_count: 1000,
+            train_window_candles: 300,
+            test_window_candles: 100,
+            quantity_base: decimal("0.0005"),
+            window_count: 7,
+            candidate_window_count: 1,
+            profitable_window_count: 2,
+            total_test_profit_loss_quote: decimal("1"),
+            average_test_profit_loss_quote: decimal("0.1"),
+            average_test_gross_profit_loss_quote: decimal("0.2"),
+            average_test_fee_quote: decimal("0.08"),
+            average_test_slippage_quote: decimal("0.02"),
+            worst_test_profit_loss_quote: decimal("-0.1"),
+            average_test_alpha_quote: decimal("1"),
+            average_test_match_quote: decimal("0.1"),
+            worst_test_drawdown_pct: 0.01,
+            total_test_filled_order_count: 21,
+            total_test_buy_count: 11,
+            total_test_sell_count: 10,
+            take_profit_exit_count: 2,
+            stop_loss_exit_count: 1,
+            max_holding_exit_count: 3,
+            regime_exit_count: 4,
+        }
+    }
+
+    #[test]
+    fn cost_diagnostics_do_not_change_walk_forward_ranking() {
+        let baseline = walk_forward_result();
+        let mut different_diagnostics = baseline.clone();
+        different_diagnostics.average_test_gross_profit_loss_quote = decimal("999");
+        different_diagnostics.average_test_fee_quote = decimal("998");
+        different_diagnostics.average_test_slippage_quote = decimal("0.9");
+        different_diagnostics.take_profit_exit_count = 999;
+        different_diagnostics.stop_loss_exit_count = 999;
+        different_diagnostics.max_holding_exit_count = 999;
+        different_diagnostics.regime_exit_count = 999;
+
+        assert_eq!(
+            compare_walk_forward_results(&baseline, &different_diagnostics),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn gross_profit_loss_adds_back_fees_and_slippage() {
+        assert_eq!(
+            gross_profit_loss_quote(decimal("-1.78"), decimal("1.75"), decimal("0.35")),
+            decimal("0.32")
+        );
+    }
+
+    #[test]
+    fn classifies_managed_exit_reasons() {
+        let mut diagnostics = WalkForwardWindowDiagnostics::default();
+        diagnostics.record_exit_reason("take profit at 210.00 bps (target 200)");
+        diagnostics.record_exit_reason("stop loss at -110.00 bps (limit -100)");
+        diagnostics.record_exit_reason("maximum holding period reached at 24 events");
+        diagnostics.record_exit_reason("120-tick regime invalidated at MA 64000");
+        diagnostics.record_exit_reason("RSI entry");
+
+        assert_eq!(diagnostics.take_profit_exit_count, 1);
+        assert_eq!(diagnostics.stop_loss_exit_count, 1);
+        assert_eq!(diagnostics.max_holding_exit_count, 1);
+        assert_eq!(diagnostics.regime_exit_count, 1);
     }
 
     #[test]
