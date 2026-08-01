@@ -1,6 +1,6 @@
 use crate::backtest::{self, BacktestReport, TradeRecord};
 use crate::candles;
-use crate::config::{Config, ExchangeKind, StrategyKind};
+use crate::config::{Config, ExchangeKind, StrategyDirection, StrategyKind};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use crate::orders::Side;
@@ -19,6 +19,10 @@ const RSI_WINDOWS: [usize; 3] = [7, 14, 21];
 const RSI_OVERSOLD_THRESHOLDS: [u8; 3] = [25, 30, 35];
 const RSI_OVERBOUGHT_THRESHOLDS: [u8; 3] = [65, 70, 75];
 const CAPPED_RSI_TRANCHE_CAPS: [usize; 3] = [4, 8, 16];
+const RSI_DIRECTIONAL_VARIANTS: [(&str, StrategyDirection); 2] = [
+    ("rsi_long", StrategyDirection::LongOnly),
+    ("rsi_short", StrategyDirection::ShortOnly),
+];
 const RSI_REGIME_WINDOWS: [usize; 2] = [60, 120];
 const RSI_EXIT_PROFILES: [RsiExitProfile; 3] = [
     RsiExitProfile::new("tight", 100, 60, 12),
@@ -51,6 +55,11 @@ const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
             * RSI_OVERSOLD_THRESHOLDS.len()
             * RSI_OVERBOUGHT_THRESHOLDS.len()
             * CAPPED_RSI_TRANCHE_CAPS.len()
+            * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (RSI_WINDOWS.len()
+            * RSI_OVERSOLD_THRESHOLDS.len()
+            * RSI_OVERBOUGHT_THRESHOLDS.len()
+            * RSI_DIRECTIONAL_VARIANTS.len()
             * CANDLE_QUANTITY_MICRO_UNITS.len())
         + (RSI_WINDOWS.len()
             * RSI_OVERSOLD_THRESHOLDS.len()
@@ -171,6 +180,7 @@ pub struct WalkForwardResult {
     pub average_test_alpha_quote: Decimal,
     pub average_test_match_quote: Decimal,
     pub worst_test_drawdown_pct: f64,
+    pub peak_test_position_base: Decimal,
     pub total_test_filled_order_count: usize,
     pub total_test_buy_count: usize,
     pub total_test_sell_count: usize,
@@ -179,6 +189,27 @@ pub struct WalkForwardResult {
     pub max_holding_exit_count: usize,
     pub opposite_signal_exit_count: usize,
     pub regime_exit_count: usize,
+    pub windows: Vec<WalkForwardWindowResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalkForwardWindowResult {
+    pub index: usize,
+    pub test_start_ms: i64,
+    pub test_end_ms: i64,
+    pub candidate: bool,
+    pub profit_loss_quote: Decimal,
+    pub gross_profit_loss_quote: Decimal,
+    pub fees_quote: Decimal,
+    pub slippage_quote: Decimal,
+    pub buy_and_hold_profit_loss_quote: Decimal,
+    pub alpha_quote: Decimal,
+    pub match_quote: Decimal,
+    pub max_drawdown_pct: f64,
+    pub filled_order_count: usize,
+    pub buy_count: usize,
+    pub sell_count: usize,
+    pub peak_position_base: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -186,6 +217,7 @@ struct WalkForwardWindowDiagnostics {
     gross_profit_loss_quote: Decimal,
     fees_quote: Decimal,
     slippage_quote: Decimal,
+    peak_futures_position_base: Decimal,
     take_profit_exit_count: usize,
     stop_loss_exit_count: usize,
     max_holding_exit_count: usize,
@@ -203,6 +235,7 @@ impl WalkForwardWindowDiagnostics {
             ),
             fees_quote: report.total_fees_quote,
             slippage_quote: report.total_slippage_quote,
+            peak_futures_position_base: report.peak_futures_position_base,
             ..Self::default()
         };
 
@@ -344,7 +377,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                 if config.exchange.kind == ExchangeKind::PaperFutures {
                     skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
                         * RSI_OVERBOUGHT_THRESHOLDS.len()
-                        * CAPPED_RSI_TRANCHE_CAPS.len()
+                        * (CAPPED_RSI_TRANCHE_CAPS.len() + rsi_directional_variant_count(config))
                         * CANDLE_QUANTITY_MICRO_UNITS.len();
                 }
                 continue;
@@ -424,6 +457,44 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                                     *test_closes
                                         .last()
                                         .expect("test closes should not be empty"),
+                                ));
+                            }
+
+                            for (strategy_kind, direction) in RSI_DIRECTIONAL_VARIANTS {
+                                if direction == StrategyDirection::ShortOnly
+                                    && !short_research_enabled(config)
+                                {
+                                    continue;
+                                }
+                                let mut directional_candidate = candidate.clone();
+                                directional_candidate.strategy.rsi_mean_reversion.direction =
+                                    direction;
+                                let directional_train_report = backtest::run_from_prices(
+                                    &directional_candidate,
+                                    train_closes.clone(),
+                                )?;
+                                let directional_test_report = backtest::run_from_prices(
+                                    &directional_candidate,
+                                    test_closes.clone(),
+                                )?;
+                                results.push(CandleSweepResult::from_report(
+                                    strategy_kind,
+                                    &format!(
+                                        "{rsi_window}:{oversold_threshold}/{overbought_threshold}"
+                                    ),
+                                    interval_seconds,
+                                    candles.len(),
+                                    train_closes.len(),
+                                    test_closes.len(),
+                                    rsi_window,
+                                    0,
+                                    Decimal::from_micro_units(quantity_micro_units),
+                                    &directional_train_report,
+                                    &directional_test_report,
+                                    *train_closes
+                                        .last()
+                                        .expect("train closes should not be empty"),
+                                    *test_closes.last().expect("test closes should not be empty"),
                                 ));
                             }
                         }
@@ -734,6 +805,10 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
             .iter()
             .map(|candle| candle.close)
             .collect::<Vec<_>>();
+        let candle_start_ms = candles
+            .iter()
+            .map(|candle| candle.start_ms)
+            .collect::<Vec<_>>();
         let Some(plan) = walk_forward_plan(candle_closes.len()) else {
             skipped_under_warmed_count += walk_forward_strategy_count(config) * cost_profile_count;
             continue;
@@ -760,6 +835,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                         &format!("{fast_window}/{slow_window}"),
                         interval_seconds,
                         &candle_closes,
+                        &candle_start_ms,
                         plan,
                         fast_window,
                         slow_window,
@@ -780,7 +856,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                 if config.exchange.kind == ExchangeKind::PaperFutures {
                     skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
                         * RSI_OVERBOUGHT_THRESHOLDS.len()
-                        * CAPPED_RSI_TRANCHE_CAPS.len()
+                        * (CAPPED_RSI_TRANCHE_CAPS.len() + rsi_directional_variant_count(config))
                         * CANDLE_QUANTITY_MICRO_UNITS.len()
                         * cost_profile_count;
                 }
@@ -800,6 +876,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                             &format!("{rsi_window}:{oversold_threshold}/{overbought_threshold}"),
                             interval_seconds,
                             &candle_closes,
+                            &candle_start_ms,
                             plan,
                             rsi_window,
                             0,
@@ -816,6 +893,29 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                                     ),
                                     interval_seconds,
                                     &candle_closes,
+                                    &candle_start_ms,
+                                    plan,
+                                    rsi_window,
+                                    0,
+                                    Decimal::from_micro_units(quantity_micro_units),
+                                )?);
+                            }
+
+                            for (strategy_kind, direction) in RSI_DIRECTIONAL_VARIANTS {
+                                if direction == StrategyDirection::ShortOnly
+                                    && !short_research_enabled(config)
+                                {
+                                    continue;
+                                }
+                                results.extend(walk_forward_strategy_results(
+                                    config,
+                                    strategy_kind,
+                                    &format!(
+                                        "{rsi_window}:{oversold_threshold}/{overbought_threshold}"
+                                    ),
+                                    interval_seconds,
+                                    &candle_closes,
+                                    &candle_start_ms,
                                     plan,
                                     rsi_window,
                                     0,
@@ -866,6 +966,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                                             ),
                                             interval_seconds,
                                             &candle_closes,
+                                            &candle_start_ms,
                                             plan,
                                             rsi_window,
                                             0,
@@ -907,6 +1008,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                                 ),
                                 interval_seconds,
                                 &candle_closes,
+                                &candle_start_ms,
                                 plan,
                                 rsi_window,
                                 regime_window,
@@ -935,6 +1037,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                     &breakout_window.to_string(),
                     interval_seconds,
                     &candle_closes,
+                    &candle_start_ms,
                     plan,
                     breakout_window,
                     0,
@@ -1104,6 +1207,30 @@ fn walk_forward_quality_label(result: &WalkForwardResult) -> &'static str {
     }
 }
 
+fn peak_tranche_count(position_base: Decimal, quantity_base: Decimal) -> f64 {
+    if quantity_base <= Decimal::ZERO {
+        0.0
+    } else {
+        position_base.ratio_to(quantity_base)
+    }
+}
+
+fn format_utc_date(timestamp_ms: i64) -> String {
+    let days_since_epoch = timestamp_ms.div_euclid(86_400_000);
+    let shifted_days = days_since_epoch + 719_468;
+    let era = shifted_days.div_euclid(146_097);
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 fn quality_label(result: &CandleSweepResult) -> &'static str {
     if is_candidate(result) {
         "candidate"
@@ -1169,13 +1296,26 @@ fn walk_forward_strategy_count(config: &Config) -> usize {
         * RSI_OVERBOUGHT_THRESHOLDS.len()
         * CAPPED_RSI_TRANCHE_CAPS.len()
         * CANDLE_QUANTITY_MICRO_UNITS.len();
+    let directional_rsi_count = RSI_WINDOWS.len()
+        * RSI_OVERSOLD_THRESHOLDS.len()
+        * RSI_OVERBOUGHT_THRESHOLDS.len()
+        * rsi_directional_variant_count(config)
+        * CANDLE_QUANTITY_MICRO_UNITS.len();
 
     base_count
         + if config.exchange.kind == ExchangeKind::PaperFutures {
-            managed_rsi_count + capped_rsi_count
+            managed_rsi_count + capped_rsi_count + directional_rsi_count
         } else {
             0
         }
+}
+
+fn short_research_enabled(config: &Config) -> bool {
+    config.risk.allow_short && config.risk.max_short_position_base > Decimal::ZERO
+}
+
+fn rsi_directional_variant_count(config: &Config) -> usize {
+    1 + usize::from(short_research_enabled(config))
 }
 
 fn walk_forward_windows(
@@ -1236,6 +1376,7 @@ fn walk_forward_strategy_results(
     parameter_summary: &str,
     interval_seconds: i64,
     closes: &[Decimal],
+    candle_start_ms: &[i64],
     plan: WalkForwardPlan,
     fast_window: usize,
     slow_window: usize,
@@ -1258,6 +1399,7 @@ fn walk_forward_strategy_results(
                 parameter_summary,
                 interval_seconds,
                 closes,
+                candle_start_ms,
                 plan,
                 fast_window,
                 slow_window,
@@ -1277,11 +1419,18 @@ fn walk_forward_strategy_result(
     parameter_summary: &str,
     interval_seconds: i64,
     closes: &[Decimal],
+    candle_start_ms: &[i64],
     plan: WalkForwardPlan,
     fast_window: usize,
     slow_window: usize,
     quantity_base: Decimal,
 ) -> Result<WalkForwardResult> {
+    if closes.len() != candle_start_ms.len() {
+        return Err(BotError::Config(
+            "walk-forward candle prices and timestamps have different lengths".to_string(),
+        ));
+    }
+
     let mut candidate_window_count = 0_usize;
     let mut profitable_window_count = 0_usize;
     let mut total_test_profit_loss_quote = Decimal::ZERO;
@@ -1292,6 +1441,7 @@ fn walk_forward_strategy_result(
     let mut total_test_match_quote = Decimal::ZERO;
     let mut worst_test_profit_loss_quote: Option<Decimal> = None;
     let mut worst_test_drawdown_pct = 0.0_f64;
+    let mut peak_test_position_base = Decimal::ZERO;
     let mut total_test_filled_order_count = 0_usize;
     let mut total_test_buy_count = 0_usize;
     let mut total_test_sell_count = 0_usize;
@@ -1301,6 +1451,7 @@ fn walk_forward_strategy_result(
     let mut opposite_signal_exit_count = 0_usize;
     let mut regime_exit_count = 0_usize;
     let mut window_count = 0_usize;
+    let mut windows = Vec::new();
 
     for (train_start, train_end, test_end) in walk_forward_windows(closes.len(), plan) {
         let train_closes = closes[train_start..train_end].to_vec();
@@ -1318,7 +1469,8 @@ fn walk_forward_strategy_result(
             quantity_base,
         )?;
 
-        if is_candidate(&result) {
+        let candidate = is_candidate(&result);
+        if candidate {
             candidate_window_count += 1;
         }
         if result.test_profit_loss_quote > Decimal::ZERO {
@@ -1339,6 +1491,9 @@ fn walk_forward_strategy_result(
         if result.test_max_drawdown_pct > worst_test_drawdown_pct {
             worst_test_drawdown_pct = result.test_max_drawdown_pct;
         }
+        if diagnostics.peak_futures_position_base > peak_test_position_base {
+            peak_test_position_base = diagnostics.peak_futures_position_base;
+        }
         total_test_filled_order_count += result.test_filled_order_count;
         total_test_buy_count += result.test_buy_count;
         total_test_sell_count += result.test_sell_count;
@@ -1347,6 +1502,25 @@ fn walk_forward_strategy_result(
         max_holding_exit_count += diagnostics.max_holding_exit_count;
         opposite_signal_exit_count += diagnostics.opposite_signal_exit_count;
         regime_exit_count += diagnostics.regime_exit_count;
+        windows.push(WalkForwardWindowResult {
+            index: window_count + 1,
+            test_start_ms: candle_start_ms[train_end],
+            test_end_ms: candle_start_ms[test_end - 1] + interval_seconds * 1_000,
+            candidate,
+            profit_loss_quote: result.test_profit_loss_quote,
+            gross_profit_loss_quote: diagnostics.gross_profit_loss_quote,
+            fees_quote: diagnostics.fees_quote,
+            slippage_quote: diagnostics.slippage_quote,
+            buy_and_hold_profit_loss_quote: result.test_profit_loss_quote
+                - result.test_buy_and_hold_delta_quote,
+            alpha_quote: result.test_buy_and_hold_delta_quote,
+            match_quote: result.test_capital_matched_delta_quote,
+            max_drawdown_pct: result.test_max_drawdown_pct,
+            filled_order_count: result.test_filled_order_count,
+            buy_count: result.test_buy_count,
+            sell_count: result.test_sell_count,
+            peak_position_base: diagnostics.peak_futures_position_base,
+        });
         window_count += 1;
     }
 
@@ -1383,6 +1557,7 @@ fn walk_forward_strategy_result(
         average_test_alpha_quote,
         average_test_match_quote,
         worst_test_drawdown_pct,
+        peak_test_position_base,
         total_test_filled_order_count,
         total_test_buy_count,
         total_test_sell_count,
@@ -1391,6 +1566,7 @@ fn walk_forward_strategy_result(
         max_holding_exit_count,
         opposite_signal_exit_count,
         regime_exit_count,
+        windows,
     })
 }
 
@@ -1425,6 +1601,21 @@ fn strategy_candle_result(
             candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
             candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
             candidate.strategy.rsi_mean_reversion.max_tranches = None;
+        }
+        "rsi_long" | "rsi_short" => {
+            let (window, oversold_threshold, overbought_threshold) =
+                parse_rsi_parameter_summary(parameter_summary)?;
+            candidate.strategy.kind = StrategyKind::RsiMeanReversion;
+            candidate.strategy.rsi_mean_reversion.window = window;
+            candidate.strategy.rsi_mean_reversion.oversold_threshold = oversold_threshold;
+            candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
+            candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
+            candidate.strategy.rsi_mean_reversion.max_tranches = None;
+            candidate.strategy.rsi_mean_reversion.direction = if strategy_kind == "rsi_long" {
+                StrategyDirection::LongOnly
+            } else {
+                StrategyDirection::ShortOnly
+            };
         }
         "capped_rsi" => {
             let (window, oversold_threshold, overbought_threshold, max_tranches) =
@@ -1945,6 +2136,7 @@ fn baseline_report(config: &Config, event_count: usize) -> BacktestReport {
         win_count: 0,
         loss_count: 0,
         exposure_pct: 0.0,
+        peak_futures_position_base: Decimal::ZERO,
         final_base_balance: Decimal::ZERO,
         final_quote_balance: config.bot.paper_starting_quote_balance,
         trade_log_csv_path: None,
@@ -2683,7 +2875,7 @@ impl Display for WalkForwardReport {
         writeln!(f, "Best per strategy family and cost profile")?;
         writeln!(
             f,
-            "{:>15} {:>7} {:>8} {:>8} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>17} {:>7}",
+            "{:>15} {:>7} {:>8} {:>8} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>8} {:>10} {:>7} {:>7} {:>17} {:>7}",
             "strategy",
             "cost",
             "fee/slip",
@@ -2698,6 +2890,8 @@ impl Display for WalkForwardReport {
             "avg_alpha",
             "avg_match",
             "worst_dd",
+            "peak_pos",
+            "peak_x",
             "fills",
             "exits tp/sl/t/o/r",
             "b/s"
@@ -2706,7 +2900,7 @@ impl Display for WalkForwardReport {
         for result in best_walk_forward_results_by_family_and_cost(&self.results) {
             writeln!(
                 f,
-                "{:>15} {:>7} {:>3}/{:<4} {:>7}s {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
+                "{:>15} {:>7} {:>3}/{:<4} {:>7}s {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>10} {:>7.1} {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
                 result.strategy_kind,
                 result.cost_profile,
                 result.assumed_fee_bps,
@@ -2724,6 +2918,8 @@ impl Display for WalkForwardReport {
                 result.average_test_alpha_quote,
                 result.average_test_match_quote,
                 result.worst_test_drawdown_pct,
+                result.peak_test_position_base,
+                peak_tranche_count(result.peak_test_position_base, result.quantity_base),
                 result.total_test_filled_order_count,
                 result.take_profit_exit_count,
                 result.stop_loss_exit_count,
@@ -2738,7 +2934,7 @@ impl Display for WalkForwardReport {
         writeln!(f, "Overall leaders")?;
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>15} {:>26} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>17} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>15} {:>26} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>10} {:>7} {:>7} {:>17} {:>7}",
             "interval",
             "candles",
             "train",
@@ -2760,6 +2956,8 @@ impl Display for WalkForwardReport {
             "avg_match",
             "total_pnl",
             "worst_dd",
+            "peak_pos",
+            "peak_x",
             "fills",
             "exits tp/sl/t/o/r",
             "b/s"
@@ -2768,7 +2966,7 @@ impl Display for WalkForwardReport {
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>15} {:>26} {:>8} {:>7} {:>3}/{:<4} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>15} {:>26} {:>8} {:>7} {:>3}/{:<4} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>10} {:>7.1} {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_window_candles,
@@ -2793,6 +2991,8 @@ impl Display for WalkForwardReport {
                 result.average_test_match_quote,
                 result.total_test_profit_loss_quote,
                 result.worst_test_drawdown_pct,
+                result.peak_test_position_base,
+                peak_tranche_count(result.peak_test_position_base, result.quantity_base),
                 result.total_test_filled_order_count,
                 result.take_profit_exit_count,
                 result.stop_loss_exit_count,
@@ -2804,6 +3004,73 @@ impl Display for WalkForwardReport {
             )?;
         }
 
+        writeln!(f, "Window details for each overall cost leader")?;
+        let mut rendered_cost_profiles: Vec<&str> = Vec::new();
+        for result in &self.results {
+            if rendered_cost_profiles.contains(&result.cost_profile.as_str()) {
+                continue;
+            }
+            rendered_cost_profiles.push(result.cost_profile.as_str());
+            writeln!(
+                f,
+                "{} {} {}s qty {} cost {} ({}/{})",
+                result.strategy_kind,
+                result.parameter_summary,
+                result.interval_seconds,
+                result.quantity_base,
+                result.cost_profile,
+                result.assumed_fee_bps,
+                result.assumed_slippage_bps
+            )?;
+            writeln!(
+                f,
+                "{:>3} {:>23} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>8} {:>7} {:>7} {:>10} {:>7}",
+                "win",
+                "test_period_utc",
+                "quality",
+                "pnl",
+                "gross",
+                "costs",
+                "market",
+                "alpha",
+                "match",
+                "dd",
+                "fills",
+                "b/s",
+                "peak_pos",
+                "peak_x"
+            )?;
+            for window in &result.windows {
+                let quality = if window.candidate {
+                    "candidate"
+                } else if window.profit_loss_quote > Decimal::ZERO {
+                    "profit"
+                } else {
+                    "loss"
+                };
+                writeln!(
+                    f,
+                    "{:>3} {:>10}..{:<10} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>7.2}% {:>7} {:>3}/{:<3} {:>10} {:>7.1}",
+                    window.index,
+                    format_utc_date(window.test_start_ms),
+                    format_utc_date(window.test_end_ms),
+                    quality,
+                    window.profit_loss_quote,
+                    window.gross_profit_loss_quote,
+                    window.fees_quote + window.slippage_quote,
+                    window.buy_and_hold_profit_loss_quote,
+                    window.alpha_quote,
+                    window.match_quote,
+                    window.max_drawdown_pct,
+                    window.filled_order_count,
+                    window.buy_count,
+                    window.sell_count,
+                    window.peak_position_base,
+                    peak_tranche_count(window.peak_position_base, result.quantity_base),
+                )?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -2813,10 +3080,10 @@ mod tests {
     use super::{
         BaselinePlan, CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
         WalkForwardReport, WalkForwardResult, WalkForwardWindowDiagnostics,
-        best_walk_forward_results_by_family_and_cost, capital_matched_buy_hold_profit_loss,
-        compare_candle_sweep_results, compare_walk_forward_results, gross_profit_loss_quote,
-        is_candidate, run, run_baseline_from_prices, run_candles, strategy_candle_result,
-        walk_forward_strategy_count,
+        WalkForwardWindowResult, best_walk_forward_results_by_family_and_cost,
+        capital_matched_buy_hold_profit_loss, compare_candle_sweep_results,
+        compare_walk_forward_results, gross_profit_loss_quote, is_candidate, run,
+        run_baseline_from_prices, run_candles, strategy_candle_result, walk_forward_strategy_count,
     };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, ExchangeKind, MarketDataConfig,
@@ -2933,6 +3200,7 @@ mod tests {
             average_test_alpha_quote: decimal("1"),
             average_test_match_quote: decimal("0.1"),
             worst_test_drawdown_pct: 0.01,
+            peak_test_position_base: decimal("0.002"),
             total_test_filled_order_count: 21,
             total_test_buy_count: 11,
             total_test_sell_count: 10,
@@ -2941,6 +3209,24 @@ mod tests {
             max_holding_exit_count: 3,
             opposite_signal_exit_count: 5,
             regime_exit_count: 4,
+            windows: vec![WalkForwardWindowResult {
+                index: 1,
+                test_start_ms: 0,
+                test_end_ms: 86_400_000,
+                candidate: false,
+                profit_loss_quote: decimal("0.1"),
+                gross_profit_loss_quote: decimal("0.2"),
+                fees_quote: decimal("0.08"),
+                slippage_quote: decimal("0.02"),
+                buy_and_hold_profit_loss_quote: decimal("-0.9"),
+                alpha_quote: decimal("1"),
+                match_quote: decimal("0.1"),
+                max_drawdown_pct: 0.01,
+                filled_order_count: 3,
+                buy_count: 2,
+                sell_count: 1,
+                peak_position_base: decimal("0.002"),
+            }],
         }
     }
 
@@ -3016,6 +3302,8 @@ mod tests {
         assert!(family_position < overall_position);
         assert!(output.contains("managed_rsi"));
         assert!(output.contains("exits tp/sl/t/o/r"));
+        assert!(output.contains("Window details for each overall cost leader"));
+        assert!(output.contains("1970-01-01..1970-01-02"));
     }
 
     #[test]
@@ -3024,6 +3312,12 @@ mod tests {
             gross_profit_loss_quote(decimal("-1.78"), decimal("1.75"), decimal("0.35")),
             decimal("0.32")
         );
+    }
+
+    #[test]
+    fn formats_walk_forward_window_dates_in_utc() {
+        assert_eq!(super::format_utc_date(0), "1970-01-01");
+        assert_eq!(super::format_utc_date(-1), "1969-12-31");
     }
 
     #[test]
@@ -3059,11 +3353,17 @@ mod tests {
     }
 
     #[test]
-    fn futures_walk_forward_counts_capped_and_scaled_rsi_variants() {
+    fn futures_walk_forward_counts_capped_scaled_and_directional_rsi_variants() {
         let mut config = config();
         config.exchange.kind = ExchangeKind::PaperFutures;
+        config.risk.allow_short = true;
+        config.risk.max_short_position_base = decimal("0.25");
 
-        assert_eq!(walk_forward_strategy_count(&config), 2_811);
+        assert_eq!(walk_forward_strategy_count(&config), 2_973);
+
+        config.risk.allow_short = false;
+        config.risk.max_short_position_base = Decimal::ZERO;
+        assert_eq!(walk_forward_strategy_count(&config), 2_892);
     }
 
     #[test]
@@ -3156,6 +3456,24 @@ mod tests {
 
         assert_eq!(result.strategy_kind, "capped_rsi");
         assert_eq!(result.parameter_summary, "3:30/70/x8");
+
+        for strategy_kind in ["rsi_long", "rsi_short"] {
+            let (directional_result, _) = strategy_candle_result(
+                &config,
+                strategy_kind,
+                "3:30/70",
+                60,
+                train.len() + test.len(),
+                &train,
+                &test,
+                3,
+                0,
+                decimal("0.0005"),
+            )
+            .expect("directional RSI window should run");
+
+            assert_eq!(directional_result.strategy_kind, strategy_kind);
+        }
     }
 
     #[test]

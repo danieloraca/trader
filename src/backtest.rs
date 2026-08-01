@@ -35,6 +35,7 @@ pub struct BacktestReport {
     pub win_count: usize,
     pub loss_count: usize,
     pub exposure_pct: f64,
+    pub peak_futures_position_base: Decimal,
     pub final_base_balance: Decimal,
     pub final_quote_balance: Decimal,
     pub trade_log_csv_path: Option<String>,
@@ -160,6 +161,7 @@ fn run_with_source(
         win_count: 0,
         loss_count: 0,
         exposure_pct: 0.0,
+        peak_futures_position_base: Decimal::ZERO,
         final_base_balance: Decimal::ZERO,
         final_quote_balance: config.bot.paper_starting_quote_balance,
         trade_log_csv_path: config.backtest.trade_log_csv_path.clone(),
@@ -225,6 +227,12 @@ fn run_with_source(
                         } else {
                             report.loss_count += 1;
                         }
+                    }
+
+                    if portfolio.futures_enabled
+                        && portfolio.futures_position_base > report.peak_futures_position_base
+                    {
+                        report.peak_futures_position_base = portfolio.futures_position_base;
                     }
 
                     report.trades.push(trade);
@@ -702,6 +710,13 @@ impl Display for BacktestReport {
         )?;
         writeln!(f, "Wins / losses: {} / {}", self.win_count, self.loss_count)?;
         writeln!(f, "Exposure: {:.2}%", self.exposure_pct)?;
+        if self.peak_futures_position_base > Decimal::ZERO {
+            writeln!(
+                f,
+                "Peak futures position: {}",
+                self.peak_futures_position_base
+            )?;
+        }
         writeln!(f, "Final base balance: {}", self.final_base_balance)?;
         writeln!(f, "Final quote balance: {}", self.final_quote_balance)?;
         if let Some(path) = &self.trade_log_csv_path {
@@ -715,8 +730,8 @@ impl Display for BacktestReport {
 mod tests {
     use super::{run, run_from_sqlite};
     use crate::config::{
-        BacktestConfig, BotConfig, Config, ExchangeConfig, MarketDataConfig, RiskConfig,
-        StorageConfig, StrategyConfig, TelemetryConfig,
+        BacktestConfig, BotConfig, Config, ExchangeConfig, ExchangeKind, MarketDataConfig,
+        RiskConfig, StorageConfig, StrategyConfig, StrategyDirection, TelemetryConfig,
     };
     use crate::decimal::Decimal;
     use rusqlite::Connection;
@@ -792,6 +807,19 @@ mod tests {
         assert!(report.total_fees_quote > Decimal::ZERO);
         assert!(report.total_slippage_quote > Decimal::ZERO);
         assert!(report.buy_and_hold_value_quote > Decimal::ZERO);
+    }
+
+    #[test]
+    fn reports_peak_futures_position() {
+        let mut config = config();
+        config.exchange.kind = ExchangeKind::PaperFutures;
+        config.risk.allow_short = true;
+        config.risk.max_short_position_base = decimal("0.25");
+        config.strategy.simple_momentum.direction = StrategyDirection::LongShort;
+
+        let report = run(&config).expect("futures backtest should run");
+
+        assert_eq!(report.peak_futures_position_base, decimal("0.02"));
     }
 
     #[test]
