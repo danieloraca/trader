@@ -14,6 +14,7 @@ use crate::config::{StrategyConfig, StrategyDirection, StrategyKind};
 use crate::decimal::Decimal;
 use crate::market::MarketEvent;
 use crate::orders::Side;
+use crate::portfolio::Portfolio;
 
 #[derive(Debug, Clone)]
 pub struct Signal {
@@ -35,6 +36,14 @@ pub enum SignalIntent {
 
 pub trait Strategy {
     fn on_market_event(&mut self, event: &MarketEvent) -> Vec<Signal>;
+
+    fn on_market_event_with_portfolio(
+        &mut self,
+        event: &MarketEvent,
+        _portfolio: &Portfolio,
+    ) -> Vec<Signal> {
+        self.on_market_event(event)
+    }
 }
 
 pub fn from_config(config: &StrategyConfig) -> Box<dyn Strategy> {

@@ -134,7 +134,9 @@ impl App {
             );
             self.store.record_market_event(&event)?;
 
-            let signals = self.strategy.on_market_event(&event);
+            let signals = self
+                .strategy
+                .on_market_event_with_portfolio(&event, self.exchange.portfolio());
             debug!(
                 run_id = %self.run_id,
                 signal_count = signals.len(),

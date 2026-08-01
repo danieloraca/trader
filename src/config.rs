@@ -288,6 +288,14 @@ pub struct RsiRegimeConfig {
     pub regime_window: usize,
     #[serde(default = "default_rsi_quantity_base")]
     pub quantity_base: Decimal,
+    #[serde(default = "default_rsi_regime_take_profit_bps")]
+    pub take_profit_bps: i64,
+    #[serde(default = "default_rsi_regime_stop_loss_bps")]
+    pub stop_loss_bps: i64,
+    #[serde(default = "default_rsi_regime_max_holding_events")]
+    pub max_holding_events: usize,
+    #[serde(default = "default_true")]
+    pub exit_on_regime_change: bool,
     #[serde(default)]
     pub direction: StrategyDirection,
 }
@@ -336,6 +344,10 @@ impl Default for RsiRegimeConfig {
             overbought_threshold: default_rsi_overbought_threshold(),
             regime_window: default_rsi_regime_window(),
             quantity_base: default_rsi_quantity_base(),
+            take_profit_bps: default_rsi_regime_take_profit_bps(),
+            stop_loss_bps: default_rsi_regime_stop_loss_bps(),
+            max_holding_events: default_rsi_regime_max_holding_events(),
+            exit_on_regime_change: true,
             direction: StrategyDirection::default(),
         }
     }
@@ -666,6 +678,24 @@ impl Config {
             ));
         }
 
+        if self.strategy.rsi_regime.take_profit_bps <= 0 {
+            return Err(BotError::Config(
+                "regime RSI take-profit bps must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_regime.stop_loss_bps <= 0 {
+            return Err(BotError::Config(
+                "regime RSI stop-loss bps must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_regime.max_holding_events == 0 {
+            return Err(BotError::Config(
+                "regime RSI maximum holding events must be positive".to_string(),
+            ));
+        }
+
         if self.strategy.breakout.window == 0 {
             return Err(BotError::Config(
                 "breakout window must be positive".to_string(),
@@ -844,6 +874,22 @@ fn default_rsi_quantity_base() -> Decimal {
 
 fn default_rsi_regime_window() -> usize {
     120
+}
+
+fn default_rsi_regime_take_profit_bps() -> i64 {
+    200
+}
+
+fn default_rsi_regime_stop_loss_bps() -> i64 {
+    100
+}
+
+fn default_rsi_regime_max_holding_events() -> usize {
+    24
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_breakout_window() -> usize {

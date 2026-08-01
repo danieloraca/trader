@@ -64,7 +64,7 @@ Validate active strategies across rolling train/test windows before treating a s
 cargo run -- --config config/pi-paper-futures-live.toml --walk-forward-sqlite /var/lib/trader/trader.sqlite
 ```
 
-Regime-filtered RSI permits pullback longs only while price is above a rising long moving average, and rally shorts only while price is below a falling long moving average. The sweep tests 60- and 120-candle regime windows. A walk-forward candidate must pass the per-window candidate rule in at least 70% of windows and have positive average P/L, worst-window P/L, average alpha, and average match alpha.
+Regime-filtered RSI permits pullback longs only while price is above a rising long moving average, and rally shorts only while price is below a falling long moving average. Open futures positions use the actual persisted portfolio for full-position take-profit, stop-loss, maximum-holding-period, and regime-invalidation exits. The sweep tests 60- and 120-candle regime windows with `tight`, `balanced`, and `wide` exit profiles. A walk-forward candidate must pass the per-window candidate rule in at least 70% of windows and have positive average P/L, worst-window P/L, average alpha, and average match alpha.
 
 Configure cost assumptions and optional CSV output:
 

@@ -180,7 +180,7 @@ fn run_with_source(
             exposed_events += 1;
         }
 
-        let signals = strategy.on_market_event(&event);
+        let signals = strategy.on_market_event_with_portfolio(&event, &risk_portfolio);
         report.signal_count += signals.len();
 
         for signal in signals {

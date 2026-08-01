@@ -62,6 +62,10 @@ oversold_threshold = 25
 overbought_threshold = 65
 regime_window = 120
 quantity_base = 0.0005
+take_profit_bps = 200
+stop_loss_bps = 100
+max_holding_events = 24
+exit_on_regime_change = true
 direction = "long_only"
 
 [strategy.breakout]

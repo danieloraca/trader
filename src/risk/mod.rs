@@ -24,7 +24,11 @@ impl RiskManager {
             client_order_id: None,
         };
 
-        if request.quote_value() > self.config.max_order_quote_value {
+        if matches!(
+            signal.intent,
+            SignalIntent::IncreaseLong | SignalIntent::IncreaseShort
+        ) && request.quote_value() > self.config.max_order_quote_value
+        {
             return Err(BotError::Risk(format!(
                 "signal rejected: order value {} exceeds max {}",
                 request.quote_value(),
@@ -236,6 +240,23 @@ mod tests {
             .expect_err("short signal should be rejected");
 
         assert!(error.to_string().contains("short entries require futures"));
+    }
+
+    #[test]
+    fn allows_exposure_reducing_futures_order_above_entry_value_limit() {
+        let mut portfolio = futures_portfolio();
+        portfolio.futures_position_side = crate::portfolio::FuturesPositionSide::Long;
+        portfolio.futures_position_base = Decimal::from_f64(0.25).expect("quantity should parse");
+        portfolio.futures_entry_price = Decimal::from_f64(10_000.0).expect("price should parse");
+        let mut close_signal = signal(Side::Sell, 0.25, 10_000.0);
+        close_signal.intent = SignalIntent::DecreaseLong;
+
+        let request = risk_manager()
+            .approve(&close_signal, &portfolio)
+            .expect("risk-reducing close should be approved");
+
+        assert_eq!(request.quantity_base, portfolio.futures_position_base);
+        assert!(request.quote_value() > Decimal::from_f64(500.0).expect("limit should parse"));
     }
 
     #[test]
