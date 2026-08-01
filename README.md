@@ -48,15 +48,23 @@ Sweep simple momentum parameters against recorded Pi market data:
 cargo run -- --config config/pi-paper-live.toml --sweep-sqlite /var/lib/trader/trader.sqlite
 ```
 
-Sweep moving-average crossover and RSI mean-reversion parameters against 1m/5m candles built from recorded Pi market data:
+Sweep moving-average crossover, RSI mean-reversion, regime-filtered RSI, and breakout parameters against 1m/5m candles built from recorded Pi market data:
 
 ```sh
 cargo run -- --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/trader/trader.sqlite
 ```
 
-The candle sweep uses a chronological 70/30 train/test split, ranks rows with at least 3 test fills first, and saves its latest ranked results into SQLite. It includes MA crossover, RSI mean reversion, all-in hold, fixed-size hold, DCA, and trend-filtered DCA research rows. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
+The candle sweep uses a chronological 70/30 train/test split, ranks rows with at least 3 test fills first, and saves its latest ranked results into SQLite. It includes MA crossover, RSI mean reversion, regime-filtered RSI, breakout, all-in hold, fixed-size hold, DCA, and trend-filtered DCA research rows. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
 Sweep alpha means strategy P/L minus full-account buy-and-hold P/L over the same train or test slice. Match alpha means strategy P/L minus a capital-matched passive benchmark: buy-only rows deploy the same total capital at the first buy, while active rows hold their own buy lots to the end of the slice.
-A candidate row requires at least 3 test fills, positive test P/L, and positive test alpha.
+A candidate row requires at least 3 test fills, positive test P/L, positive test alpha, positive match alpha, and train P/L no worse than -10 quote units.
+
+Validate active strategies across rolling train/test windows before treating a single split as meaningful:
+
+```sh
+cargo run -- --config config/pi-paper-futures-live.toml --walk-forward-sqlite /var/lib/trader/trader.sqlite
+```
+
+Regime-filtered RSI permits pullback longs only while price is above a rising long moving average, and rally shorts only while price is below a falling long moving average. The sweep tests 60- and 120-candle regime windows. A walk-forward candidate must pass the per-window candidate rule in at least 70% of windows and have positive average P/L, worst-window P/L, average alpha, and average match alpha.
 
 Configure cost assumptions and optional CSV output:
 

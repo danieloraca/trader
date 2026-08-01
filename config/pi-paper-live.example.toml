@@ -56,6 +56,14 @@ overbought_threshold = 70
 quantity_base = 0.001
 direction = "long_only"
 
+[strategy.rsi_regime]
+window = 21
+oversold_threshold = 25
+overbought_threshold = 65
+regime_window = 120
+quantity_base = 0.0005
+direction = "long_only"
+
 [strategy.breakout]
 window = 20
 quantity_base = 0.001

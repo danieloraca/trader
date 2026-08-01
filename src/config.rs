@@ -202,6 +202,8 @@ pub struct StrategyConfig {
     #[serde(default)]
     pub rsi_mean_reversion: RsiMeanReversionConfig,
     #[serde(default)]
+    pub rsi_regime: RsiRegimeConfig,
+    #[serde(default)]
     pub breakout: BreakoutConfig,
 }
 
@@ -212,6 +214,7 @@ impl Default for StrategyConfig {
             simple_momentum: SimpleMomentumConfig::default(),
             moving_average_crossover: MovingAverageCrossoverConfig::default(),
             rsi_mean_reversion: RsiMeanReversionConfig::default(),
+            rsi_regime: RsiRegimeConfig::default(),
             breakout: BreakoutConfig::default(),
         }
     }
@@ -223,6 +226,7 @@ pub enum StrategyKind {
     SimpleMomentum,
     MovingAverageCrossover,
     RsiMeanReversion,
+    RsiRegime,
     Breakout,
 }
 
@@ -273,6 +277,22 @@ pub struct RsiMeanReversionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RsiRegimeConfig {
+    #[serde(default = "default_rsi_window")]
+    pub window: usize,
+    #[serde(default = "default_rsi_oversold_threshold")]
+    pub oversold_threshold: u8,
+    #[serde(default = "default_rsi_overbought_threshold")]
+    pub overbought_threshold: u8,
+    #[serde(default = "default_rsi_regime_window")]
+    pub regime_window: usize,
+    #[serde(default = "default_rsi_quantity_base")]
+    pub quantity_base: Decimal,
+    #[serde(default)]
+    pub direction: StrategyDirection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct BreakoutConfig {
     #[serde(default = "default_breakout_window")]
     pub window: usize,
@@ -302,6 +322,19 @@ impl Default for RsiMeanReversionConfig {
             window: default_rsi_window(),
             oversold_threshold: default_rsi_oversold_threshold(),
             overbought_threshold: default_rsi_overbought_threshold(),
+            quantity_base: default_rsi_quantity_base(),
+            direction: StrategyDirection::default(),
+        }
+    }
+}
+
+impl Default for RsiRegimeConfig {
+    fn default() -> Self {
+        Self {
+            window: default_rsi_window(),
+            oversold_threshold: default_rsi_oversold_threshold(),
+            overbought_threshold: default_rsi_overbought_threshold(),
+            regime_window: default_rsi_regime_window(),
             quantity_base: default_rsi_quantity_base(),
             direction: StrategyDirection::default(),
         }
@@ -605,6 +638,34 @@ impl Config {
             ));
         }
 
+        if self.strategy.rsi_regime.window == 0 {
+            return Err(BotError::Config(
+                "regime RSI window must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_regime.oversold_threshold == 0
+            || self.strategy.rsi_regime.overbought_threshold >= 100
+            || self.strategy.rsi_regime.oversold_threshold
+                >= self.strategy.rsi_regime.overbought_threshold
+        {
+            return Err(BotError::Config(
+                "regime RSI thresholds must satisfy 0 < oversold < overbought < 100".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_regime.regime_window < 2 {
+            return Err(BotError::Config(
+                "regime RSI moving average window must be at least 2".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_regime.quantity_base <= Decimal::ZERO {
+            return Err(BotError::Config(
+                "regime RSI quantity must be positive".to_string(),
+            ));
+        }
+
         if self.strategy.breakout.window == 0 {
             return Err(BotError::Config(
                 "breakout window must be positive".to_string(),
@@ -779,6 +840,10 @@ fn default_rsi_overbought_threshold() -> u8 {
 
 fn default_rsi_quantity_base() -> Decimal {
     Decimal::from_micro_units(1_000)
+}
+
+fn default_rsi_regime_window() -> usize {
+    120
 }
 
 fn default_breakout_window() -> usize {
