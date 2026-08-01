@@ -301,6 +301,8 @@ pub struct RsiMeanReversionConfig {
     #[serde(default)]
     pub max_tranches: Option<usize>,
     #[serde(default)]
+    pub regime_window: Option<usize>,
+    #[serde(default)]
     pub direction: StrategyDirection,
 }
 
@@ -388,6 +390,7 @@ impl Default for RsiMeanReversionConfig {
             overbought_threshold: default_rsi_overbought_threshold(),
             quantity_base: default_rsi_quantity_base(),
             max_tranches: None,
+            regime_window: None,
             direction: StrategyDirection::default(),
         }
     }
@@ -747,6 +750,17 @@ impl Config {
         {
             return Err(BotError::Config(
                 "RSI mean reversion tranche cap requires the paper_futures exchange".to_string(),
+            ));
+        }
+
+        if self
+            .strategy
+            .rsi_mean_reversion
+            .regime_window
+            .is_some_and(|window| window < 2)
+        {
+            return Err(BotError::Config(
+                "RSI mean reversion regime window must be at least 2 when configured".to_string(),
             ));
         }
 
@@ -1257,6 +1271,7 @@ verbose = true
         assert_eq!(config.strategy.rsi_mean_reversion.oversold_threshold, 30);
         assert_eq!(config.strategy.rsi_mean_reversion.overbought_threshold, 70);
         assert_eq!(config.strategy.rsi_mean_reversion.max_tranches, None);
+        assert_eq!(config.strategy.rsi_mean_reversion.regime_window, None);
         assert_eq!(
             config.strategy.rsi_mean_reversion.quantity_base.to_string(),
             "0.001"
@@ -1400,6 +1415,22 @@ verbose = true
             error
                 .to_string()
                 .contains("tranche cap requires the paper_futures exchange")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rsi_regime_window() {
+        let invalid_config = VALID_CONFIG.replace(
+            "quantity_base = 0.001\ndirection = \"long_only\"\n\n[strategy.breakout]",
+            "quantity_base = 0.001\nregime_window = 1\ndirection = \"long_only\"\n\n[strategy.breakout]",
+        );
+
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("regime window must be at least 2")
         );
     }
 

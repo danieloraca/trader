@@ -23,6 +23,21 @@ const RSI_DIRECTIONAL_VARIANTS: [(&str, StrategyDirection); 2] = [
     ("rsi_long", StrategyDirection::LongOnly),
     ("rsi_short", StrategyDirection::ShortOnly),
 ];
+const FILTERED_RSI_LONG_PULLBACK_THRESHOLDS: [u8; 4] = [30, 35, 40, 45];
+const FILTERED_RSI_DIRECTIONAL_VARIANTS: [FilteredRsiSweepVariant; 2] = [
+    FilteredRsiSweepVariant::new(
+        "filtered_rsi_long",
+        StrategyDirection::LongOnly,
+        &FILTERED_RSI_LONG_PULLBACK_THRESHOLDS,
+        &RSI_OVERBOUGHT_THRESHOLDS,
+    ),
+    FilteredRsiSweepVariant::new(
+        "filtered_rsi_short",
+        StrategyDirection::ShortOnly,
+        &RSI_OVERSOLD_THRESHOLDS,
+        &RSI_OVERBOUGHT_THRESHOLDS,
+    ),
+];
 const RSI_REGIME_WINDOWS: [usize; 2] = [60, 120];
 const RSI_EXIT_PROFILES: [RsiExitProfile; 3] = [
     RsiExitProfile::new("tight", 100, 60, 12),
@@ -73,6 +88,11 @@ const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
             * RSI_OVERBOUGHT_THRESHOLDS.len()
             * RSI_REGIME_WINDOWS.len()
             * RSI_EXIT_PROFILES.len()
+            * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (RSI_WINDOWS.len()
+            * RSI_REGIME_WINDOWS.len()
+            * (FILTERED_RSI_LONG_PULLBACK_THRESHOLDS.len() * RSI_OVERBOUGHT_THRESHOLDS.len()
+                + RSI_OVERSOLD_THRESHOLDS.len() * RSI_OVERBOUGHT_THRESHOLDS.len())
             * CANDLE_QUANTITY_MICRO_UNITS.len())
         + 1
         + CANDLE_QUANTITY_MICRO_UNITS.len()
@@ -400,6 +420,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                         candidate.strategy.rsi_mean_reversion.quantity_base =
                             Decimal::from_micro_units(quantity_micro_units);
                         candidate.strategy.rsi_mean_reversion.max_tranches = None;
+                        candidate.strategy.rsi_mean_reversion.regime_window = None;
                         candidate.backtest.trade_log_csv_path = None;
 
                         let train_report =
@@ -618,8 +639,6 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                                 candidate.strategy.rsi_regime.quantity_base =
                                     Decimal::from_micro_units(quantity_micro_units);
                                 apply_rsi_exit_profile(&mut candidate, exit_profile);
-                                candidate.strategy.rsi_regime.direction =
-                                    candidate.strategy.rsi_mean_reversion.direction;
                                 candidate.backtest.trade_log_csv_path = None;
 
                                 let train_report =
@@ -627,23 +646,93 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                                 let test_report =
                                     backtest::run_from_prices(&candidate, test_closes.clone())?;
                                 results.push(CandleSweepResult::from_report(
-                                "rsi_regime",
-                                &format!(
-                                    "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{regime_window}/{}",
-                                    exit_profile.label
-                                ),
-                                interval_seconds,
-                                candles.len(),
-                                train_closes.len(),
-                                test_closes.len(),
-                                rsi_window,
-                                regime_window,
-                                Decimal::from_micro_units(quantity_micro_units),
-                                &train_report,
-                                &test_report,
-                                *train_closes.last().expect("train closes should not be empty"),
-                                *test_closes.last().expect("test closes should not be empty"),
-                            ));
+                                    "rsi_regime",
+                                    &format!(
+                                        "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{regime_window}/{}",
+                                        exit_profile.label
+                                    ),
+                                    interval_seconds,
+                                    candles.len(),
+                                    train_closes.len(),
+                                    test_closes.len(),
+                                    rsi_window,
+                                    regime_window,
+                                    Decimal::from_micro_units(quantity_micro_units),
+                                    &train_report,
+                                    &test_report,
+                                    *train_closes
+                                        .last()
+                                        .expect("train closes should not be empty"),
+                                    *test_closes
+                                        .last()
+                                        .expect("test closes should not be empty"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let filtered_rsi_variants = filtered_rsi_variants(config);
+        let filtered_rsi_parameter_count = filtered_rsi_variants
+            .iter()
+            .copied()
+            .map(FilteredRsiSweepVariant::parameter_count)
+            .sum::<usize>();
+        for rsi_window in RSI_WINDOWS {
+            for regime_window in RSI_REGIME_WINDOWS {
+                let required_closes = (rsi_window + 1).max(regime_window + 1);
+                if train_closes.len() < required_closes || test_closes.len() < required_closes {
+                    skipped_under_warmed_count +=
+                        filtered_rsi_parameter_count * CANDLE_QUANTITY_MICRO_UNITS.len();
+                    continue;
+                }
+
+                for variant in &filtered_rsi_variants {
+                    for &oversold_threshold in variant.oversold_thresholds {
+                        for &overbought_threshold in variant.overbought_thresholds {
+                            for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                                let mut candidate = config.clone();
+                                candidate.strategy.kind = StrategyKind::RsiMeanReversion;
+                                candidate.strategy.rsi_mean_reversion.window = rsi_window;
+                                candidate.strategy.rsi_mean_reversion.oversold_threshold =
+                                    oversold_threshold;
+                                candidate.strategy.rsi_mean_reversion.overbought_threshold =
+                                    overbought_threshold;
+                                candidate.strategy.rsi_mean_reversion.quantity_base =
+                                    Decimal::from_micro_units(quantity_micro_units);
+                                candidate.strategy.rsi_mean_reversion.max_tranches = None;
+                                candidate.strategy.rsi_mean_reversion.regime_window =
+                                    Some(regime_window);
+                                candidate.strategy.rsi_mean_reversion.direction = variant.direction;
+                                candidate.backtest.trade_log_csv_path = None;
+
+                                let train_report =
+                                    backtest::run_from_prices(&candidate, train_closes.clone())?;
+                                let test_report =
+                                    backtest::run_from_prices(&candidate, test_closes.clone())?;
+                                results.push(CandleSweepResult::from_report(
+                                        variant.strategy_kind,
+                                        &format!(
+                                            "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{regime_window}"
+                                        ),
+                                        interval_seconds,
+                                        candles.len(),
+                                        train_closes.len(),
+                                        test_closes.len(),
+                                        rsi_window,
+                                        regime_window,
+                                        Decimal::from_micro_units(quantity_micro_units),
+                                        &train_report,
+                                        &test_report,
+                                        *train_closes
+                                            .last()
+                                            .expect("train closes should not be empty"),
+                                        *test_closes
+                                            .last()
+                                            .expect("test closes should not be empty"),
+                                    ));
                             }
                         }
                     }
@@ -1000,20 +1089,63 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                         for exit_profile in RSI_EXIT_PROFILES {
                             for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
                                 results.extend(walk_forward_strategy_results(
-                                config,
-                                "rsi_regime",
-                                &format!(
-                                    "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{regime_window}/{}",
-                                    exit_profile.label
-                                ),
-                                interval_seconds,
-                                &candle_closes,
-                                &candle_start_ms,
-                                plan,
-                                rsi_window,
-                                regime_window,
-                                Decimal::from_micro_units(quantity_micro_units),
-                            )?);
+                                    config,
+                                    "rsi_regime",
+                                    &format!(
+                                        "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{regime_window}/{}",
+                                        exit_profile.label
+                                    ),
+                                    interval_seconds,
+                                    &candle_closes,
+                                    &candle_start_ms,
+                                    plan,
+                                    rsi_window,
+                                    regime_window,
+                                    Decimal::from_micro_units(quantity_micro_units),
+                                )?);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let filtered_rsi_variants = filtered_rsi_variants(config);
+        let filtered_rsi_parameter_count = filtered_rsi_variants
+            .iter()
+            .copied()
+            .map(FilteredRsiSweepVariant::parameter_count)
+            .sum::<usize>();
+        for rsi_window in RSI_WINDOWS {
+            for regime_window in RSI_REGIME_WINDOWS {
+                let required_closes = (rsi_window + 1).max(regime_window + 1);
+                if plan.train_window_candles < required_closes
+                    || plan.test_window_candles < required_closes
+                {
+                    skipped_under_warmed_count += filtered_rsi_parameter_count
+                        * CANDLE_QUANTITY_MICRO_UNITS.len()
+                        * cost_profile_count;
+                    continue;
+                }
+
+                for variant in &filtered_rsi_variants {
+                    for &oversold_threshold in variant.oversold_thresholds {
+                        for &overbought_threshold in variant.overbought_thresholds {
+                            for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
+                                results.extend(walk_forward_strategy_results(
+                                        config,
+                                        variant.strategy_kind,
+                                        &format!(
+                                            "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{regime_window}"
+                                        ),
+                                        interval_seconds,
+                                        &candle_closes,
+                                        &candle_start_ms,
+                                        plan,
+                                        rsi_window,
+                                        regime_window,
+                                        Decimal::from_micro_units(quantity_micro_units),
+                                    )?);
                             }
                         }
                     }
@@ -1301,10 +1433,17 @@ fn walk_forward_strategy_count(config: &Config) -> usize {
         * RSI_OVERBOUGHT_THRESHOLDS.len()
         * rsi_directional_variant_count(config)
         * CANDLE_QUANTITY_MICRO_UNITS.len();
+    let filtered_rsi_count = RSI_WINDOWS.len()
+        * RSI_REGIME_WINDOWS.len()
+        * filtered_rsi_variants(config)
+            .into_iter()
+            .map(FilteredRsiSweepVariant::parameter_count)
+            .sum::<usize>()
+        * CANDLE_QUANTITY_MICRO_UNITS.len();
 
     base_count
         + if config.exchange.kind == ExchangeKind::PaperFutures {
-            managed_rsi_count + capped_rsi_count + directional_rsi_count
+            managed_rsi_count + capped_rsi_count + directional_rsi_count + filtered_rsi_count
         } else {
             0
         }
@@ -1316,6 +1455,18 @@ fn short_research_enabled(config: &Config) -> bool {
 
 fn rsi_directional_variant_count(config: &Config) -> usize {
     1 + usize::from(short_research_enabled(config))
+}
+
+fn filtered_rsi_variants(config: &Config) -> Vec<FilteredRsiSweepVariant> {
+    if config.exchange.kind != ExchangeKind::PaperFutures {
+        return Vec::new();
+    }
+    FILTERED_RSI_DIRECTIONAL_VARIANTS
+        .into_iter()
+        .filter(|variant| {
+            variant.direction != StrategyDirection::ShortOnly || short_research_enabled(config)
+        })
+        .collect()
 }
 
 fn walk_forward_windows(
@@ -1601,6 +1752,7 @@ fn strategy_candle_result(
             candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
             candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
             candidate.strategy.rsi_mean_reversion.max_tranches = None;
+            candidate.strategy.rsi_mean_reversion.regime_window = None;
         }
         "rsi_long" | "rsi_short" => {
             let (window, oversold_threshold, overbought_threshold) =
@@ -1611,6 +1763,7 @@ fn strategy_candle_result(
             candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
             candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
             candidate.strategy.rsi_mean_reversion.max_tranches = None;
+            candidate.strategy.rsi_mean_reversion.regime_window = None;
             candidate.strategy.rsi_mean_reversion.direction = if strategy_kind == "rsi_long" {
                 StrategyDirection::LongOnly
             } else {
@@ -1626,6 +1779,7 @@ fn strategy_candle_result(
             candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
             candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
             candidate.strategy.rsi_mean_reversion.max_tranches = Some(max_tranches);
+            candidate.strategy.rsi_mean_reversion.regime_window = None;
         }
         "managed_rsi" | "managed_rsi_opp" => {
             let (window, oversold_threshold, overbought_threshold, exit_profile, cooldown_events) =
@@ -1664,6 +1818,23 @@ fn strategy_candle_result(
             candidate.strategy.managed_rsi.direction =
                 candidate.strategy.rsi_mean_reversion.direction;
         }
+        "filtered_rsi_long" | "filtered_rsi_short" => {
+            let (window, oversold_threshold, overbought_threshold, regime_window) =
+                parse_filtered_rsi_parameter_summary(parameter_summary)?;
+            candidate.strategy.kind = StrategyKind::RsiMeanReversion;
+            candidate.strategy.rsi_mean_reversion.window = window;
+            candidate.strategy.rsi_mean_reversion.oversold_threshold = oversold_threshold;
+            candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
+            candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
+            candidate.strategy.rsi_mean_reversion.max_tranches = None;
+            candidate.strategy.rsi_mean_reversion.regime_window = Some(regime_window);
+            candidate.strategy.rsi_mean_reversion.direction =
+                if strategy_kind == "filtered_rsi_long" {
+                    StrategyDirection::LongOnly
+                } else {
+                    StrategyDirection::ShortOnly
+                };
+        }
         "rsi_regime" => {
             let (window, oversold_threshold, overbought_threshold, regime_window, exit_profile) =
                 parse_rsi_regime_parameter_summary(parameter_summary)?;
@@ -1674,8 +1845,6 @@ fn strategy_candle_result(
             candidate.strategy.rsi_regime.regime_window = regime_window;
             candidate.strategy.rsi_regime.quantity_base = quantity_base;
             apply_rsi_exit_profile(&mut candidate, exit_profile);
-            candidate.strategy.rsi_regime.direction =
-                candidate.strategy.rsi_mean_reversion.direction;
         }
         "breakout" => {
             let breakout_window = parameter_summary.parse::<usize>().map_err(|error| {
@@ -1767,6 +1936,26 @@ fn parse_capped_rsi_parameter_summary(parameter_summary: &str) -> Result<(usize,
 
     let (window, oversold, overbought) = parse_rsi_parameter_summary(rsi_summary)?;
     Ok((window, oversold, overbought, max_tranches))
+}
+
+fn parse_filtered_rsi_parameter_summary(parameter_summary: &str) -> Result<(usize, u8, u8, usize)> {
+    let Some((rsi_summary, regime_summary)) = parameter_summary.split_once('@') else {
+        return Err(BotError::Config(format!(
+            "invalid filtered RSI parameter summary: {parameter_summary}"
+        )));
+    };
+    let (window, oversold, overbought) = parse_rsi_parameter_summary(rsi_summary)?;
+    let regime_window = regime_summary.parse::<usize>().map_err(|error| {
+        BotError::Config(format!(
+            "invalid filtered RSI regime window in parameter summary {parameter_summary}: {error}"
+        ))
+    })?;
+    if !RSI_REGIME_WINDOWS.contains(&regime_window) {
+        return Err(BotError::Config(format!(
+            "unsupported filtered RSI regime window in parameter summary: {parameter_summary}"
+        )));
+    }
+    Ok((window, oversold, overbought, regime_window))
 }
 
 fn parse_rsi_regime_parameter_summary(
@@ -1891,6 +2080,14 @@ struct RsiExitProfile {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct FilteredRsiSweepVariant {
+    strategy_kind: &'static str,
+    direction: StrategyDirection,
+    oversold_thresholds: &'static [u8],
+    overbought_thresholds: &'static [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ManagedRsiSweepVariant {
     strategy_kind: &'static str,
     max_tranches: usize,
@@ -1911,6 +2108,26 @@ impl ManagedRsiSweepVariant {
             exit_on_opposite_signal,
             reduce_on_opposite_signal,
         }
+    }
+}
+
+impl FilteredRsiSweepVariant {
+    const fn new(
+        strategy_kind: &'static str,
+        direction: StrategyDirection,
+        oversold_thresholds: &'static [u8],
+        overbought_thresholds: &'static [u8],
+    ) -> Self {
+        Self {
+            strategy_kind,
+            direction,
+            oversold_thresholds,
+            overbought_thresholds,
+        }
+    }
+
+    fn parameter_count(self) -> usize {
+        self.oversold_thresholds.len() * self.overbought_thresholds.len()
     }
 }
 
@@ -2875,7 +3092,7 @@ impl Display for WalkForwardReport {
         writeln!(f, "Best per strategy family and cost profile")?;
         writeln!(
             f,
-            "{:>15} {:>7} {:>8} {:>8} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>8} {:>10} {:>7} {:>7} {:>17} {:>7}",
+            "{:>18} {:>7} {:>8} {:>8} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>8} {:>10} {:>7} {:>7} {:>17} {:>7}",
             "strategy",
             "cost",
             "fee/slip",
@@ -2900,7 +3117,7 @@ impl Display for WalkForwardReport {
         for result in best_walk_forward_results_by_family_and_cost(&self.results) {
             writeln!(
                 f,
-                "{:>15} {:>7} {:>3}/{:<4} {:>7}s {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>10} {:>7.1} {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
+                "{:>18} {:>7} {:>3}/{:<4} {:>7}s {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>10} {:>7.1} {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
                 result.strategy_kind,
                 result.cost_profile,
                 result.assumed_fee_bps,
@@ -2934,7 +3151,7 @@ impl Display for WalkForwardReport {
         writeln!(f, "Overall leaders")?;
         writeln!(
             f,
-            "{:>8} {:>7} {:>7} {:>7} {:>15} {:>26} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>10} {:>7} {:>7} {:>17} {:>7}",
+            "{:>8} {:>7} {:>7} {:>7} {:>18} {:>26} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>10} {:>7} {:>7} {:>17} {:>7}",
             "interval",
             "candles",
             "train",
@@ -2966,7 +3183,7 @@ impl Display for WalkForwardReport {
         for result in self.results.iter().take(25) {
             writeln!(
                 f,
-                "{:>7}s {:>7} {:>7} {:>7} {:>15} {:>26} {:>8} {:>7} {:>3}/{:<4} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>10} {:>7.1} {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
+                "{:>7}s {:>7} {:>7} {:>7} {:>18} {:>26} {:>8} {:>7} {:>3}/{:<4} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>10} {:>7.1} {:>7} {:>3}/{:<3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
                 result.interval_seconds,
                 result.candle_count,
                 result.train_window_candles,
@@ -3078,12 +3295,13 @@ impl Display for WalkForwardReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaselinePlan, CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
-        WalkForwardReport, WalkForwardResult, WalkForwardWindowDiagnostics,
+        BaselinePlan, CandleSweepResult, FilteredRsiSweepVariant, MAX_CANDLE_SWEEP_COMBINATIONS,
+        MIN_TEST_FILLS, WalkForwardReport, WalkForwardResult, WalkForwardWindowDiagnostics,
         WalkForwardWindowResult, best_walk_forward_results_by_family_and_cost,
         capital_matched_buy_hold_profit_loss, compare_candle_sweep_results,
-        compare_walk_forward_results, gross_profit_loss_quote, is_candidate, run,
-        run_baseline_from_prices, run_candles, strategy_candle_result, walk_forward_strategy_count,
+        compare_walk_forward_results, filtered_rsi_variants, gross_profit_loss_quote, is_candidate,
+        run, run_baseline_from_prices, run_candles, strategy_candle_result,
+        walk_forward_strategy_count,
     };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, ExchangeKind, MarketDataConfig,
@@ -3353,17 +3571,48 @@ mod tests {
     }
 
     #[test]
-    fn futures_walk_forward_counts_capped_scaled_and_directional_rsi_variants() {
+    fn futures_walk_forward_counts_all_directional_rsi_variants() {
         let mut config = config();
         config.exchange.kind = ExchangeKind::PaperFutures;
         config.risk.allow_short = true;
         config.risk.max_short_position_base = decimal("0.25");
 
-        assert_eq!(walk_forward_strategy_count(&config), 2_973);
+        assert_eq!(walk_forward_strategy_count(&config), 3_351);
+        let variants = filtered_rsi_variants(&config);
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| variant.strategy_kind)
+                .collect::<Vec<_>>(),
+            vec!["filtered_rsi_long", "filtered_rsi_short"]
+        );
+        assert_eq!(
+            variants
+                .into_iter()
+                .map(FilteredRsiSweepVariant::parameter_count)
+                .collect::<Vec<_>>(),
+            vec![12, 9]
+        );
 
         config.risk.allow_short = false;
         config.risk.max_short_position_base = Decimal::ZERO;
-        assert_eq!(walk_forward_strategy_count(&config), 2_892);
+        assert_eq!(walk_forward_strategy_count(&config), 3_108);
+        assert_eq!(
+            filtered_rsi_variants(&config)
+                .into_iter()
+                .map(|variant| variant.strategy_kind)
+                .collect::<Vec<_>>(),
+            vec!["filtered_rsi_long"]
+        );
+
+        config.exchange.kind = ExchangeKind::Paper;
+        assert_eq!(
+            filtered_rsi_variants(&config)
+                .into_iter()
+                .map(|variant| variant.strategy_kind)
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
@@ -3471,6 +3720,27 @@ mod tests {
                 decimal("0.0005"),
             )
             .expect("directional RSI window should run");
+
+            assert_eq!(directional_result.strategy_kind, strategy_kind);
+        }
+
+        for (strategy_kind, parameters) in [
+            ("filtered_rsi_long", "3:45/75@60"),
+            ("filtered_rsi_short", "3:25/75@60"),
+        ] {
+            let (directional_result, _) = strategy_candle_result(
+                &config,
+                strategy_kind,
+                parameters,
+                60,
+                train.len() + test.len(),
+                &train,
+                &test,
+                3,
+                60,
+                decimal("0.0005"),
+            )
+            .expect("directional regime RSI window should run");
 
             assert_eq!(directional_result.strategy_kind, strategy_kind);
         }

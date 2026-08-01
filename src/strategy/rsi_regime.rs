@@ -87,36 +87,97 @@ impl RsiRegimeStrategy {
         let bullish_regime = price > current_ma && current_ma > previous_ma;
         let bearish_regime = price < current_ma && current_ma < previous_ma;
 
-        let signal = match zone {
-            RsiZone::Oversold if self.previous_zone != RsiZone::Oversold && bullish_regime => {
-                bullish_signal(
-                    self.config.direction,
-                    event.symbol(),
-                    self.config.quantity_base,
-                    price,
-                    format!(
-                        "RSI {:.2} oversold in rising {}-tick regime",
-                        rsi, self.config.regime_window
-                    ),
-                )
+        let signal = if futures_portfolio.is_some() {
+            self.futures_entry_signal(event, zone, rsi, bullish_regime, bearish_regime)
+        } else {
+            match zone {
+                RsiZone::Oversold if self.previous_zone != RsiZone::Oversold && bullish_regime => {
+                    bullish_signal(
+                        self.config.direction,
+                        event.symbol(),
+                        self.config.quantity_base,
+                        price,
+                        format!(
+                            "RSI {:.2} oversold in rising {}-tick regime",
+                            rsi, self.config.regime_window
+                        ),
+                    )
+                }
+                RsiZone::Overbought
+                    if self.previous_zone != RsiZone::Overbought && bearish_regime =>
+                {
+                    bearish_signal(
+                        self.config.direction,
+                        event.symbol(),
+                        self.config.quantity_base,
+                        price,
+                        format!(
+                            "RSI {:.2} overbought in falling {}-tick regime",
+                            rsi, self.config.regime_window
+                        ),
+                    )
+                }
+                _ => None,
             }
-            RsiZone::Overbought if self.previous_zone != RsiZone::Overbought && bearish_regime => {
-                bearish_signal(
-                    self.config.direction,
-                    event.symbol(),
-                    self.config.quantity_base,
-                    price,
-                    format!(
-                        "RSI {:.2} overbought in falling {}-tick regime",
-                        rsi, self.config.regime_window
-                    ),
-                )
-            }
-            _ => None,
         };
 
         self.previous_zone = zone;
         signal.into_iter().collect()
+    }
+
+    fn futures_entry_signal(
+        &self,
+        event: &MarketEvent,
+        zone: RsiZone,
+        rsi: f64,
+        bullish_regime: bool,
+        bearish_regime: bool,
+    ) -> Option<Signal> {
+        match zone {
+            RsiZone::Oversold
+                if self.previous_zone != RsiZone::Oversold
+                    && bullish_regime
+                    && matches!(
+                        self.config.direction,
+                        crate::config::StrategyDirection::LongOnly
+                            | crate::config::StrategyDirection::LongShort
+                    ) =>
+            {
+                Some(Signal {
+                    symbol: event.symbol().to_string(),
+                    side: Side::Buy,
+                    intent: SignalIntent::IncreaseLong,
+                    quantity_base: self.config.quantity_base,
+                    price: event.price(),
+                    reason: format!(
+                        "RSI {:.2} oversold in rising {}-tick regime",
+                        rsi, self.config.regime_window
+                    ),
+                })
+            }
+            RsiZone::Overbought
+                if self.previous_zone != RsiZone::Overbought
+                    && bearish_regime
+                    && matches!(
+                        self.config.direction,
+                        crate::config::StrategyDirection::ShortOnly
+                            | crate::config::StrategyDirection::LongShort
+                    ) =>
+            {
+                Some(Signal {
+                    symbol: event.symbol().to_string(),
+                    side: Side::Sell,
+                    intent: SignalIntent::IncreaseShort,
+                    quantity_base: self.config.quantity_base,
+                    price: event.price(),
+                    reason: format!(
+                        "RSI {:.2} overbought in falling {}-tick regime",
+                        rsi, self.config.regime_window
+                    ),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn observe_position(&mut self, position_side: FuturesPositionSide) {
@@ -340,6 +401,60 @@ mod tests {
         }
 
         assert!(strategy.on_market_event(&tick("99")).is_empty());
+    }
+
+    #[test]
+    fn long_only_ignores_short_entry_in_falling_regime() {
+        let mut strategy = strategy(10, 30);
+        strategy.config.direction = StrategyDirection::LongOnly;
+        let portfolio = Portfolio::paper_futures("BTC", "USD", decimal("10000"));
+        for price in ["250", "200", "200", "100"] {
+            assert!(
+                strategy
+                    .on_market_event_with_portfolio(&tick(price), &portfolio)
+                    .is_empty()
+            );
+        }
+
+        assert!(
+            strategy
+                .on_market_event_with_portfolio(&tick("150"), &portfolio)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn short_only_ignores_long_entry_in_rising_regime() {
+        let mut strategy = strategy(70, 90);
+        strategy.config.direction = StrategyDirection::ShortOnly;
+        let portfolio = Portfolio::paper_futures("BTC", "USD", decimal("10000"));
+        for price in ["50", "100", "100", "200"] {
+            assert!(
+                strategy
+                    .on_market_event_with_portfolio(&tick(price), &portfolio)
+                    .is_empty()
+            );
+        }
+
+        assert!(
+            strategy
+                .on_market_event_with_portfolio(&tick("150"), &portfolio)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn long_only_preserves_spot_reduction_signal() {
+        let mut strategy = strategy(10, 30);
+        strategy.config.direction = StrategyDirection::LongOnly;
+        for price in ["250", "200", "200", "100"] {
+            assert!(strategy.on_market_event(&tick(price)).is_empty());
+        }
+
+        let signals = strategy.on_market_event(&tick("150"));
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseLong);
     }
 
     #[test]
