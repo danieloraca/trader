@@ -935,6 +935,32 @@ fn compare_walk_forward_results(lhs: &WalkForwardResult, rhs: &WalkForwardResult
         })
 }
 
+fn best_walk_forward_results_by_family_and_cost(
+    results: &[WalkForwardResult],
+) -> Vec<&WalkForwardResult> {
+    let mut leaders: Vec<&WalkForwardResult> = Vec::new();
+
+    for result in results {
+        if let Some(index) = leaders.iter().position(|leader| {
+            leader.strategy_kind == result.strategy_kind
+                && leader.cost_profile == result.cost_profile
+        }) {
+            if compare_walk_forward_results(result, leaders[index]) == Ordering::Less {
+                leaders[index] = result;
+            }
+        } else {
+            leaders.push(result);
+        }
+    }
+
+    leaders.sort_by(|lhs, rhs| {
+        lhs.strategy_kind
+            .cmp(&rhs.strategy_kind)
+            .then_with(|| lhs.cost_profile.cmp(&rhs.cost_profile))
+    });
+    leaders
+}
+
 fn is_candidate(result: &CandleSweepResult) -> bool {
     result.test_filled_order_count >= MIN_TEST_FILLS
         && result.test_profit_loss_quote > Decimal::ZERO
@@ -2398,6 +2424,61 @@ impl Display for WalkForwardReport {
             return Ok(());
         }
 
+        writeln!(f, "Best per strategy family and cost profile")?;
+        writeln!(
+            f,
+            "{:>11} {:>7} {:>8} {:>8} {:>26} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>15} {:>7}",
+            "strategy",
+            "cost",
+            "fee/slip",
+            "interval",
+            "params",
+            "qty",
+            "quality",
+            "cand_win",
+            "prof_win",
+            "avg_pnl",
+            "worst_pnl",
+            "avg_alpha",
+            "avg_match",
+            "worst_dd",
+            "fills",
+            "exits tp/sl/t/r",
+            "b/s"
+        )?;
+
+        for result in best_walk_forward_results_by_family_and_cost(&self.results) {
+            writeln!(
+                f,
+                "{:>11} {:>7} {:>3}/{:<4} {:>7}s {:>26} {:>8} {:>9} {:>3}/{:<5} {:>3}/{:<5} {:>12} {:>12} {:>12} {:>12} {:>7.2}% {:>7} {:>3}/{:<3}/{:<3}/{:<3} {:>3}/{:<3}",
+                result.strategy_kind,
+                result.cost_profile,
+                result.assumed_fee_bps,
+                result.assumed_slippage_bps,
+                result.interval_seconds,
+                result.parameter_summary,
+                result.quantity_base,
+                walk_forward_quality_label(result),
+                result.candidate_window_count,
+                result.window_count,
+                result.profitable_window_count,
+                result.window_count,
+                result.average_test_profit_loss_quote,
+                result.worst_test_profit_loss_quote,
+                result.average_test_alpha_quote,
+                result.average_test_match_quote,
+                result.worst_test_drawdown_pct,
+                result.total_test_filled_order_count,
+                result.take_profit_exit_count,
+                result.stop_loss_exit_count,
+                result.max_holding_exit_count,
+                result.regime_exit_count,
+                result.total_test_buy_count,
+                result.total_test_sell_count,
+            )?;
+        }
+
+        writeln!(f, "Overall leaders")?;
         writeln!(
             f,
             "{:>8} {:>7} {:>7} {:>7} {:>10} {:>26} {:>8} {:>7} {:>8} {:>9} {:>9} {:>9} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>7} {:>15} {:>7}",
@@ -2473,7 +2554,8 @@ impl Display for WalkForwardReport {
 mod tests {
     use super::{
         BaselinePlan, CandleSweepResult, MAX_CANDLE_SWEEP_COMBINATIONS, MIN_TEST_FILLS,
-        WalkForwardResult, WalkForwardWindowDiagnostics, capital_matched_buy_hold_profit_loss,
+        WalkForwardReport, WalkForwardResult, WalkForwardWindowDiagnostics,
+        best_walk_forward_results_by_family_and_cost, capital_matched_buy_hold_profit_loss,
         compare_candle_sweep_results, compare_walk_forward_results, gross_profit_loss_quote,
         is_candidate, run, run_baseline_from_prices, run_candles, strategy_candle_result,
     };
@@ -2621,6 +2703,58 @@ mod tests {
             compare_walk_forward_results(&baseline, &different_diagnostics),
             std::cmp::Ordering::Equal
         );
+    }
+
+    #[test]
+    fn selects_best_walk_forward_result_for_each_family_and_cost() {
+        let mut weaker_rsi = walk_forward_result();
+        weaker_rsi.strategy_kind = "rsi".to_string();
+        weaker_rsi.average_test_profit_loss_quote = decimal("1");
+
+        let mut stronger_rsi = weaker_rsi.clone();
+        stronger_rsi.average_test_profit_loss_quote = decimal("2");
+
+        let mut stressed_rsi = stronger_rsi.clone();
+        stressed_rsi.cost_profile = "stress".to_string();
+        stressed_rsi.average_test_profit_loss_quote = decimal("0.5");
+
+        let mut managed_rsi = walk_forward_result();
+        managed_rsi.strategy_kind = "managed_rsi".to_string();
+
+        let results = [weaker_rsi, stressed_rsi, managed_rsi, stronger_rsi];
+        let leaders = best_walk_forward_results_by_family_and_cost(&results);
+
+        assert_eq!(leaders.len(), 3);
+        assert_eq!(leaders[0].strategy_kind, "managed_rsi");
+        assert_eq!(leaders[1].strategy_kind, "rsi");
+        assert_eq!(leaders[1].cost_profile, "base");
+        assert_eq!(leaders[1].average_test_profit_loss_quote, decimal("2"));
+        assert_eq!(leaders[2].cost_profile, "stress");
+    }
+
+    #[test]
+    fn walk_forward_report_renders_family_leaders_before_overall_leaders() {
+        let mut managed_rsi = walk_forward_result();
+        managed_rsi.strategy_kind = "managed_rsi".to_string();
+        managed_rsi.parameter_summary = "21:30/65@balanced/cd1".to_string();
+        let report = WalkForwardReport {
+            sqlite_path: "data/test.sqlite".to_string(),
+            result_count: 1,
+            skipped_under_warmed_count: 0,
+            results: vec![managed_rsi],
+        };
+
+        let output = report.to_string();
+
+        let family_position = output
+            .find("Best per strategy family and cost profile")
+            .expect("family heading should render");
+        let overall_position = output
+            .find("Overall leaders")
+            .expect("overall heading should render");
+        assert!(family_position < overall_position);
+        assert!(output.contains("managed_rsi"));
+        assert!(output.contains("exits tp/sl/t/r"));
     }
 
     #[test]
