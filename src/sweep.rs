@@ -25,7 +25,12 @@ const RSI_EXIT_PROFILES: [RsiExitProfile; 3] = [
     RsiExitProfile::new("wide", 400, 200, 48),
 ];
 const MANAGED_RSI_COOLDOWN_EVENTS: [usize; 2] = [1, 3];
-const MANAGED_RSI_STRATEGY_KINDS: [&str; 2] = ["managed_rsi", "managed_rsi_opp"];
+const MANAGED_RSI_SWEEP_VARIANTS: [ManagedRsiSweepVariant; 4] = [
+    ManagedRsiSweepVariant::new("managed_rsi", 1, false, false),
+    ManagedRsiSweepVariant::new("managed_rsi_opp", 1, true, false),
+    ManagedRsiSweepVariant::new("scaled_rsi", 2, false, true),
+    ManagedRsiSweepVariant::new("scaled_rsi", 3, false, true),
+];
 const CANDLE_QUANTITY_MICRO_UNITS: [i64; 3] = [500, 1_000, 2_000];
 const DCA_PERIODS: [usize; 3] = [5, 15, 30];
 const TREND_WINDOWS: [usize; 3] = [15, 30, 60];
@@ -46,7 +51,7 @@ const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
             * RSI_OVERBOUGHT_THRESHOLDS.len()
             * RSI_EXIT_PROFILES.len()
             * MANAGED_RSI_COOLDOWN_EVENTS.len()
-            * MANAGED_RSI_STRATEGY_KINDS.len()
+            * MANAGED_RSI_SWEEP_VARIANTS.len()
             * CANDLE_QUANTITY_MICRO_UNITS.len())
         + (RSI_WINDOWS.len()
             * RSI_OVERSOLD_THRESHOLDS.len()
@@ -209,7 +214,7 @@ impl WalkForwardWindowDiagnostics {
             self.stop_loss_exit_count += 1;
         } else if reason.starts_with("maximum holding period") {
             self.max_holding_exit_count += 1;
-        } else if reason.starts_with("opposite RSI exit") {
+        } else if reason.starts_with("opposite RSI") {
             self.opposite_signal_exit_count += 1;
         } else if reason.contains("regime invalidated") {
             self.regime_exit_count += 1;
@@ -384,7 +389,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                         * RSI_OVERBOUGHT_THRESHOLDS.len()
                         * RSI_EXIT_PROFILES.len()
                         * MANAGED_RSI_COOLDOWN_EVENTS.len()
-                        * MANAGED_RSI_STRATEGY_KINDS.len()
+                        * MANAGED_RSI_SWEEP_VARIANTS.len()
                         * CANDLE_QUANTITY_MICRO_UNITS.len();
                     continue;
                 }
@@ -397,7 +402,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
 
                         for exit_profile in RSI_EXIT_PROFILES {
                             for cooldown_events in MANAGED_RSI_COOLDOWN_EVENTS {
-                                for strategy_kind in MANAGED_RSI_STRATEGY_KINDS {
+                                for variant in MANAGED_RSI_SWEEP_VARIANTS {
                                     for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
                                         let mut candidate = config.clone();
                                         candidate.strategy.kind = StrategyKind::ManagedRsi;
@@ -408,8 +413,12 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                                             overbought_threshold;
                                         candidate.strategy.managed_rsi.quantity_base =
                                             Decimal::from_micro_units(quantity_micro_units);
+                                        candidate.strategy.managed_rsi.max_tranches =
+                                            variant.max_tranches;
                                         candidate.strategy.managed_rsi.exit_on_opposite_signal =
-                                            strategy_kind == "managed_rsi_opp";
+                                            variant.exit_on_opposite_signal;
+                                        candidate.strategy.managed_rsi.reduce_on_opposite_signal =
+                                            variant.reduce_on_opposite_signal;
                                         apply_managed_rsi_profile(
                                             &mut candidate,
                                             exit_profile,
@@ -428,10 +437,14 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                                             test_closes.clone(),
                                         )?;
                                         results.push(CandleSweepResult::from_report(
-                                            strategy_kind,
-                                            &format!(
-                                                "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{}/cd{cooldown_events}",
-                                                exit_profile.label
+                                            variant.strategy_kind,
+                                            &managed_rsi_parameter_summary(
+                                                rsi_window,
+                                                oversold_threshold,
+                                                overbought_threshold,
+                                                exit_profile,
+                                                cooldown_events,
+                                                variant,
                                             ),
                                             interval_seconds,
                                             candles.len(),
@@ -749,7 +762,7 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                         * RSI_OVERBOUGHT_THRESHOLDS.len()
                         * RSI_EXIT_PROFILES.len()
                         * MANAGED_RSI_COOLDOWN_EVENTS.len()
-                        * MANAGED_RSI_STRATEGY_KINDS.len()
+                        * MANAGED_RSI_SWEEP_VARIANTS.len()
                         * CANDLE_QUANTITY_MICRO_UNITS.len()
                         * cost_profile_count;
                     continue;
@@ -763,14 +776,18 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
 
                         for exit_profile in RSI_EXIT_PROFILES {
                             for cooldown_events in MANAGED_RSI_COOLDOWN_EVENTS {
-                                for strategy_kind in MANAGED_RSI_STRATEGY_KINDS {
+                                for variant in MANAGED_RSI_SWEEP_VARIANTS {
                                     for quantity_micro_units in CANDLE_QUANTITY_MICRO_UNITS {
                                         results.extend(walk_forward_strategy_results(
                                             config,
-                                            strategy_kind,
-                                            &format!(
-                                                "{rsi_window}:{oversold_threshold}/{overbought_threshold}@{}/cd{cooldown_events}",
-                                                exit_profile.label
+                                            variant.strategy_kind,
+                                            &managed_rsi_parameter_summary(
+                                                rsi_window,
+                                                oversold_threshold,
+                                                overbought_threshold,
+                                                exit_profile,
+                                                cooldown_events,
+                                                variant,
                                             ),
                                             interval_seconds,
                                             &candle_closes,
@@ -1070,7 +1087,7 @@ fn walk_forward_strategy_count(config: &Config) -> usize {
         * RSI_OVERBOUGHT_THRESHOLDS.len()
         * RSI_EXIT_PROFILES.len()
         * MANAGED_RSI_COOLDOWN_EVENTS.len()
-        * MANAGED_RSI_STRATEGY_KINDS.len()
+        * MANAGED_RSI_SWEEP_VARIANTS.len()
         * CANDLE_QUANTITY_MICRO_UNITS.len();
 
     base_count
@@ -1336,8 +1353,31 @@ fn strategy_candle_result(
             candidate.strategy.managed_rsi.oversold_threshold = oversold_threshold;
             candidate.strategy.managed_rsi.overbought_threshold = overbought_threshold;
             candidate.strategy.managed_rsi.quantity_base = quantity_base;
+            candidate.strategy.managed_rsi.max_tranches = 1;
             candidate.strategy.managed_rsi.exit_on_opposite_signal =
                 strategy_kind == "managed_rsi_opp";
+            candidate.strategy.managed_rsi.reduce_on_opposite_signal = false;
+            apply_managed_rsi_profile(&mut candidate, exit_profile, cooldown_events);
+            candidate.strategy.managed_rsi.direction =
+                candidate.strategy.rsi_mean_reversion.direction;
+        }
+        "scaled_rsi" => {
+            let (
+                window,
+                oversold_threshold,
+                overbought_threshold,
+                exit_profile,
+                cooldown_events,
+                max_tranches,
+            ) = parse_scaled_rsi_parameter_summary(parameter_summary)?;
+            candidate.strategy.kind = StrategyKind::ManagedRsi;
+            candidate.strategy.managed_rsi.window = window;
+            candidate.strategy.managed_rsi.oversold_threshold = oversold_threshold;
+            candidate.strategy.managed_rsi.overbought_threshold = overbought_threshold;
+            candidate.strategy.managed_rsi.quantity_base = quantity_base;
+            candidate.strategy.managed_rsi.max_tranches = max_tranches;
+            candidate.strategy.managed_rsi.exit_on_opposite_signal = false;
+            candidate.strategy.managed_rsi.reduce_on_opposite_signal = true;
             apply_managed_rsi_profile(&mut candidate, exit_profile, cooldown_events);
             candidate.strategy.managed_rsi.direction =
                 candidate.strategy.rsi_mean_reversion.direction;
@@ -1500,12 +1540,75 @@ fn parse_managed_rsi_parameter_summary(
     Ok((window, oversold, overbought, exit_profile, cooldown_events))
 }
 
+fn parse_scaled_rsi_parameter_summary(
+    parameter_summary: &str,
+) -> Result<(usize, u8, u8, RsiExitProfile, usize, usize)> {
+    let Some((managed_summary, tranche_label)) = parameter_summary.rsplit_once('/') else {
+        return Err(BotError::Config(format!(
+            "invalid scaled RSI parameter summary: {parameter_summary}"
+        )));
+    };
+    let max_tranches = tranche_label
+        .strip_prefix('x')
+        .ok_or_else(|| {
+            BotError::Config(format!(
+                "invalid scaled RSI tranche cap in parameter summary: {parameter_summary}"
+            ))
+        })?
+        .parse::<usize>()
+        .map_err(|error| {
+            BotError::Config(format!(
+                "invalid scaled RSI tranche cap in parameter summary {parameter_summary}: {error}"
+            ))
+        })?;
+    if ![2, 3].contains(&max_tranches) {
+        return Err(BotError::Config(format!(
+            "unsupported scaled RSI tranche cap in parameter summary: {parameter_summary}"
+        )));
+    }
+
+    let (window, oversold, overbought, exit_profile, cooldown_events) =
+        parse_managed_rsi_parameter_summary(managed_summary)?;
+    Ok((
+        window,
+        oversold,
+        overbought,
+        exit_profile,
+        cooldown_events,
+        max_tranches,
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RsiExitProfile {
     label: &'static str,
     take_profit_bps: i64,
     stop_loss_bps: i64,
     max_holding_events: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedRsiSweepVariant {
+    strategy_kind: &'static str,
+    max_tranches: usize,
+    exit_on_opposite_signal: bool,
+    reduce_on_opposite_signal: bool,
+}
+
+impl ManagedRsiSweepVariant {
+    const fn new(
+        strategy_kind: &'static str,
+        max_tranches: usize,
+        exit_on_opposite_signal: bool,
+        reduce_on_opposite_signal: bool,
+    ) -> Self {
+        Self {
+            strategy_kind,
+            max_tranches,
+            exit_on_opposite_signal,
+            reduce_on_opposite_signal,
+        }
+    }
 }
 
 impl RsiExitProfile {
@@ -1521,6 +1624,25 @@ impl RsiExitProfile {
             stop_loss_bps,
             max_holding_events,
         }
+    }
+}
+
+fn managed_rsi_parameter_summary(
+    window: usize,
+    oversold_threshold: u8,
+    overbought_threshold: u8,
+    exit_profile: RsiExitProfile,
+    cooldown_events: usize,
+    variant: ManagedRsiSweepVariant,
+) -> String {
+    let base = format!(
+        "{window}:{oversold_threshold}/{overbought_threshold}@{}/cd{cooldown_events}",
+        exit_profile.label
+    );
+    if variant.strategy_kind == "scaled_rsi" {
+        format!("{base}/x{}", variant.max_tranches)
+    } else {
+        base
     }
 }
 
@@ -2582,6 +2704,7 @@ mod tests {
         best_walk_forward_results_by_family_and_cost, capital_matched_buy_hold_profit_loss,
         compare_candle_sweep_results, compare_walk_forward_results, gross_profit_loss_quote,
         is_candidate, run, run_baseline_from_prices, run_candles, strategy_candle_result,
+        walk_forward_strategy_count,
     };
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, ExchangeKind, MarketDataConfig,
@@ -2798,13 +2921,14 @@ mod tests {
         diagnostics.record_exit_reason("stop loss at -110.00 bps (limit -100)");
         diagnostics.record_exit_reason("maximum holding period reached at 24 events");
         diagnostics.record_exit_reason("opposite RSI exit at 72.50");
+        diagnostics.record_exit_reason("opposite RSI tranche reduction at 72.50");
         diagnostics.record_exit_reason("120-tick regime invalidated at MA 64000");
         diagnostics.record_exit_reason("RSI entry");
 
         assert_eq!(diagnostics.take_profit_exit_count, 1);
         assert_eq!(diagnostics.stop_loss_exit_count, 1);
         assert_eq!(diagnostics.max_holding_exit_count, 1);
-        assert_eq!(diagnostics.opposite_signal_exit_count, 1);
+        assert_eq!(diagnostics.opposite_signal_exit_count, 2);
         assert_eq!(diagnostics.regime_exit_count, 1);
     }
 
@@ -2820,6 +2944,14 @@ mod tests {
         assert_eq!((profiles[0].fee_bps, profiles[0].slippage_bps), (5, 5));
         assert_eq!(profiles[1].label, "stress");
         assert_eq!((profiles[1].fee_bps, profiles[1].slippage_bps), (5, 10));
+    }
+
+    #[test]
+    fn futures_walk_forward_counts_scaled_rsi_variants() {
+        let mut config = config();
+        config.exchange.kind = ExchangeKind::PaperFutures;
+
+        assert_eq!(walk_forward_strategy_count(&config), 2_568);
     }
 
     #[test]
@@ -2867,6 +2999,23 @@ mod tests {
 
         assert_eq!(opposite_result.strategy_kind, "managed_rsi_opp");
         assert_eq!(diagnostics.opposite_signal_exit_count, 1);
+
+        let (scaled_result, _) = strategy_candle_result(
+            &config,
+            "scaled_rsi",
+            "3:30/70@wide/cd1/x3",
+            60,
+            train.len() + test.len(),
+            &train,
+            &test,
+            3,
+            0,
+            decimal("0.0005"),
+        )
+        .expect("scaled RSI window should run");
+
+        assert_eq!(scaled_result.strategy_kind, "scaled_rsi");
+        assert_eq!(scaled_result.parameter_summary, "3:30/70@wide/cd1/x3");
     }
 
     #[test]

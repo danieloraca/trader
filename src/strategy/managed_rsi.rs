@@ -68,43 +68,55 @@ impl ManagedRsiStrategy {
             }
         }
 
-        let can_enter = match futures_portfolio {
-            Some(portfolio) if portfolio.futures_position_side != FuturesPositionSide::Flat => {
-                false
-            }
-            Some(_) if self.cooldown_remaining > 0 => {
+        let flat_entry_allowed = match futures_portfolio {
+            Some(portfolio)
+                if portfolio.futures_position_side == FuturesPositionSide::Flat
+                    && self.cooldown_remaining > 0 =>
+            {
                 self.cooldown_remaining -= 1;
                 false
             }
             _ => true,
         };
 
-        let signal = if can_enter {
-            match zone {
-                RsiZone::Oversold if self.previous_zone != RsiZone::Oversold => bullish_signal(
-                    self.config.direction,
-                    event.symbol(),
-                    self.config.quantity_base,
-                    event.price(),
-                    format!(
-                        "managed RSI {:.2} at/below oversold {}",
-                        rsi, self.config.oversold_threshold
-                    ),
-                ),
-                RsiZone::Overbought if self.previous_zone != RsiZone::Overbought => bearish_signal(
-                    self.config.direction,
-                    event.symbol(),
-                    self.config.quantity_base,
-                    event.price(),
-                    format!(
-                        "managed RSI {:.2} at/above overbought {}",
-                        rsi, self.config.overbought_threshold
-                    ),
-                ),
-                _ => None,
-            }
-        } else {
-            None
+        let signal = match zone {
+            RsiZone::Oversold if self.previous_zone != RsiZone::Oversold => self
+                .entry_quantity(
+                    futures_portfolio,
+                    FuturesPositionSide::Long,
+                    flat_entry_allowed,
+                )
+                .and_then(|quantity_base| {
+                    bullish_signal(
+                        self.config.direction,
+                        event.symbol(),
+                        quantity_base,
+                        event.price(),
+                        format!(
+                            "managed RSI {:.2} at/below oversold {}",
+                            rsi, self.config.oversold_threshold
+                        ),
+                    )
+                }),
+            RsiZone::Overbought if self.previous_zone != RsiZone::Overbought => self
+                .entry_quantity(
+                    futures_portfolio,
+                    FuturesPositionSide::Short,
+                    flat_entry_allowed,
+                )
+                .and_then(|quantity_base| {
+                    bearish_signal(
+                        self.config.direction,
+                        event.symbol(),
+                        quantity_base,
+                        event.price(),
+                        format!(
+                            "managed RSI {:.2} at/above overbought {}",
+                            rsi, self.config.overbought_threshold
+                        ),
+                    )
+                }),
+            _ => None,
         };
 
         self.previous_zone = zone;
@@ -124,6 +136,34 @@ impl ManagedRsiStrategy {
             self.tracked_position_side = position_side;
             self.holding_events = 1;
             self.cooldown_remaining = 0;
+        }
+    }
+
+    fn entry_quantity(
+        &self,
+        portfolio: Option<&Portfolio>,
+        target_side: FuturesPositionSide,
+        flat_entry_allowed: bool,
+    ) -> Option<Decimal> {
+        let Some(portfolio) = portfolio else {
+            return Some(self.config.quantity_base);
+        };
+
+        match portfolio.futures_position_side {
+            FuturesPositionSide::Flat => flat_entry_allowed.then_some(self.config.quantity_base),
+            side if side == target_side => {
+                let tranche_multiplier =
+                    i64::try_from(self.config.max_tranches).unwrap_or(i64::MAX);
+                let max_position = Decimal::from_micro_units(
+                    self.config
+                        .quantity_base
+                        .micro_units()
+                        .saturating_mul(tranche_multiplier),
+                );
+                let remaining = max_position - portfolio.futures_position_base;
+                (remaining > Decimal::ZERO).then_some(self.config.quantity_base.min(remaining))
+            }
+            _ => None,
         }
     }
 
@@ -176,7 +216,7 @@ impl ManagedRsiStrategy {
         zone: RsiZone,
         rsi: f64,
     ) -> Option<Signal> {
-        if !self.config.exit_on_opposite_signal {
+        if !self.config.exit_on_opposite_signal && !self.config.reduce_on_opposite_signal {
             return None;
         }
 
@@ -190,8 +230,26 @@ impl ManagedRsiStrategy {
             FuturesPositionSide::Flat => false,
         };
 
-        opposite_transition
-            .then(|| close_signal(event, portfolio, format!("opposite RSI exit at {rsi:.2}")))
+        if !opposite_transition {
+            return None;
+        }
+
+        if self.config.exit_on_opposite_signal {
+            return Some(close_signal(
+                event,
+                portfolio,
+                format!("opposite RSI exit at {rsi:.2}"),
+            ));
+        }
+
+        Some(close_signal_with_quantity(
+            event,
+            portfolio,
+            self.config
+                .quantity_base
+                .min(portfolio.futures_position_base),
+            format!("opposite RSI tranche reduction at {rsi:.2}"),
+        ))
     }
 }
 
@@ -210,6 +268,15 @@ impl Strategy for ManagedRsiStrategy {
 }
 
 fn close_signal(event: &MarketEvent, portfolio: &Portfolio, reason: String) -> Signal {
+    close_signal_with_quantity(event, portfolio, portfolio.futures_position_base, reason)
+}
+
+fn close_signal_with_quantity(
+    event: &MarketEvent,
+    portfolio: &Portfolio,
+    quantity_base: Decimal,
+    reason: String,
+) -> Signal {
     let (side, intent) = match portfolio.futures_position_side {
         FuturesPositionSide::Long => (Side::Sell, SignalIntent::DecreaseLong),
         FuturesPositionSide::Short => (Side::Buy, SignalIntent::DecreaseShort),
@@ -219,7 +286,7 @@ fn close_signal(event: &MarketEvent, portfolio: &Portfolio, reason: String) -> S
         symbol: event.symbol().to_string(),
         side,
         intent,
-        quantity_base: portfolio.futures_position_base,
+        quantity_base,
         price: event.price(),
         reason,
     }
@@ -277,7 +344,9 @@ mod tests {
             stop_loss_bps: 100,
             max_holding_events: 24,
             cooldown_events: 2,
+            max_tranches: 1,
             exit_on_opposite_signal: false,
+            reduce_on_opposite_signal: false,
             direction: StrategyDirection::LongShort,
         })
     }
@@ -348,6 +417,41 @@ mod tests {
     }
 
     #[test]
+    fn adds_one_tranche_on_same_side_transition_below_cap() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        strategy.config.max_tranches = 2;
+        let long = position(FuturesPositionSide::Long, "100");
+        for price in ["100", "99", "98"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &long);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("97"), &long);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::IncreaseLong);
+        assert_eq!(signals[0].quantity_base, decimal("0.001"));
+    }
+
+    #[test]
+    fn does_not_add_tranche_at_position_cap() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        strategy.config.max_tranches = 2;
+        let mut long = position(FuturesPositionSide::Long, "100");
+        long.futures_position_base = decimal("0.002");
+        for price in ["100", "99", "98"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &long);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("97"), &long);
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
     fn closes_full_position_at_take_profit() {
         let mut strategy = strategy();
         let long = position(FuturesPositionSide::Long, "100");
@@ -373,6 +477,21 @@ mod tests {
         assert_eq!(signals[0].intent, SignalIntent::DecreaseShort);
         assert_eq!(signals[0].quantity_base, decimal("0.001"));
         assert!(signals[0].reason.contains("stop loss"));
+    }
+
+    #[test]
+    fn protective_exit_closes_all_scaled_tranches() {
+        let mut strategy = strategy();
+        strategy.config.max_tranches = 3;
+        let mut long = position(FuturesPositionSide::Long, "100");
+        long.futures_position_base = decimal("0.003");
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &long);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseLong);
+        assert_eq!(signals[0].quantity_base, decimal("0.003"));
+        assert!(signals[0].reason.contains("take profit"));
     }
 
     #[test]
@@ -446,6 +565,48 @@ mod tests {
         let signals = strategy.on_market_event_with_portfolio(&tick("103"), &long);
 
         assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn reduces_long_by_one_tranche_on_opposite_transition() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        strategy.config.max_tranches = 3;
+        strategy.config.reduce_on_opposite_signal = true;
+        let mut long = position(FuturesPositionSide::Long, "100");
+        long.futures_position_base = decimal("0.003");
+        for price in ["100", "101", "102"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &long);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &long);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseLong);
+        assert_eq!(signals[0].quantity_base, decimal("0.001"));
+        assert!(signals[0].reason.starts_with("opposite RSI tranche"));
+    }
+
+    #[test]
+    fn reduces_short_by_one_tranche_on_opposite_transition() {
+        let mut strategy = strategy();
+        strategy.config.take_profit_bps = 10_000;
+        strategy.config.stop_loss_bps = 10_000;
+        strategy.config.max_tranches = 2;
+        strategy.config.reduce_on_opposite_signal = true;
+        let mut short = position(FuturesPositionSide::Short, "100");
+        short.futures_position_base = decimal("0.002");
+        for price in ["100", "99", "98"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &short);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("97"), &short);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseShort);
+        assert_eq!(signals[0].quantity_base, decimal("0.001"));
+        assert!(signals[0].reason.starts_with("opposite RSI tranche"));
     }
 
     #[test]

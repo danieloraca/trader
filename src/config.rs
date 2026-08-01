@@ -320,8 +320,12 @@ pub struct ManagedRsiConfig {
     pub max_holding_events: usize,
     #[serde(default = "default_managed_rsi_cooldown_events")]
     pub cooldown_events: usize,
+    #[serde(default = "default_managed_rsi_max_tranches")]
+    pub max_tranches: usize,
     #[serde(default)]
     pub exit_on_opposite_signal: bool,
+    #[serde(default)]
+    pub reduce_on_opposite_signal: bool,
     #[serde(default)]
     pub direction: StrategyDirection,
 }
@@ -397,7 +401,9 @@ impl Default for ManagedRsiConfig {
             stop_loss_bps: default_rsi_regime_stop_loss_bps(),
             max_holding_events: default_rsi_regime_max_holding_events(),
             cooldown_events: default_managed_rsi_cooldown_events(),
+            max_tranches: default_managed_rsi_max_tranches(),
             exit_on_opposite_signal: false,
+            reduce_on_opposite_signal: false,
             direction: StrategyDirection::default(),
         }
     }
@@ -767,6 +773,20 @@ impl Config {
             ));
         }
 
+        if self.strategy.managed_rsi.max_tranches == 0 {
+            return Err(BotError::Config(
+                "managed RSI maximum tranches must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.managed_rsi.exit_on_opposite_signal
+            && self.strategy.managed_rsi.reduce_on_opposite_signal
+        {
+            return Err(BotError::Config(
+                "managed RSI cannot both exit and reduce on an opposite signal".to_string(),
+            ));
+        }
+
         if self.strategy.kind == StrategyKind::ManagedRsi
             && self.exchange.kind != ExchangeKind::PaperFutures
         {
@@ -1033,6 +1053,10 @@ fn default_managed_rsi_cooldown_events() -> usize {
     1
 }
 
+fn default_managed_rsi_max_tranches() -> usize {
+    1
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1223,7 +1247,9 @@ verbose = true
         assert_eq!(config.strategy.managed_rsi.cooldown_events, 1);
         assert_eq!(config.strategy.managed_rsi.take_profit_bps, 200);
         assert_eq!(config.strategy.managed_rsi.stop_loss_bps, 100);
+        assert_eq!(config.strategy.managed_rsi.max_tranches, 1);
         assert!(!config.strategy.managed_rsi.exit_on_opposite_signal);
+        assert!(!config.strategy.managed_rsi.reduce_on_opposite_signal);
         assert_eq!(config.strategy.breakout.window, 20);
         assert_eq!(config.strategy.breakout.quantity_base.to_string(), "0.001");
         assert_eq!(
@@ -1324,6 +1350,42 @@ verbose = true
             error
                 .to_string()
                 .contains("managed RSI requires the paper_futures exchange")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_managed_rsi_tranche_cap() {
+        let invalid_config = format!(
+            "{}\n[strategy.managed_rsi]\nmax_tranches = 0\n",
+            VALID_CONFIG
+                .replace("kind = \"paper\"", "kind = \"paper_futures\"")
+                .replace("kind = \"simple_momentum\"", "kind = \"managed_rsi\"")
+        );
+
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed RSI maximum tranches must be positive")
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_managed_rsi_opposite_actions() {
+        let invalid_config = format!(
+            "{}\n[strategy.managed_rsi]\nexit_on_opposite_signal = true\nreduce_on_opposite_signal = true\n",
+            VALID_CONFIG
+                .replace("kind = \"paper\"", "kind = \"paper_futures\"")
+                .replace("kind = \"simple_momentum\"", "kind = \"managed_rsi\"")
+        );
+
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot both exit and reduce on an opposite signal")
         );
     }
 
