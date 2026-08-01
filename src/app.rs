@@ -1,6 +1,6 @@
 use crate::config::{Config, ExchangeKind, MarketDataKind};
 use crate::error::{BotError, Result};
-use crate::exchange::{Exchange, KrakenExchange, PaperExchange};
+use crate::exchange::{Exchange, KrakenExchange, PaperExchange, PaperFuturesExchange};
 use crate::market::{KrakenTickerMarketDataSource, MarketDataSource, ReplayMarketDataSource};
 use crate::orders::{OrderManager, OrderRequest, OrderStatus};
 use crate::portfolio::Portfolio;
@@ -46,6 +46,10 @@ impl App {
 
         let mut exchange: Box<dyn Exchange> = match config.exchange.kind {
             ExchangeKind::Paper => Box::new(PaperExchange::new(portfolio)),
+            ExchangeKind::PaperFutures => Box::new(PaperFuturesExchange::new(
+                portfolio,
+                config.exchange.paper_futures.leverage,
+            )),
             ExchangeKind::Kraken => Box::new(KrakenExchange::new(&config, portfolio)?),
         };
         let synced_portfolio = exchange.sync_portfolio()?;

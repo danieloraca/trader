@@ -51,6 +51,12 @@ struct PortfolioRow {
     quote_currency: String,
     base_balance_micro_units: i64,
     quote_balance_micro_units: i64,
+    futures_enabled: bool,
+    futures_position_side: String,
+    futures_position_base_micro_units: i64,
+    futures_entry_price_micro_units: i64,
+    futures_margin_used_micro_units: i64,
+    futures_realized_pnl_micro_units: i64,
 }
 
 #[derive(Debug)]
@@ -284,18 +290,58 @@ fn heartbeat(connection: &Connection) -> rusqlite::Result<Option<HeartbeatRow>> 
 }
 
 fn portfolio(connection: &Connection) -> rusqlite::Result<Option<PortfolioRow>> {
+    let has_futures_columns = column_exists(connection, "portfolio_state", "futures_enabled")?;
+    let futures_enabled_projection = if has_futures_columns {
+        "futures_enabled"
+    } else {
+        "0"
+    };
+    let futures_position_side_projection = if has_futures_columns {
+        "futures_position_side"
+    } else {
+        "'flat'"
+    };
+    let futures_position_base_projection = if has_futures_columns {
+        "futures_position_base_micro_units"
+    } else {
+        "0"
+    };
+    let futures_entry_price_projection = if has_futures_columns {
+        "futures_entry_price_micro_units"
+    } else {
+        "0"
+    };
+    let futures_margin_used_projection = if has_futures_columns {
+        "futures_margin_used_micro_units"
+    } else {
+        "0"
+    };
+    let futures_realized_pnl_projection = if has_futures_columns {
+        "futures_realized_pnl_micro_units"
+    } else {
+        "0"
+    };
+
     connection
         .query_row(
-            "
+            &format!(
+                "
             SELECT
                 updated_at_ms,
                 base_currency,
                 quote_currency,
                 base_balance_micro_units,
-                quote_balance_micro_units
+                quote_balance_micro_units,
+                {futures_enabled_projection},
+                {futures_position_side_projection},
+                {futures_position_base_projection},
+                {futures_entry_price_projection},
+                {futures_margin_used_projection},
+                {futures_realized_pnl_projection}
             FROM portfolio_state
             WHERE id = 1
-            ",
+            "
+            ),
             [],
             |row| {
                 Ok(PortfolioRow {
@@ -304,6 +350,12 @@ fn portfolio(connection: &Connection) -> rusqlite::Result<Option<PortfolioRow>> 
                     quote_currency: row.get(2)?,
                     base_balance_micro_units: row.get(3)?,
                     quote_balance_micro_units: row.get(4)?,
+                    futures_enabled: row.get::<_, i64>(5)? != 0,
+                    futures_position_side: row.get(6)?,
+                    futures_position_base_micro_units: row.get(7)?,
+                    futures_entry_price_micro_units: row.get(8)?,
+                    futures_margin_used_micro_units: row.get(9)?,
+                    futures_realized_pnl_micro_units: row.get(10)?,
                 })
             },
         )
@@ -704,15 +756,7 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
     let portfolio = snapshot
         .portfolio
         .as_ref()
-        .map(|portfolio| {
-            format!(
-                "{} {}, {} {}",
-                portfolio.base_currency,
-                format_micro_units(portfolio.base_balance_micro_units),
-                portfolio.quote_currency,
-                format_micro_units(portfolio.quote_balance_micro_units)
-            )
-        })
+        .map(portfolio_summary)
         .unwrap_or_else(|| "n/a".to_string());
     let portfolio_time_ms = snapshot
         .portfolio
@@ -722,12 +766,19 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
         .portfolio
         .as_ref()
         .zip(latest_price_micro_units)
-        .map(|(portfolio, price)| {
-            format_micro_units(
-                portfolio.quote_balance_micro_units
-                    + scaled_product(portfolio.base_balance_micro_units, price),
-            )
-        })
+        .map(|(portfolio, price)| format_micro_units(marked_value_micro_units(portfolio, price)))
+        .unwrap_or_else(|| "n/a".to_string());
+    let futures_margin = snapshot
+        .portfolio
+        .as_ref()
+        .filter(|portfolio| portfolio.futures_enabled)
+        .map(|portfolio| format_micro_units(portfolio.futures_margin_used_micro_units))
+        .unwrap_or_else(|| "n/a".to_string());
+    let futures_realized = snapshot
+        .portfolio
+        .as_ref()
+        .filter(|portfolio| portfolio.futures_enabled)
+        .map(|portfolio| format_micro_units(portfolio.futures_realized_pnl_micro_units))
         .unwrap_or_else(|| "n/a".to_string());
     let research = research_summary(
         snapshot.strategy_research_run.as_ref(),
@@ -750,6 +801,8 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
 <div class="tile"><div class="label">Run Uptime</div><div class="value">{}</div><div class="muted">{}</div></div>
 <div class="tile"><div class="label">Portfolio</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
 <div class="tile"><div class="label">Marked Value</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Futures Margin</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Futures Realized P/L</div><div class="value">{}</div></div>
 </section>"#,
         research.signal_class,
         escape_html(&research.signal_value),
@@ -775,7 +828,50 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
         portfolio_time_ms.unwrap_or_default(),
         escape_html(&time_fallback(portfolio_time_ms)),
         escape_html(&marked_value),
+        escape_html(&futures_margin),
+        escape_html(&futures_realized),
     );
+}
+
+fn portfolio_summary(portfolio: &PortfolioRow) -> String {
+    if portfolio.futures_enabled {
+        format!(
+            "{} {} {} @ {}",
+            portfolio.base_currency,
+            portfolio.futures_position_side,
+            format_micro_units(portfolio.futures_position_base_micro_units),
+            format_micro_units(portfolio.futures_entry_price_micro_units)
+        )
+    } else {
+        format!(
+            "{} {}, {} {}",
+            portfolio.base_currency,
+            format_micro_units(portfolio.base_balance_micro_units),
+            portfolio.quote_currency,
+            format_micro_units(portfolio.quote_balance_micro_units)
+        )
+    }
+}
+
+fn marked_value_micro_units(portfolio: &PortfolioRow, mark_price_micro_units: i64) -> i64 {
+    if !portfolio.futures_enabled {
+        return portfolio.quote_balance_micro_units
+            + scaled_product(portfolio.base_balance_micro_units, mark_price_micro_units);
+    }
+
+    let unrealized = match portfolio.futures_position_side.as_str() {
+        "long" => scaled_product(
+            portfolio.futures_position_base_micro_units,
+            mark_price_micro_units - portfolio.futures_entry_price_micro_units,
+        ),
+        "short" => scaled_product(
+            portfolio.futures_position_base_micro_units,
+            portfolio.futures_entry_price_micro_units - mark_price_micro_units,
+        ),
+        _ => 0,
+    };
+
+    portfolio.quote_balance_micro_units + unrealized
 }
 
 fn research_summary(

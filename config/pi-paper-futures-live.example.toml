@@ -4,13 +4,8 @@ base_currency = "BTC"
 quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
-[backtest]
-fee_bps = 26
-slippage_bps = 5
-trade_log_csv_path = "data/backtest-trades.csv"
-
 [exchange]
-kind = "paper"
+kind = "paper_futures"
 
 [exchange.paper_futures]
 leverage = 1.0
@@ -23,8 +18,8 @@ api_secret_env = "KRAKEN_API_SECRET"
 enable_order_placement = false
 
 [market_data]
-kind = "replay"
-replay_prices = [100.0, 101.0, 102.0, 101.5, 99.0]
+kind = "kraken_ticker"
+replay_prices = []
 idle_sleep_ms = 1000
 
 [market_data.kraken]
@@ -35,39 +30,39 @@ poll_interval_ms = 5000
 [risk]
 max_order_quote_value = 500.0
 max_position_base = 0.25
-allow_short = false
-max_short_position_base = 0.0
+allow_short = true
+max_short_position_base = 0.25
 
 [strategy]
-kind = "simple_momentum"
+kind = "moving_average_crossover"
 
 [strategy.simple_momentum]
 buy_threshold_bps = 50
 sell_threshold_bps = -100
 buy_quantity_base = 0.01
 sell_quantity_base = 0.005
-direction = "long_only"
+direction = "long_short"
 
 [strategy.moving_average_crossover]
 fast_window = 5
 slow_window = 20
 quantity_base = 0.001
-direction = "long_only"
+direction = "long_short"
 
 [strategy.rsi_mean_reversion]
 window = 14
 oversold_threshold = 30
 overbought_threshold = 70
 quantity_base = 0.001
-direction = "long_only"
+direction = "long_short"
 
 [strategy.breakout]
 window = 20
 quantity_base = 0.001
-direction = "long_only"
+direction = "long_short"
 
 [storage]
-sqlite_path = "data/trader.sqlite"
+sqlite_path = "/var/lib/trader/trader-futures.sqlite"
 
 [telemetry]
-verbose = true
+verbose = false

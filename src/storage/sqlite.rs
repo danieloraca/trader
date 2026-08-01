@@ -2,7 +2,7 @@ use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use crate::market::MarketEvent;
 use crate::orders::{Order, OrderRequest, Side};
-use crate::portfolio::Portfolio;
+use crate::portfolio::{FuturesPositionSide, Portfolio};
 use crate::storage::Store;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
@@ -80,7 +80,13 @@ impl SqliteStore {
                     base_currency TEXT NOT NULL,
                     quote_currency TEXT NOT NULL,
                     base_balance_micro_units INTEGER NOT NULL,
-                    quote_balance_micro_units INTEGER NOT NULL
+                    quote_balance_micro_units INTEGER NOT NULL,
+                    futures_enabled INTEGER NOT NULL DEFAULT 0,
+                    futures_position_side TEXT NOT NULL DEFAULT 'flat',
+                    futures_position_base_micro_units INTEGER NOT NULL DEFAULT 0,
+                    futures_entry_price_micro_units INTEGER NOT NULL DEFAULT 0,
+                    futures_margin_used_micro_units INTEGER NOT NULL DEFAULT 0,
+                    futures_realized_pnl_micro_units INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS replay_state (
@@ -168,6 +174,54 @@ impl SqliteStore {
         if self.column_exists("portfolio_state", "base_balance")? {
             self.rebuild_portfolio_with_micro_units()?;
         }
+
+        self.add_column_if_missing(
+            "portfolio_state",
+            "futures_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "portfolio_state",
+            "futures_position_side",
+            "TEXT NOT NULL DEFAULT 'flat'",
+        )?;
+        self.add_column_if_missing(
+            "portfolio_state",
+            "futures_position_base_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "portfolio_state",
+            "futures_entry_price_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "portfolio_state",
+            "futures_margin_used_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "portfolio_state",
+            "futures_realized_pnl_micro_units",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        Ok(())
+    }
+
+    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        if self.column_exists(table, column)? {
+            return Ok(());
+        }
+
+        self.connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )
+            .map_err(|error| {
+                BotError::Storage(format!("failed to add column {table}.{column}: {error}"))
+            })?;
 
         Ok(())
     }
@@ -549,7 +603,17 @@ impl Store for SqliteStore {
         self.connection
             .query_row(
                 "
-                SELECT base_currency, quote_currency, base_balance_micro_units, quote_balance_micro_units
+                SELECT
+                    base_currency,
+                    quote_currency,
+                    base_balance_micro_units,
+                    quote_balance_micro_units,
+                    futures_enabled,
+                    futures_position_side,
+                    futures_position_base_micro_units,
+                    futures_entry_price_micro_units,
+                    futures_margin_used_micro_units,
+                    futures_realized_pnl_micro_units
                 FROM portfolio_state
                 WHERE id = 1
                 ",
@@ -560,6 +624,14 @@ impl Store for SqliteStore {
                         quote_currency: row.get(1)?,
                         base_balance: Decimal::from_micro_units(row.get(2)?),
                         quote_balance: Decimal::from_micro_units(row.get(3)?),
+                        futures_enabled: row.get::<_, i64>(4)? != 0,
+                        futures_position_side: FuturesPositionSide::from_str(
+                            &row.get::<_, String>(5)?,
+                        ),
+                        futures_position_base: Decimal::from_micro_units(row.get(6)?),
+                        futures_entry_price: Decimal::from_micro_units(row.get(7)?),
+                        futures_margin_used_quote: Decimal::from_micro_units(row.get(8)?),
+                        futures_realized_pnl_quote: Decimal::from_micro_units(row.get(9)?),
                     })
                 },
             )
@@ -577,15 +649,27 @@ impl Store for SqliteStore {
                     base_currency,
                     quote_currency,
                     base_balance_micro_units,
-                    quote_balance_micro_units
+                    quote_balance_micro_units,
+                    futures_enabled,
+                    futures_position_side,
+                    futures_position_base_micro_units,
+                    futures_entry_price_micro_units,
+                    futures_margin_used_micro_units,
+                    futures_realized_pnl_micro_units
                 )
-                VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT(id) DO UPDATE SET
                     updated_at_ms = excluded.updated_at_ms,
                     base_currency = excluded.base_currency,
                     quote_currency = excluded.quote_currency,
                     base_balance_micro_units = excluded.base_balance_micro_units,
-                    quote_balance_micro_units = excluded.quote_balance_micro_units
+                    quote_balance_micro_units = excluded.quote_balance_micro_units,
+                    futures_enabled = excluded.futures_enabled,
+                    futures_position_side = excluded.futures_position_side,
+                    futures_position_base_micro_units = excluded.futures_position_base_micro_units,
+                    futures_entry_price_micro_units = excluded.futures_entry_price_micro_units,
+                    futures_margin_used_micro_units = excluded.futures_margin_used_micro_units,
+                    futures_realized_pnl_micro_units = excluded.futures_realized_pnl_micro_units
                 ",
                 params![
                     Self::now_ms()?,
@@ -593,6 +677,12 @@ impl Store for SqliteStore {
                     portfolio.quote_currency.as_str(),
                     portfolio.base_balance.micro_units(),
                     portfolio.quote_balance.micro_units(),
+                    if portfolio.futures_enabled { 1 } else { 0 },
+                    portfolio.futures_position_side.as_str(),
+                    portfolio.futures_position_base.micro_units(),
+                    portfolio.futures_entry_price.micro_units(),
+                    portfolio.futures_margin_used_quote.micro_units(),
+                    portfolio.futures_realized_pnl_quote.micro_units(),
                 ],
             )
             .map_err(|error| BotError::Storage(format!("failed to save portfolio: {error}")))?;

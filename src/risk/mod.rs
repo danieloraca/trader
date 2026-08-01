@@ -1,7 +1,8 @@
 use crate::config::RiskConfig;
+use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use crate::orders::OrderRequest;
-use crate::portfolio::Portfolio;
+use crate::portfolio::{FuturesPositionSide, Portfolio};
 use crate::strategy::{Signal, SignalIntent};
 use tracing::info;
 
@@ -31,19 +32,34 @@ impl RiskManager {
             )));
         }
 
-        if signal.intent == SignalIntent::IncreaseShort {
-            if !self.config.allow_short {
-                return Err(BotError::Risk(
-                    "signal rejected: short entries are disabled for this account".to_string(),
-                ));
-            }
+        if portfolio.futures_enabled {
+            self.approve_futures(signal, &request, portfolio)?;
+        } else {
+            self.approve_spot(signal, &request, portfolio)?;
+        }
 
-            if request.quantity_base > self.config.max_short_position_base {
-                return Err(BotError::Risk(format!(
-                    "signal rejected: short quantity {} exceeds max short {}",
-                    request.quantity_base, self.config.max_short_position_base
-                )));
-            }
+        info!(
+            symbol = %signal.symbol,
+            side = ?signal.side,
+            intent = ?signal.intent,
+            quantity_base = %signal.quantity_base,
+            price = %signal.price,
+            reason = %signal.reason,
+            "approved signal"
+        );
+        Ok(request)
+    }
+
+    fn approve_spot(
+        &self,
+        signal: &Signal,
+        request: &OrderRequest,
+        portfolio: &Portfolio,
+    ) -> Result<()> {
+        if signal.intent == SignalIntent::IncreaseShort {
+            return Err(BotError::Risk(
+                "signal rejected: short entries require futures mode".to_string(),
+            ));
         }
 
         if signal.intent == SignalIntent::IncreaseLong
@@ -65,16 +81,97 @@ impl RiskManager {
             )));
         }
 
-        info!(
-            symbol = %signal.symbol,
-            side = ?signal.side,
-            intent = ?signal.intent,
-            quantity_base = %signal.quantity_base,
-            price = %signal.price,
-            reason = %signal.reason,
-            "approved signal"
-        );
-        Ok(request)
+        Ok(())
+    }
+
+    fn approve_futures(
+        &self,
+        signal: &Signal,
+        request: &OrderRequest,
+        portfolio: &Portfolio,
+    ) -> Result<()> {
+        match signal.intent {
+            SignalIntent::IncreaseLong => {
+                let projected_long = match portfolio.futures_position_side {
+                    FuturesPositionSide::Long => {
+                        portfolio.futures_position_base + request.quantity_base
+                    }
+                    FuturesPositionSide::Short => {
+                        if request.quantity_base > portfolio.futures_position_base {
+                            request.quantity_base - portfolio.futures_position_base
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                    FuturesPositionSide::Flat => request.quantity_base,
+                };
+
+                if projected_long > self.config.max_position_base {
+                    return Err(BotError::Risk(format!(
+                        "signal rejected: resulting long position {} exceeds max {}",
+                        projected_long, self.config.max_position_base
+                    )));
+                }
+            }
+            SignalIntent::DecreaseLong => {
+                if portfolio.futures_position_side != FuturesPositionSide::Long {
+                    return Err(BotError::Risk(
+                        "signal rejected: no long futures position to reduce".to_string(),
+                    ));
+                }
+
+                if request.quantity_base > portfolio.futures_position_base {
+                    return Err(BotError::Risk(format!(
+                        "signal rejected: reduce-long quantity {} exceeds position {}",
+                        request.quantity_base, portfolio.futures_position_base
+                    )));
+                }
+            }
+            SignalIntent::IncreaseShort => {
+                if !self.config.allow_short {
+                    return Err(BotError::Risk(
+                        "signal rejected: short entries are disabled for this account".to_string(),
+                    ));
+                }
+
+                let projected_short = match portfolio.futures_position_side {
+                    FuturesPositionSide::Short => {
+                        portfolio.futures_position_base + request.quantity_base
+                    }
+                    FuturesPositionSide::Long => {
+                        if request.quantity_base > portfolio.futures_position_base {
+                            request.quantity_base - portfolio.futures_position_base
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                    FuturesPositionSide::Flat => request.quantity_base,
+                };
+
+                if projected_short > self.config.max_short_position_base {
+                    return Err(BotError::Risk(format!(
+                        "signal rejected: resulting short position {} exceeds max short {}",
+                        projected_short, self.config.max_short_position_base
+                    )));
+                }
+            }
+            SignalIntent::DecreaseShort => {
+                if portfolio.futures_position_side != FuturesPositionSide::Short {
+                    return Err(BotError::Risk(
+                        "signal rejected: no short futures position to reduce".to_string(),
+                    ));
+                }
+
+                if request.quantity_base > portfolio.futures_position_base {
+                    return Err(BotError::Risk(format!(
+                        "signal rejected: reduce-short quantity {} exceeds position {}",
+                        request.quantity_base, portfolio.futures_position_base
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -106,6 +203,14 @@ mod tests {
         portfolio
     }
 
+    fn futures_portfolio() -> Portfolio {
+        Portfolio::paper_futures(
+            "BTC",
+            "USD",
+            Decimal::from_f64(10_000.0).expect("decimal should parse"),
+        )
+    }
+
     fn signal(side: Side, quantity_base: f64, price: f64) -> Signal {
         Signal {
             symbol: "BTC-USD".to_string(),
@@ -122,12 +227,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_entry_when_shorting_is_disabled() {
+    fn rejects_short_entry_in_spot_mode() {
         let mut short_signal = signal(Side::Sell, 0.01, 100.0);
         short_signal.intent = SignalIntent::IncreaseShort;
 
         let error = risk_manager()
             .approve(&short_signal, &portfolio(0.0))
+            .expect_err("short signal should be rejected");
+
+        assert!(error.to_string().contains("short entries require futures"));
+    }
+
+    #[test]
+    fn rejects_futures_short_entry_when_shorting_is_disabled() {
+        let mut short_signal = signal(Side::Sell, 0.01, 100.0);
+        short_signal.intent = SignalIntent::IncreaseShort;
+
+        let error = risk_manager()
+            .approve(&short_signal, &futures_portfolio())
             .expect_err("short signal should be rejected");
 
         assert!(error.to_string().contains("short entries are disabled"));

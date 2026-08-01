@@ -7,6 +7,9 @@ paper_starting_quote_balance = 10000.0
 [exchange]
 kind = "paper"
 
+[exchange.paper_futures]
+leverage = 1.0
+
 [exchange.kraken]
 base_url = "https://api.kraken.com"
 pair = "XBTUSD"

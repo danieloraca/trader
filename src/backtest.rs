@@ -1,10 +1,10 @@
 use crate::candles::RecordedPrice;
-use crate::config::Config;
+use crate::config::{Config, ExchangeKind};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
 use crate::market::{MarketDataSource, ReplayMarketDataSource};
 use crate::orders::{OrderRequest, Side};
-use crate::portfolio::Portfolio;
+use crate::portfolio::{FuturesPositionSide, Portfolio};
 use crate::risk::RiskManager;
 use crate::strategy;
 use rusqlite::Connection;
@@ -61,6 +61,12 @@ struct SimulatedPortfolio {
     base_balance: Decimal,
     quote_balance: Decimal,
     cost_basis_quote: Decimal,
+    futures_enabled: bool,
+    futures_position_side: FuturesPositionSide,
+    futures_position_base: Decimal,
+    futures_entry_price: Decimal,
+    futures_margin_used_quote: Decimal,
+    futures_realized_pnl_quote: Decimal,
 }
 
 pub fn run(config: &Config) -> Result<BacktestReport> {
@@ -108,12 +114,26 @@ fn run_with_source(
         base_balance: Decimal::ZERO,
         quote_balance: config.bot.paper_starting_quote_balance,
         cost_basis_quote: Decimal::ZERO,
+        futures_enabled: config.exchange.kind == ExchangeKind::PaperFutures,
+        futures_position_side: FuturesPositionSide::Flat,
+        futures_position_base: Decimal::ZERO,
+        futures_entry_price: Decimal::ZERO,
+        futures_margin_used_quote: Decimal::ZERO,
+        futures_realized_pnl_quote: Decimal::ZERO,
     };
-    let mut risk_portfolio = Portfolio::new(
-        &config.bot.base_currency,
-        &config.bot.quote_currency,
-        config.bot.paper_starting_quote_balance,
-    );
+    let mut risk_portfolio = if config.exchange.kind == ExchangeKind::PaperFutures {
+        Portfolio::paper_futures(
+            &config.bot.base_currency,
+            &config.bot.quote_currency,
+            config.bot.paper_starting_quote_balance,
+        )
+    } else {
+        Portfolio::new(
+            &config.bot.base_currency,
+            &config.bot.quote_currency,
+            config.bot.paper_starting_quote_balance,
+        )
+    };
     let mut strategy = strategy::from_config(&config.strategy);
     let risk = RiskManager::new(config.risk.clone());
 
@@ -156,7 +176,7 @@ fn run_with_source(
         first_price.get_or_insert(event.price());
         last_price = Some(event.price());
 
-        if portfolio.base_balance > Decimal::ZERO {
+        if portfolio_is_exposed(&portfolio) {
             exposed_events += 1;
         }
 
@@ -178,6 +198,7 @@ fn run_with_source(
                 &order_request,
                 config.backtest.fee_bps,
                 config.backtest.slippage_bps,
+                config.exchange.paper_futures.leverage,
             ) {
                 Ok(mut trade) => {
                     report.filled_order_count += 1;
@@ -191,14 +212,17 @@ fn run_with_source(
                         Side::Buy => report.buy_count += 1,
                         Side::Sell => {
                             report.sell_count += 1;
-                            let trade_return_pct =
-                                trade.realized_pnl_quote.ratio_to(trade.gross_quote_value) * 100.0;
-                            trade_return_sum_pct += trade_return_pct;
-                            if trade.realized_pnl_quote > Decimal::ZERO {
-                                report.win_count += 1;
-                            } else if trade.realized_pnl_quote < Decimal::ZERO {
-                                report.loss_count += 1;
-                            }
+                        }
+                    }
+
+                    if trade.realized_pnl_quote != Decimal::ZERO {
+                        let trade_return_pct =
+                            trade.realized_pnl_quote.ratio_to(trade.gross_quote_value) * 100.0;
+                        trade_return_sum_pct += trade_return_pct;
+                        if trade.realized_pnl_quote > Decimal::ZERO {
+                            report.win_count += 1;
+                        } else {
+                            report.loss_count += 1;
                         }
                     }
 
@@ -211,6 +235,12 @@ fn run_with_source(
 
         risk_portfolio.base_balance = portfolio.base_balance;
         risk_portfolio.quote_balance = portfolio.quote_balance;
+        risk_portfolio.futures_enabled = portfolio.futures_enabled;
+        risk_portfolio.futures_position_side = portfolio.futures_position_side;
+        risk_portfolio.futures_position_base = portfolio.futures_position_base;
+        risk_portfolio.futures_entry_price = portfolio.futures_entry_price;
+        risk_portfolio.futures_margin_used_quote = portfolio.futures_margin_used_quote;
+        risk_portfolio.futures_realized_pnl_quote = portfolio.futures_realized_pnl_quote;
 
         let value = portfolio_value(&portfolio, event.price());
         if value > peak_value {
@@ -228,7 +258,7 @@ fn run_with_source(
         BotError::Config("backtest requires at least one replay price".to_string())
     })?;
     let last_price = last_price.expect("last price should exist when first price exists");
-    report.final_base_balance = portfolio.base_balance;
+    report.final_base_balance = final_base_balance(&portfolio);
     report.final_quote_balance = portfolio.quote_balance;
     report.final_value_quote = portfolio_value(&portfolio, last_price);
     report.profit_loss_quote = report.final_value_quote - report.initial_value_quote;
@@ -325,6 +355,7 @@ fn fill_order(
     request: &OrderRequest,
     fee_bps: i64,
     slippage_bps: i64,
+    futures_leverage: Decimal,
 ) -> Result<TradeRecord> {
     let slippage = bps_value(request.limit_price, slippage_bps);
     let fill_price = match request.side {
@@ -334,6 +365,18 @@ fn fill_order(
     let gross_quote_value = request.quantity_base * fill_price;
     let fee_quote = bps_value(gross_quote_value, fee_bps);
     let slippage_quote = request.quantity_base * slippage;
+
+    if portfolio.futures_enabled {
+        return fill_futures_order(
+            portfolio,
+            request,
+            fill_price,
+            gross_quote_value,
+            fee_quote,
+            slippage_quote,
+            futures_leverage,
+        );
+    }
 
     let realized_pnl_quote = match request.side {
         Side::Buy => {
@@ -381,7 +424,195 @@ fn fill_order(
 }
 
 fn portfolio_value(portfolio: &SimulatedPortfolio, price: Decimal) -> Decimal {
-    portfolio.quote_balance + (portfolio.base_balance * price)
+    if portfolio.futures_enabled {
+        portfolio.quote_balance + futures_unrealized_pnl(portfolio, price)
+    } else {
+        portfolio.quote_balance + (portfolio.base_balance * price)
+    }
+}
+
+fn fill_futures_order(
+    portfolio: &mut SimulatedPortfolio,
+    request: &OrderRequest,
+    fill_price: Decimal,
+    gross_quote_value: Decimal,
+    fee_quote: Decimal,
+    slippage_quote: Decimal,
+    futures_leverage: Decimal,
+) -> Result<TradeRecord> {
+    let realized_pnl_quote = match (portfolio.futures_position_side, request.side) {
+        (FuturesPositionSide::Flat, Side::Buy) => {
+            open_futures_position(
+                portfolio,
+                FuturesPositionSide::Long,
+                request.quantity_base,
+                fill_price,
+            );
+            Decimal::ZERO
+        }
+        (FuturesPositionSide::Flat, Side::Sell) => {
+            open_futures_position(
+                portfolio,
+                FuturesPositionSide::Short,
+                request.quantity_base,
+                fill_price,
+            );
+            Decimal::ZERO
+        }
+        (FuturesPositionSide::Long, Side::Buy) | (FuturesPositionSide::Short, Side::Sell) => {
+            increase_futures_position(portfolio, request.quantity_base, fill_price);
+            Decimal::ZERO
+        }
+        (FuturesPositionSide::Long, Side::Sell) => {
+            reduce_or_flip_long(portfolio, request.quantity_base, fill_price)
+        }
+        (FuturesPositionSide::Short, Side::Buy) => {
+            reduce_or_flip_short(portfolio, request.quantity_base, fill_price)
+        }
+    };
+
+    portfolio.quote_balance -= fee_quote;
+    portfolio.futures_realized_pnl_quote += realized_pnl_quote - fee_quote;
+    portfolio.futures_margin_used_quote = futures_margin_used(portfolio, futures_leverage);
+
+    if portfolio.futures_margin_used_quote > portfolio.quote_balance {
+        return Err(BotError::Risk(format!(
+            "backtest rejected: futures margin {} exceeds equity {}",
+            portfolio.futures_margin_used_quote, portfolio.quote_balance
+        )));
+    }
+
+    Ok(TradeRecord {
+        event_index: 0,
+        side: request.side,
+        quantity_base: request.quantity_base,
+        signal_price: request.limit_price,
+        fill_price,
+        gross_quote_value,
+        fee_quote,
+        slippage_quote,
+        equity_after: Decimal::ZERO,
+        realized_pnl_quote: realized_pnl_quote - fee_quote,
+        reason: String::new(),
+    })
+}
+
+fn open_futures_position(
+    portfolio: &mut SimulatedPortfolio,
+    side: FuturesPositionSide,
+    quantity: Decimal,
+    entry_price: Decimal,
+) {
+    portfolio.futures_position_side = side;
+    portfolio.futures_position_base = quantity;
+    portfolio.futures_entry_price = entry_price;
+}
+
+fn increase_futures_position(
+    portfolio: &mut SimulatedPortfolio,
+    quantity: Decimal,
+    price: Decimal,
+) {
+    let old_notional = portfolio.futures_position_base * portfolio.futures_entry_price;
+    let new_notional = quantity * price;
+    let new_quantity = portfolio.futures_position_base + quantity;
+    portfolio.futures_entry_price = (old_notional + new_notional) / new_quantity;
+    portfolio.futures_position_base = new_quantity;
+}
+
+fn reduce_or_flip_long(
+    portfolio: &mut SimulatedPortfolio,
+    quantity: Decimal,
+    price: Decimal,
+) -> Decimal {
+    let close_quantity = min_decimal(quantity, portfolio.futures_position_base);
+    let realized = (price - portfolio.futures_entry_price) * close_quantity;
+    portfolio.quote_balance += realized;
+
+    if quantity < portfolio.futures_position_base {
+        portfolio.futures_position_base -= quantity;
+        return realized;
+    }
+
+    let remainder = quantity - close_quantity;
+    clear_futures_position(portfolio);
+    if remainder > Decimal::ZERO {
+        open_futures_position(portfolio, FuturesPositionSide::Short, remainder, price);
+    }
+    realized
+}
+
+fn reduce_or_flip_short(
+    portfolio: &mut SimulatedPortfolio,
+    quantity: Decimal,
+    price: Decimal,
+) -> Decimal {
+    let close_quantity = min_decimal(quantity, portfolio.futures_position_base);
+    let realized = (portfolio.futures_entry_price - price) * close_quantity;
+    portfolio.quote_balance += realized;
+
+    if quantity < portfolio.futures_position_base {
+        portfolio.futures_position_base -= quantity;
+        return realized;
+    }
+
+    let remainder = quantity - close_quantity;
+    clear_futures_position(portfolio);
+    if remainder > Decimal::ZERO {
+        open_futures_position(portfolio, FuturesPositionSide::Long, remainder, price);
+    }
+    realized
+}
+
+fn clear_futures_position(portfolio: &mut SimulatedPortfolio) {
+    portfolio.futures_position_side = FuturesPositionSide::Flat;
+    portfolio.futures_position_base = Decimal::ZERO;
+    portfolio.futures_entry_price = Decimal::ZERO;
+    portfolio.futures_margin_used_quote = Decimal::ZERO;
+}
+
+fn futures_margin_used(portfolio: &SimulatedPortfolio, leverage: Decimal) -> Decimal {
+    if portfolio.futures_position_side == FuturesPositionSide::Flat {
+        Decimal::ZERO
+    } else {
+        (portfolio.futures_position_base * portfolio.futures_entry_price) / leverage
+    }
+}
+
+fn futures_unrealized_pnl(portfolio: &SimulatedPortfolio, mark_price: Decimal) -> Decimal {
+    match portfolio.futures_position_side {
+        FuturesPositionSide::Flat => Decimal::ZERO,
+        FuturesPositionSide::Long => {
+            (mark_price - portfolio.futures_entry_price) * portfolio.futures_position_base
+        }
+        FuturesPositionSide::Short => {
+            (portfolio.futures_entry_price - mark_price) * portfolio.futures_position_base
+        }
+    }
+}
+
+fn portfolio_is_exposed(portfolio: &SimulatedPortfolio) -> bool {
+    if portfolio.futures_enabled {
+        portfolio.futures_position_side != FuturesPositionSide::Flat
+    } else {
+        portfolio.base_balance > Decimal::ZERO
+    }
+}
+
+fn final_base_balance(portfolio: &SimulatedPortfolio) -> Decimal {
+    if !portfolio.futures_enabled {
+        return portfolio.base_balance;
+    }
+
+    match portfolio.futures_position_side {
+        FuturesPositionSide::Flat => Decimal::ZERO,
+        FuturesPositionSide::Long => portfolio.futures_position_base,
+        FuturesPositionSide::Short => Decimal::ZERO - portfolio.futures_position_base,
+    }
+}
+
+fn min_decimal(lhs: Decimal, rhs: Decimal) -> Decimal {
+    if lhs <= rhs { lhs } else { rhs }
 }
 
 fn bps_value(value: Decimal, bps: i64) -> Decimal {

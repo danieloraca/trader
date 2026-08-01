@@ -1,8 +1,10 @@
 mod kraken;
 mod paper;
+mod paper_futures;
 
 pub use kraken::KrakenExchange;
 pub use paper::PaperExchange;
+pub use paper_futures::PaperFuturesExchange;
 
 use crate::error::Result;
 use crate::orders::{ExchangeOrder, OrderRequest};

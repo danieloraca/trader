@@ -57,6 +57,8 @@ pub struct ExchangeConfig {
     pub kind: ExchangeKind,
     #[serde(default)]
     pub kraken: KrakenConfig,
+    #[serde(default)]
+    pub paper_futures: PaperFuturesConfig,
 }
 
 impl Default for ExchangeConfig {
@@ -64,20 +66,36 @@ impl Default for ExchangeConfig {
         Self {
             kind: ExchangeKind::Paper,
             kraken: KrakenConfig::default(),
+            paper_futures: PaperFuturesConfig::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ExchangeKind {
     Paper,
+    PaperFutures,
     Kraken,
 }
 
 impl Default for ExchangeKind {
     fn default() -> Self {
         Self::Paper
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaperFuturesConfig {
+    #[serde(default = "default_paper_futures_leverage")]
+    pub leverage: Decimal,
+}
+
+impl Default for PaperFuturesConfig {
+    fn default() -> Self {
+        Self {
+            leverage: default_paper_futures_leverage(),
+        }
     }
 }
 
@@ -432,6 +450,14 @@ impl Config {
             }
         }
 
+        if self.exchange.kind == ExchangeKind::PaperFutures
+            && self.exchange.paper_futures.leverage <= Decimal::ZERO
+        {
+            return Err(BotError::Config(
+                "paper futures leverage must be positive".to_string(),
+            ));
+        }
+
         if self.market_data.kind == MarketDataKind::Replay
             && self.market_data.replay_prices.is_empty()
         {
@@ -685,6 +711,10 @@ fn default_kraken_api_key_env() -> String {
 
 fn default_kraken_api_secret_env() -> String {
     "KRAKEN_API_SECRET".to_string()
+}
+
+fn default_paper_futures_leverage() -> Decimal {
+    Decimal::from_micro_units(1_000_000)
 }
 
 fn default_kraken_ticker_poll_interval_ms() -> u64 {
