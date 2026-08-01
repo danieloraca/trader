@@ -1,7 +1,8 @@
 use crate::config::RsiMeanReversionConfig;
 use crate::decimal::Decimal;
 use crate::market::MarketEvent;
-use crate::strategy::{Signal, Strategy, bearish_signal, bullish_signal};
+use crate::portfolio::{FuturesPositionSide, Portfolio};
+use crate::strategy::{Signal, SignalIntent, Strategy, bearish_signal, bullish_signal};
 use std::collections::VecDeque;
 
 pub struct RsiMeanReversionStrategy {
@@ -25,10 +26,8 @@ impl RsiMeanReversionStrategy {
             previous_zone: RsiZone::Neutral,
         }
     }
-}
 
-impl Strategy for RsiMeanReversionStrategy {
-    fn on_market_event(&mut self, event: &MarketEvent) -> Vec<Signal> {
+    fn evaluate(&mut self, event: &MarketEvent, portfolio: Option<&Portfolio>) -> Vec<Signal> {
         self.closes.push_back(event.price());
         while self.closes.len() > self.config.window + 1 {
             self.closes.pop_front();
@@ -69,10 +68,59 @@ impl Strategy for RsiMeanReversionStrategy {
                 ),
             ),
             _ => None,
-        };
+        }
+        .and_then(|signal| self.apply_position_cap(signal, portfolio));
 
         self.previous_zone = zone;
         signal.into_iter().collect()
+    }
+
+    fn apply_position_cap(
+        &self,
+        mut signal: Signal,
+        portfolio: Option<&Portfolio>,
+    ) -> Option<Signal> {
+        let (Some(max_tranches), Some(portfolio)) = (self.config.max_tranches, portfolio) else {
+            return Some(signal);
+        };
+
+        let increases_existing_side = matches!(
+            (signal.intent, portfolio.futures_position_side),
+            (SignalIntent::IncreaseLong, FuturesPositionSide::Long)
+                | (SignalIntent::IncreaseShort, FuturesPositionSide::Short)
+        );
+        if !increases_existing_side {
+            return Some(signal);
+        }
+
+        let tranche_multiplier = i64::try_from(max_tranches).unwrap_or(i64::MAX);
+        let max_position = Decimal::from_micro_units(
+            self.config
+                .quantity_base
+                .micro_units()
+                .saturating_mul(tranche_multiplier),
+        );
+        let remaining = max_position - portfolio.futures_position_base;
+        if remaining <= Decimal::ZERO {
+            return None;
+        }
+
+        signal.quantity_base = signal.quantity_base.min(remaining);
+        Some(signal)
+    }
+}
+
+impl Strategy for RsiMeanReversionStrategy {
+    fn on_market_event(&mut self, event: &MarketEvent) -> Vec<Signal> {
+        self.evaluate(event, None)
+    }
+
+    fn on_market_event_with_portfolio(
+        &mut self,
+        event: &MarketEvent,
+        portfolio: &Portfolio,
+    ) -> Vec<Signal> {
+        self.evaluate(event, Some(portfolio))
     }
 }
 
@@ -107,7 +155,8 @@ mod tests {
     use crate::decimal::Decimal;
     use crate::market::{MarketEvent, PriceTick};
     use crate::orders::Side;
-    use crate::strategy::Strategy;
+    use crate::portfolio::{FuturesPositionSide, Portfolio};
+    use crate::strategy::{SignalIntent, Strategy};
 
     fn decimal(value: &str) -> Decimal {
         Decimal::from_decimal_str(value).expect("decimal should parse")
@@ -123,8 +172,25 @@ mod tests {
             oversold_threshold: 30,
             overbought_threshold: 70,
             quantity_base: decimal("0.001"),
+            max_tranches: None,
             direction: StrategyDirection::LongOnly,
         })
+    }
+
+    fn long_position(quantity: &str) -> Portfolio {
+        let mut portfolio = Portfolio::paper_futures("BTC", "USD", decimal("10000"));
+        portfolio.futures_position_side = FuturesPositionSide::Long;
+        portfolio.futures_position_base = decimal(quantity);
+        portfolio.futures_entry_price = decimal("100");
+        portfolio
+    }
+
+    fn short_position(quantity: &str) -> Portfolio {
+        let mut portfolio = Portfolio::paper_futures("BTC", "USD", decimal("10000"));
+        portfolio.futures_position_side = FuturesPositionSide::Short;
+        portfolio.futures_position_base = decimal(quantity);
+        portfolio.futures_entry_price = decimal("100");
+        portfolio
     }
 
     #[test]
@@ -162,5 +228,69 @@ mod tests {
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].side, Side::Sell);
         assert!(signals[0].reason.contains("overbought"));
+    }
+
+    #[test]
+    fn capped_rsi_blocks_same_side_entry_at_cap() {
+        let mut strategy = strategy();
+        strategy.config.direction = StrategyDirection::LongShort;
+        strategy.config.max_tranches = Some(4);
+        let portfolio = long_position("0.004");
+        for price in ["100", "99", "98"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &portfolio);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("97"), &portfolio);
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn capped_rsi_blocks_short_entry_at_cap() {
+        let mut strategy = strategy();
+        strategy.config.direction = StrategyDirection::LongShort;
+        strategy.config.max_tranches = Some(4);
+        let portfolio = short_position("0.004");
+        for price in ["100", "101", "102"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &portfolio);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &portfolio);
+
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn capped_rsi_fills_only_remaining_capacity() {
+        let mut strategy = strategy();
+        strategy.config.direction = StrategyDirection::LongShort;
+        strategy.config.max_tranches = Some(4);
+        let portfolio = long_position("0.0035");
+        for price in ["100", "99", "98"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &portfolio);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("97"), &portfolio);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::IncreaseLong);
+        assert_eq!(signals[0].quantity_base, decimal("0.0005"));
+    }
+
+    #[test]
+    fn capped_rsi_preserves_opposite_signal_quantity() {
+        let mut strategy = strategy();
+        strategy.config.direction = StrategyDirection::LongShort;
+        strategy.config.max_tranches = Some(4);
+        let portfolio = long_position("0.004");
+        for price in ["100", "101", "102"] {
+            strategy.on_market_event_with_portfolio(&tick(price), &portfolio);
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &portfolio);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::IncreaseShort);
+        assert_eq!(signals[0].quantity_base, decimal("0.001"));
     }
 }

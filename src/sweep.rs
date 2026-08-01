@@ -18,6 +18,7 @@ const SLOW_WINDOWS: [usize; 4] = [15, 30, 60, 120];
 const RSI_WINDOWS: [usize; 3] = [7, 14, 21];
 const RSI_OVERSOLD_THRESHOLDS: [u8; 3] = [25, 30, 35];
 const RSI_OVERBOUGHT_THRESHOLDS: [u8; 3] = [65, 70, 75];
+const CAPPED_RSI_TRANCHE_CAPS: [usize; 3] = [4, 8, 16];
 const RSI_REGIME_WINDOWS: [usize; 2] = [60, 120];
 const RSI_EXIT_PROFILES: [RsiExitProfile; 3] = [
     RsiExitProfile::new("tight", 100, 60, 12),
@@ -45,6 +46,11 @@ const MAX_CANDLE_SWEEP_COMBINATIONS: usize = CANDLE_INTERVAL_SECONDS.len()
         + (RSI_WINDOWS.len()
             * RSI_OVERSOLD_THRESHOLDS.len()
             * RSI_OVERBOUGHT_THRESHOLDS.len()
+            * CANDLE_QUANTITY_MICRO_UNITS.len())
+        + (RSI_WINDOWS.len()
+            * RSI_OVERSOLD_THRESHOLDS.len()
+            * RSI_OVERBOUGHT_THRESHOLDS.len()
+            * CAPPED_RSI_TRANCHE_CAPS.len()
             * CANDLE_QUANTITY_MICRO_UNITS.len())
         + (RSI_WINDOWS.len()
             * RSI_OVERSOLD_THRESHOLDS.len()
@@ -335,6 +341,12 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                 skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
                     * RSI_OVERBOUGHT_THRESHOLDS.len()
                     * CANDLE_QUANTITY_MICRO_UNITS.len();
+                if config.exchange.kind == ExchangeKind::PaperFutures {
+                    skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
+                        * RSI_OVERBOUGHT_THRESHOLDS.len()
+                        * CAPPED_RSI_TRANCHE_CAPS.len()
+                        * CANDLE_QUANTITY_MICRO_UNITS.len();
+                }
                 continue;
             }
 
@@ -354,6 +366,7 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                             overbought_threshold;
                         candidate.strategy.rsi_mean_reversion.quantity_base =
                             Decimal::from_micro_units(quantity_micro_units);
+                        candidate.strategy.rsi_mean_reversion.max_tranches = None;
                         candidate.backtest.trade_log_csv_path = None;
 
                         let train_report =
@@ -377,6 +390,43 @@ pub fn run_candles(config: &Config, sqlite_path: &str) -> Result<CandleSweepRepo
                                 .expect("train closes should not be empty"),
                             *test_closes.last().expect("test closes should not be empty"),
                         ));
+
+                        if config.exchange.kind == ExchangeKind::PaperFutures {
+                            for max_tranches in CAPPED_RSI_TRANCHE_CAPS {
+                                let mut capped_candidate = candidate.clone();
+                                capped_candidate.strategy.rsi_mean_reversion.max_tranches =
+                                    Some(max_tranches);
+                                let capped_train_report = backtest::run_from_prices(
+                                    &capped_candidate,
+                                    train_closes.clone(),
+                                )?;
+                                let capped_test_report = backtest::run_from_prices(
+                                    &capped_candidate,
+                                    test_closes.clone(),
+                                )?;
+                                results.push(CandleSweepResult::from_report(
+                                    "capped_rsi",
+                                    &format!(
+                                        "{rsi_window}:{oversold_threshold}/{overbought_threshold}/x{max_tranches}"
+                                    ),
+                                    interval_seconds,
+                                    candles.len(),
+                                    train_closes.len(),
+                                    test_closes.len(),
+                                    rsi_window,
+                                    0,
+                                    Decimal::from_micro_units(quantity_micro_units),
+                                    &capped_train_report,
+                                    &capped_test_report,
+                                    *train_closes
+                                        .last()
+                                        .expect("train closes should not be empty"),
+                                    *test_closes
+                                        .last()
+                                        .expect("test closes should not be empty"),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -727,6 +777,13 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                     * RSI_OVERBOUGHT_THRESHOLDS.len()
                     * CANDLE_QUANTITY_MICRO_UNITS.len()
                     * cost_profile_count;
+                if config.exchange.kind == ExchangeKind::PaperFutures {
+                    skipped_under_warmed_count += RSI_OVERSOLD_THRESHOLDS.len()
+                        * RSI_OVERBOUGHT_THRESHOLDS.len()
+                        * CAPPED_RSI_TRANCHE_CAPS.len()
+                        * CANDLE_QUANTITY_MICRO_UNITS.len()
+                        * cost_profile_count;
+                }
                 continue;
             }
 
@@ -748,6 +805,24 @@ pub fn run_walk_forward(config: &Config, sqlite_path: &str) -> Result<WalkForwar
                             0,
                             Decimal::from_micro_units(quantity_micro_units),
                         )?);
+
+                        if config.exchange.kind == ExchangeKind::PaperFutures {
+                            for max_tranches in CAPPED_RSI_TRANCHE_CAPS {
+                                results.extend(walk_forward_strategy_results(
+                                    config,
+                                    "capped_rsi",
+                                    &format!(
+                                        "{rsi_window}:{oversold_threshold}/{overbought_threshold}/x{max_tranches}"
+                                    ),
+                                    interval_seconds,
+                                    &candle_closes,
+                                    plan,
+                                    rsi_window,
+                                    0,
+                                    Decimal::from_micro_units(quantity_micro_units),
+                                )?);
+                            }
+                        }
                     }
                 }
             }
@@ -1089,10 +1164,15 @@ fn walk_forward_strategy_count(config: &Config) -> usize {
         * MANAGED_RSI_COOLDOWN_EVENTS.len()
         * MANAGED_RSI_SWEEP_VARIANTS.len()
         * CANDLE_QUANTITY_MICRO_UNITS.len();
+    let capped_rsi_count = RSI_WINDOWS.len()
+        * RSI_OVERSOLD_THRESHOLDS.len()
+        * RSI_OVERBOUGHT_THRESHOLDS.len()
+        * CAPPED_RSI_TRANCHE_CAPS.len()
+        * CANDLE_QUANTITY_MICRO_UNITS.len();
 
     base_count
         + if config.exchange.kind == ExchangeKind::PaperFutures {
-            managed_rsi_count
+            managed_rsi_count + capped_rsi_count
         } else {
             0
         }
@@ -1344,6 +1424,17 @@ fn strategy_candle_result(
             candidate.strategy.rsi_mean_reversion.oversold_threshold = oversold_threshold;
             candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
             candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
+            candidate.strategy.rsi_mean_reversion.max_tranches = None;
+        }
+        "capped_rsi" => {
+            let (window, oversold_threshold, overbought_threshold, max_tranches) =
+                parse_capped_rsi_parameter_summary(parameter_summary)?;
+            candidate.strategy.kind = StrategyKind::RsiMeanReversion;
+            candidate.strategy.rsi_mean_reversion.window = window;
+            candidate.strategy.rsi_mean_reversion.oversold_threshold = oversold_threshold;
+            candidate.strategy.rsi_mean_reversion.overbought_threshold = overbought_threshold;
+            candidate.strategy.rsi_mean_reversion.quantity_base = quantity_base;
+            candidate.strategy.rsi_mean_reversion.max_tranches = Some(max_tranches);
         }
         "managed_rsi" | "managed_rsi_opp" => {
             let (window, oversold_threshold, overbought_threshold, exit_profile, cooldown_events) =
@@ -1464,6 +1555,27 @@ fn parse_rsi_parameter_summary(parameter_summary: &str) -> Result<(usize, u8, u8
     })?;
 
     Ok((window, oversold, overbought))
+}
+
+fn parse_capped_rsi_parameter_summary(parameter_summary: &str) -> Result<(usize, u8, u8, usize)> {
+    let Some((rsi_summary, tranche_label)) = parameter_summary.rsplit_once("/x") else {
+        return Err(BotError::Config(format!(
+            "invalid capped RSI parameter summary: {parameter_summary}"
+        )));
+    };
+    let max_tranches = tranche_label.parse::<usize>().map_err(|error| {
+        BotError::Config(format!(
+            "invalid capped RSI tranche cap in parameter summary {parameter_summary}: {error}"
+        ))
+    })?;
+    if !CAPPED_RSI_TRANCHE_CAPS.contains(&max_tranches) {
+        return Err(BotError::Config(format!(
+            "unsupported capped RSI tranche cap in parameter summary: {parameter_summary}"
+        )));
+    }
+
+    let (window, oversold, overbought) = parse_rsi_parameter_summary(rsi_summary)?;
+    Ok((window, oversold, overbought, max_tranches))
 }
 
 fn parse_rsi_regime_parameter_summary(
@@ -2947,11 +3059,11 @@ mod tests {
     }
 
     #[test]
-    fn futures_walk_forward_counts_scaled_rsi_variants() {
+    fn futures_walk_forward_counts_capped_and_scaled_rsi_variants() {
         let mut config = config();
         config.exchange.kind = ExchangeKind::PaperFutures;
 
-        assert_eq!(walk_forward_strategy_count(&config), 2_568);
+        assert_eq!(walk_forward_strategy_count(&config), 2_811);
     }
 
     #[test]
@@ -3016,6 +3128,34 @@ mod tests {
 
         assert_eq!(scaled_result.strategy_kind, "scaled_rsi");
         assert_eq!(scaled_result.parameter_summary, "3:30/70@wide/cd1/x3");
+    }
+
+    #[test]
+    fn reconstructs_capped_rsi_for_walk_forward_windows() {
+        let mut config = config();
+        config.exchange.kind = ExchangeKind::PaperFutures;
+        config.risk.allow_short = true;
+        config.risk.max_short_position_base = decimal("0.25");
+        config.strategy.rsi_mean_reversion.direction = StrategyDirection::LongShort;
+        let train = ["100", "99", "98", "97", "99", "101", "102", "100"].map(decimal);
+        let test = ["100", "101", "102", "103", "101", "99", "98", "100"].map(decimal);
+
+        let (result, _) = strategy_candle_result(
+            &config,
+            "capped_rsi",
+            "3:30/70/x8",
+            60,
+            train.len() + test.len(),
+            &train,
+            &test,
+            3,
+            0,
+            decimal("0.0005"),
+        )
+        .expect("capped RSI window should run");
+
+        assert_eq!(result.strategy_kind, "capped_rsi");
+        assert_eq!(result.parameter_summary, "3:30/70/x8");
     }
 
     #[test]

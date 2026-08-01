@@ -299,6 +299,8 @@ pub struct RsiMeanReversionConfig {
     #[serde(default = "default_rsi_quantity_base")]
     pub quantity_base: Decimal,
     #[serde(default)]
+    pub max_tranches: Option<usize>,
+    #[serde(default)]
     pub direction: StrategyDirection,
 }
 
@@ -385,6 +387,7 @@ impl Default for RsiMeanReversionConfig {
             oversold_threshold: default_rsi_oversold_threshold(),
             overbought_threshold: default_rsi_overbought_threshold(),
             quantity_base: default_rsi_quantity_base(),
+            max_tranches: None,
             direction: StrategyDirection::default(),
         }
     }
@@ -730,6 +733,20 @@ impl Config {
         if self.strategy.rsi_mean_reversion.quantity_base <= Decimal::ZERO {
             return Err(BotError::Config(
                 "RSI mean reversion quantity must be positive".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_mean_reversion.max_tranches == Some(0) {
+            return Err(BotError::Config(
+                "RSI mean reversion maximum tranches must be positive when configured".to_string(),
+            ));
+        }
+
+        if self.strategy.rsi_mean_reversion.max_tranches.is_some()
+            && self.exchange.kind != ExchangeKind::PaperFutures
+        {
+            return Err(BotError::Config(
+                "RSI mean reversion tranche cap requires the paper_futures exchange".to_string(),
             ));
         }
 
@@ -1239,6 +1256,7 @@ verbose = true
         assert_eq!(config.strategy.rsi_mean_reversion.window, 14);
         assert_eq!(config.strategy.rsi_mean_reversion.oversold_threshold, 30);
         assert_eq!(config.strategy.rsi_mean_reversion.overbought_threshold, 70);
+        assert_eq!(config.strategy.rsi_mean_reversion.max_tranches, None);
         assert_eq!(
             config.strategy.rsi_mean_reversion.quantity_base.to_string(),
             "0.001"
@@ -1350,6 +1368,38 @@ verbose = true
             error
                 .to_string()
                 .contains("managed RSI requires the paper_futures exchange")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_rsi_tranche_cap() {
+        let invalid_config = VALID_CONFIG.replace(
+            "quantity_base = 0.001\ndirection = \"long_only\"\n\n[strategy.breakout]",
+            "quantity_base = 0.001\nmax_tranches = 0\ndirection = \"long_only\"\n\n[strategy.breakout]",
+        );
+
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("RSI mean reversion maximum tranches must be positive")
+        );
+    }
+
+    #[test]
+    fn rejects_rsi_tranche_cap_with_spot_exchange() {
+        let invalid_config = VALID_CONFIG.replace(
+            "quantity_base = 0.001\ndirection = \"long_only\"\n\n[strategy.breakout]",
+            "quantity_base = 0.001\nmax_tranches = 4\ndirection = \"long_only\"\n\n[strategy.breakout]",
+        );
+
+        let error = Config::from_toml_str(&invalid_config).expect_err("config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("tranche cap requires the paper_futures exchange")
         );
     }
 
