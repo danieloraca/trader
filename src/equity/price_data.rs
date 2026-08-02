@@ -60,6 +60,7 @@ pub struct DailyPriceData {
     pub kind: DailyPriceKind,
     pub input_format: InputFormat,
     pub price_column: String,
+    pub skipped_missing_price_rows: usize,
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<DailyPriceData> {
@@ -165,12 +166,15 @@ fn parse_table(
     input_format: InputFormat,
 ) -> Result<DailyPriceData> {
     let mut bars = Vec::new();
+    let mut skipped_missing_price_rows = 0;
     for (row_number, row) in rows {
         if row.iter().all(|value| value.trim().is_empty()) {
             continue;
         }
-        if let Some(bar) = columns.parse_row(&row, row_number)? {
-            bars.push(bar);
+        match columns.parse_row(&row, row_number)? {
+            ParsedRow::Bar(bar) => bars.push(bar),
+            ParsedRow::MissingSelectedPrice => skipped_missing_price_rows += 1,
+            ParsedRow::Ignore => {}
         }
     }
 
@@ -186,6 +190,7 @@ fn parse_table(
         kind: columns.kind,
         input_format,
         price_column: columns.price_column,
+        skipped_missing_price_rows,
     })
 }
 
@@ -218,6 +223,12 @@ struct Columns {
     volume: Option<usize>,
     kind: DailyPriceKind,
     price_column: String,
+}
+
+enum ParsedRow {
+    Bar(DailyBar),
+    MissingSelectedPrice,
+    Ignore,
 }
 
 impl Columns {
@@ -262,15 +273,26 @@ impl Columns {
         })
     }
 
-    fn parse_row(&self, row: &[String], row_number: usize) -> Result<Option<DailyBar>> {
+    fn parse_row(&self, row: &[String], row_number: usize) -> Result<ParsedRow> {
         let date_value = field(row, self.date).unwrap_or_default().trim();
         if date_value.is_empty() {
-            return Ok(None);
+            return Ok(ParsedRow::Ignore);
         }
         let date = parse_date(date_value).map_err(|message| {
             BotError::MarketData(format!("invalid date at price row {row_number}: {message}"))
         })?;
-        let close = decimal_field(row, self.close, &self.price_column, row_number)?;
+        let close = match field(row, self.close).filter(|value| !value.trim().is_empty()) {
+            Some(value) => parse_decimal(value, &self.price_column, row_number)?,
+            None if self.kind == DailyPriceKind::CloseOnly => {
+                return Ok(ParsedRow::MissingSelectedPrice);
+            }
+            None => {
+                return Err(BotError::MarketData(format!(
+                    "missing {} at price row {row_number}",
+                    self.price_column
+                )));
+            }
+        };
         let (open, high, low) = if self.kind == DailyPriceKind::Ohlcv {
             (
                 decimal_field(
@@ -326,7 +348,7 @@ impl Columns {
             )));
         }
 
-        Ok(Some(DailyBar {
+        Ok(ParsedRow::Bar(DailyBar {
             date,
             date_text: date.to_string(),
             open,
@@ -521,15 +543,16 @@ mod tests {
     fn loads_vanguard_style_close_prices_and_reverses_descending_dates() {
         let path = write_csv(
             "trader-vanguard-equity.csv",
-            "Date,NAV (USD),Market price (GBP)\n31 Jul 2026,US$188.7980,£139.1600\n30 Jul 2026,US$186.5467,£138.7800\n29 Jul 2026,US$183.8182,£139.0600\n",
+            "Date,NAV (USD),Market price (GBP)\n31 Jul 2026,US$188.7980,£139.1600\n30 Jul 2026,US$186.5467,\n29 Jul 2026,US$183.8182,£139.0600\n28 Jul 2026,US$185.9226,£140.2000\n",
         );
 
         let data = load(&path).expect("close-only CSV should load");
 
         assert_eq!(data.kind, DailyPriceKind::CloseOnly);
         assert_eq!(data.price_column, "Market price (GBP)");
-        assert_eq!(data.bars[0].date_text, "2026-07-29");
-        assert_eq!(data.bars[0].close.to_string(), "139.06");
+        assert_eq!(data.skipped_missing_price_rows, 1);
+        assert_eq!(data.bars[0].date_text, "2026-07-28");
+        assert_eq!(data.bars[1].close.to_string(), "139.06");
         assert_eq!(data.bars[2].close.to_string(), "139.16");
         fs::remove_file(path).expect("CSV should remove");
     }

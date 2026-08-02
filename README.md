@@ -14,7 +14,7 @@ target/release/trader \
   --backtest-equity data/vwrp-history.xlsx
 ```
 
-The spreadsheet importer finds the header row, selects `Market price (GBP)` ahead of the USD NAV, accepts Vanguard's displayed date format and currency symbols, and reverses newest-first files into chronological order.
+The spreadsheet importer finds the header row, selects `Market price (GBP)` ahead of the USD NAV, accepts Vanguard's displayed date format and currency symbols, and reverses newest-first files into chronological order. Rows without a GBP market price, such as London market holidays where Vanguard only publishes a USD NAV, are omitted and counted in the report.
 
 Other providers can supply a comma-separated file with daily rows:
 

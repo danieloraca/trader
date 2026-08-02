@@ -17,6 +17,7 @@ pub struct EquityResearchReport {
     data_kind: DailyPriceKind,
     input_format: InputFormat,
     price_column: String,
+    skipped_missing_price_rows: usize,
     annual_trading_days: usize,
     initial_cash: Decimal,
     commission_per_order: Decimal,
@@ -111,6 +112,7 @@ pub fn run(config: &EquityResearchConfig, data: &DailyPriceData) -> Result<Equit
         data_kind: data.kind,
         input_format: data.input_format,
         price_column: data.price_column.clone(),
+        skipped_missing_price_rows: data.skipped_missing_price_rows,
         annual_trading_days: config.annual_trading_days,
         initial_cash: config.initial_cash,
         commission_per_order: config.commission_per_order,
@@ -493,6 +495,13 @@ impl Display for EquityResearchReport {
             "Input: {} {}; valuation column: {}",
             self.input_format, self.data_kind, self.price_column
         )?;
+        if self.skipped_missing_price_rows > 0 {
+            writeln!(
+                formatter,
+                "Skipped rows: {} without {}",
+                self.skipped_missing_price_rows, self.price_column
+            )?;
+        }
         writeln!(
             formatter,
             "Volume coverage: {}/{} sessions",
@@ -646,6 +655,7 @@ mod tests {
             kind,
             input_format: InputFormat::Csv,
             price_column: "close".to_string(),
+            skipped_missing_price_rows: 0,
         }
     }
 
