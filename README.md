@@ -67,7 +67,7 @@ target/release/trader \
   --backtest-equity-portfolio
 ```
 
-Portfolio asset paths are resolved relative to the config file. Target weights use basis points and must total `10000`; for example, `7000` and `3000` represent 70% and 30%. Rebalances are scheduled monthly, quarterly, or yearly, decided from the previous common-session close, and executed on the next common session. A drift threshold avoids small trades. All inputs must represent prices in the configured portfolio currency because changing FX rates are not modeled.
+Portfolio asset paths are resolved relative to the config file. Target weights use basis points and must total `10000`; for example, `7000` and `3000` represent 70% and 30%. Set `monthly_contribution` to model regular deposits. New cash is invested into underweight assets first; scheduled monthly, quarterly, or yearly rebalancing only sells when the drift threshold is breached. Rebalances are decided from the previous common-session close and execute on the next common session. Net P/L excludes deposits, while return, CAGR, volatility, Sharpe, and drawdown use a time-weighted cash-flow-adjusted curve. All inputs must represent prices in the configured portfolio currency because changing FX rates are not modeled.
 
 Compare allocation weights and rebalance policies over rolling, non-overlapping held-out periods:
 

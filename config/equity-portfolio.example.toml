@@ -2,6 +2,7 @@
 name = "70/30 equity-bond demo"
 currency = "GBP"
 initial_cash = 10000.0
+monthly_contribution = 500.0
 
 commission_per_order = 3.0
 commission_bps = 0

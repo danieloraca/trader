@@ -21,6 +21,8 @@ struct PortfolioConfig {
     name: String,
     currency: String,
     initial_cash: Decimal,
+    #[serde(default)]
+    monthly_contribution: Decimal,
     #[serde(default = "default_commission_per_order")]
     commission_per_order: Decimal,
     #[serde(default)]
@@ -120,6 +122,8 @@ struct PortfolioState {
     fees: Decimal,
     friction: Decimal,
     equity_curve: Vec<Decimal>,
+    external_flows: Vec<Decimal>,
+    total_contributions: Decimal,
 }
 
 #[derive(Debug)]
@@ -132,7 +136,7 @@ struct PortfolioResult {
     volatility_pct: f64,
     sharpe_ratio: f64,
     max_drawdown_pct: f64,
-    versus_static_pct: f64,
+    versus_target_pct: f64,
     trade_count: usize,
     turnover_pct: f64,
     fees: Decimal,
@@ -144,6 +148,8 @@ pub struct EquityPortfolioReport {
     name: String,
     currency: String,
     initial_cash: Decimal,
+    monthly_contribution: Decimal,
+    contribution_count: usize,
     first_date: String,
     last_date: String,
     common_session_count: usize,
@@ -167,8 +173,10 @@ pub struct EquityPortfolioWalkForwardReport {
     train_sessions: usize,
     test_sessions: usize,
     step_sessions: usize,
+    monthly_contribution: Decimal,
     windows: Vec<PortfolioWindow>,
     results: Vec<PortfolioWalkForwardResult>,
+    window_details: Vec<PortfolioWindowDetail>,
 }
 
 struct PortfolioWindow {
@@ -192,6 +200,15 @@ struct PortfolioWalkForwardResult {
     average_turnover_pct: f64,
 }
 
+struct PortfolioWindowDetail {
+    window_number: usize,
+    allocation: String,
+    return_pct: f64,
+    versus_first_asset_pct: f64,
+    sharpe_ratio: f64,
+    max_drawdown_pct: f64,
+}
+
 struct AssetSummary {
     symbol: String,
     target_weight_bps: i64,
@@ -208,7 +225,7 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
     let sessions = align_sessions(&inputs)?;
 
     let mut results = Vec::new();
-    results.push(cash_result(&config, sessions.len()));
+    results.push(cash_result(&config, &sessions));
     for asset_index in 0..inputs.len() {
         results.push(simulate_single_asset(
             &config,
@@ -217,7 +234,9 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
             &inputs[asset_index].config.symbol,
         ));
     }
-    results.push(simulate_target_portfolio(&config, &sessions, None));
+    let target_result = simulate_target_portfolio(&config, &sessions, None);
+    let target_return = target_result.return_pct;
+    results.push(target_result);
     for frequency in &config.rebalance_frequencies {
         results.push(simulate_target_portfolio(
             &config,
@@ -226,13 +245,8 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
         ));
     }
 
-    let static_return = results
-        .iter()
-        .find(|result| result.name == "Static target")
-        .expect("static portfolio result should exist")
-        .return_pct;
     for result in &mut results {
-        result.versus_static_pct = result.return_pct - static_return;
+        result.versus_target_pct = result.return_pct - target_return;
     }
     results.sort_by(|left, right| right.return_pct.total_cmp(&left.return_pct));
 
@@ -252,6 +266,8 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
         name: config.name,
         currency: config.currency,
         initial_cash: config.initial_cash,
+        monthly_contribution: config.monthly_contribution,
+        contribution_count: contribution_count(&sessions),
         first_date: sessions[0].date_text.clone(),
         last_date: sessions[sessions.len() - 1].date_text.clone(),
         common_session_count: sessions.len(),
@@ -340,9 +356,13 @@ pub fn run_walk_forward(config_path: impl AsRef<Path>) -> Result<EquityPortfolio
             let window_count = evaluation_ranges.len() as f64;
             results.push(PortfolioWalkForwardResult {
                 allocation: allocation_label(allocation),
-                policy: frequency
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "Static".to_string()),
+                policy: frequency.map(|value| value.to_string()).unwrap_or_else(|| {
+                    if config.monthly_contribution > Decimal::ZERO {
+                        "Buy-only".to_string()
+                    } else {
+                        "Static".to_string()
+                    }
+                }),
                 average_train_return_pct: average(&train_returns),
                 average_return_pct: average(&returns),
                 worst_return_pct: returns.iter().copied().fold(f64::INFINITY, f64::min),
@@ -361,6 +381,25 @@ pub fn run_walk_forward(config_path: impl AsRef<Path>) -> Result<EquityPortfolio
             .total_cmp(&left.average_sharpe)
             .then_with(|| right.average_return_pct.total_cmp(&left.average_return_pct))
     });
+    let detail_allocations = walk_forward_detail_allocations(&config, &allocations);
+    let mut window_details = Vec::new();
+    for allocation in detail_allocations {
+        for (window_index, (_, test_range)) in evaluation_ranges.iter().enumerate() {
+            let window_sessions = &sessions[test_range.clone()];
+            let result =
+                simulate_target_portfolio_with_weights(&config, window_sessions, None, &allocation);
+            let benchmark =
+                simulate_single_asset(&config, window_sessions, 0, &config.assets[0].symbol);
+            window_details.push(PortfolioWindowDetail {
+                window_number: window_index + 1,
+                allocation: allocation_label(&allocation),
+                return_pct: result.return_pct,
+                versus_first_asset_pct: result.return_pct - benchmark.return_pct,
+                sharpe_ratio: result.sharpe_ratio,
+                max_drawdown_pct: result.max_drawdown_pct,
+            });
+        }
+    }
 
     Ok(EquityPortfolioWalkForwardReport {
         name: config.name,
@@ -374,8 +413,10 @@ pub fn run_walk_forward(config_path: impl AsRef<Path>) -> Result<EquityPortfolio
         train_sessions: walk_forward.train_sessions,
         test_sessions: walk_forward.test_sessions,
         step_sessions: walk_forward.step_sessions,
+        monthly_contribution: config.monthly_contribution,
         windows,
         results,
+        window_details,
     })
 }
 
@@ -404,6 +445,11 @@ impl PortfolioConfig {
             return Err(BotError::Config(
                 "equity portfolio initial cash must be positive and fixed commission non-negative"
                     .to_string(),
+            ));
+        }
+        if self.monthly_contribution < Decimal::ZERO {
+            return Err(BotError::Config(
+                "equity portfolio monthly contribution must not be negative".to_string(),
             ));
         }
         if [
@@ -600,16 +646,14 @@ fn align_sessions(inputs: &[AssetInput]) -> Result<Vec<AlignedSession>> {
     Ok(sessions)
 }
 
-fn cash_result(config: &PortfolioConfig, session_count: usize) -> PortfolioResult {
-    let state = PortfolioState {
-        cash: config.initial_cash,
-        shares: vec![Decimal::ZERO; config.assets.len()],
-        trade_count: 0,
-        traded_value: Decimal::ZERO,
-        fees: Decimal::ZERO,
-        friction: Decimal::ZERO,
-        equity_curve: vec![config.initial_cash; session_count],
-    };
+fn cash_result(config: &PortfolioConfig, sessions: &[AlignedSession]) -> PortfolioResult {
+    let mut state = new_state(config, sessions.len());
+    record_equity(&mut state, &sessions[0].close_prices, Decimal::ZERO);
+    for index in 1..sessions.len() {
+        let contribution = monthly_contribution(config, sessions, index);
+        add_contribution(&mut state, contribution);
+        record_equity(&mut state, &sessions[index].close_prices, contribution);
+    }
     finish_result("Cash".to_string(), config, state)
 }
 
@@ -629,8 +673,22 @@ fn simulate_single_asset(
         budget,
         None,
     );
-    for session in sessions {
-        record_equity(&mut state, &session.close_prices);
+    record_equity(&mut state, &sessions[0].close_prices, Decimal::ZERO);
+    for index in 1..sessions.len() {
+        let contribution = monthly_contribution(config, sessions, index);
+        add_contribution(&mut state, contribution);
+        if contribution > Decimal::ZERO {
+            let budget = state.cash;
+            buy_with_budget(
+                config,
+                &mut state,
+                asset_index,
+                sessions[index].execution_prices[asset_index],
+                budget,
+                None,
+            );
+        }
+        record_equity(&mut state, &sessions[index].close_prices, contribution);
     }
     finish_result(format!("Hold {symbol}"), config, state)
 }
@@ -666,9 +724,20 @@ fn simulate_target_portfolio_with_weights(
             None,
         );
     }
-    record_equity(&mut state, &sessions[0].close_prices);
+    record_equity(&mut state, &sessions[0].close_prices, Decimal::ZERO);
 
     for index in 1..sessions.len() {
+        let contribution = monthly_contribution(config, sessions, index);
+        add_contribution(&mut state, contribution);
+        if contribution > Decimal::ZERO {
+            invest_cash_to_underweights(
+                config,
+                &mut state,
+                &sessions[index - 1].close_prices,
+                &sessions[index].execution_prices,
+                weights_bps,
+            );
+        }
         if frequency.is_some_and(|frequency| {
             period_key(sessions[index - 1].date, frequency)
                 != period_key(sessions[index].date, frequency)
@@ -681,12 +750,18 @@ fn simulate_target_portfolio_with_weights(
                 weights_bps,
             );
         }
-        record_equity(&mut state, &sessions[index].close_prices);
+        record_equity(&mut state, &sessions[index].close_prices, contribution);
     }
 
     let name = frequency
         .map(|frequency| format!("{frequency} rebalance"))
-        .unwrap_or_else(|| "Static target".to_string());
+        .unwrap_or_else(|| {
+            if config.monthly_contribution > Decimal::ZERO {
+                "Buy-only target".to_string()
+            } else {
+                "Static target".to_string()
+            }
+        });
     finish_result(name, config, state)
 }
 
@@ -699,6 +774,8 @@ fn new_state(config: &PortfolioConfig, session_count: usize) -> PortfolioState {
         fees: Decimal::ZERO,
         friction: Decimal::ZERO,
         equity_curve: Vec::with_capacity(session_count),
+        external_flows: Vec::with_capacity(session_count),
+        total_contributions: Decimal::ZERO,
     }
 }
 
@@ -758,6 +835,76 @@ fn rebalance(
             );
         }
     }
+}
+
+fn invest_cash_to_underweights(
+    config: &PortfolioConfig,
+    state: &mut PortfolioState,
+    decision_prices: &[Decimal],
+    execution_prices: &[Decimal],
+    weights_bps: &[i64],
+) {
+    if state.cash <= config.commission_per_order {
+        return;
+    }
+    let total_value = portfolio_value(state, decision_prices);
+    let mut deficits = weights_bps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target_weight_bps)| {
+            let target_value = bps_value(total_value, *target_weight_bps);
+            let current_value = state.shares[index] * decision_prices[index];
+            (target_value > current_value).then_some((index, target_value - current_value))
+        })
+        .collect::<Vec<_>>();
+    deficits.sort_by(|left, right| right.1.cmp(&left.1));
+
+    for (index, deficit) in deficits {
+        if state.cash <= config.commission_per_order {
+            break;
+        }
+        let quantity_limit = deficit / decision_prices[index];
+        let budget = state.cash;
+        buy_with_budget(
+            config,
+            state,
+            index,
+            execution_prices[index],
+            budget,
+            Some(quantity_limit),
+        );
+    }
+}
+
+fn monthly_contribution(
+    config: &PortfolioConfig,
+    sessions: &[AlignedSession],
+    index: usize,
+) -> Decimal {
+    if config.monthly_contribution > Decimal::ZERO
+        && (
+            sessions[index - 1].date.year,
+            sessions[index - 1].date.month,
+        ) != (sessions[index].date.year, sessions[index].date.month)
+    {
+        config.monthly_contribution
+    } else {
+        Decimal::ZERO
+    }
+}
+
+fn add_contribution(state: &mut PortfolioState, contribution: Decimal) {
+    state.cash += contribution;
+    state.total_contributions += contribution;
+}
+
+fn contribution_count(sessions: &[AlignedSession]) -> usize {
+    sessions
+        .windows(2)
+        .filter(|pair| {
+            (pair[0].date.year, pair[0].date.month) != (pair[1].date.year, pair[1].date.month)
+        })
+        .count()
 }
 
 fn buy_with_budget(
@@ -861,10 +1008,11 @@ fn period_key(date: TradingDate, frequency: RebalanceFrequency) -> (i32, u32) {
     }
 }
 
-fn record_equity(state: &mut PortfolioState, close_prices: &[Decimal]) {
+fn record_equity(state: &mut PortfolioState, close_prices: &[Decimal], external_flow: Decimal) {
     state
         .equity_curve
         .push(portfolio_value(state, close_prices));
+    state.external_flows.push(external_flow);
 }
 
 fn portfolio_value(state: &PortfolioState, prices: &[Decimal]) -> Decimal {
@@ -883,29 +1031,59 @@ fn finish_result(name: String, config: &PortfolioConfig, state: PortfolioState) 
         .last()
         .copied()
         .unwrap_or(config.initial_cash);
-    let profit_loss = final_value - config.initial_cash;
+    let profit_loss = final_value - config.initial_cash - state.total_contributions;
+    let adjusted_equity_curve =
+        cash_flow_adjusted_curve(&state.equity_curve, &state.external_flows);
     let statistics = calculate_statistics(
-        &state.equity_curve,
+        &adjusted_equity_curve,
         config.initial_cash,
         config.annual_trading_days,
         config.annual_risk_free_rate_pct,
     );
+    let adjusted_final_value = adjusted_equity_curve
+        .last()
+        .copied()
+        .unwrap_or(config.initial_cash);
     PortfolioResult {
         name,
         final_value,
         profit_loss,
-        return_pct: percent_ratio(profit_loss, config.initial_cash),
+        return_pct: percent_ratio(
+            adjusted_final_value - config.initial_cash,
+            config.initial_cash,
+        ),
         cagr_pct: statistics.cagr_pct,
         volatility_pct: statistics.volatility_pct,
         sharpe_ratio: statistics.sharpe_ratio,
         max_drawdown_pct: statistics.max_drawdown_pct,
-        versus_static_pct: 0.0,
+        versus_target_pct: 0.0,
         trade_count: state.trade_count,
-        turnover_pct: percent_ratio(state.traded_value, config.initial_cash),
+        turnover_pct: percent_ratio(
+            state.traded_value,
+            config.initial_cash + state.total_contributions,
+        ),
         fees: state.fees,
         friction: state.friction,
         final_cash: state.cash,
     }
+}
+
+fn cash_flow_adjusted_curve(equity_curve: &[Decimal], external_flows: &[Decimal]) -> Vec<Decimal> {
+    if equity_curve.is_empty() {
+        return Vec::new();
+    }
+    let mut adjusted = Vec::with_capacity(equity_curve.len());
+    adjusted.push(equity_curve[0]);
+    for index in 1..equity_curve.len() {
+        let capital_before_return = equity_curve[index - 1] + external_flows[index];
+        let previous_adjusted = adjusted[index - 1];
+        adjusted.push(if capital_before_return > Decimal::ZERO {
+            previous_adjusted * equity_curve[index] / capital_before_return
+        } else {
+            previous_adjusted
+        });
+    }
+    adjusted
 }
 
 impl Display for EquityPortfolioReport {
@@ -918,6 +1096,11 @@ impl Display for EquityPortfolioReport {
             self.common_session_count, self.first_date, self.last_date
         )?;
         writeln!(formatter, "Initial cash: {}", self.initial_cash)?;
+        writeln!(
+            formatter,
+            "Monthly contribution: {} ({} contributions after the initial investment)",
+            self.monthly_contribution, self.contribution_count
+        )?;
         writeln!(
             formatter,
             "Costs: {} fixed/order, {} commission bps, {} spread bps, {} slippage bps",
@@ -964,7 +1147,7 @@ impl Display for EquityPortfolioReport {
         }
         writeln!(
             formatter,
-            "strategy                 final        pnl    ret%   cagr%    vol% sharpe    dd% vs_static trades turnover%    fees friction final_cash"
+            "strategy                 final    net_pnl    twr%   cagr%    vol% sharpe    dd% vs_target trades turnover%    fees friction final_cash"
         )?;
         for result in &self.results {
             writeln!(
@@ -978,7 +1161,7 @@ impl Display for EquityPortfolioReport {
                 result.volatility_pct,
                 result.sharpe_ratio,
                 result.max_drawdown_pct,
-                result.versus_static_pct,
+                result.versus_target_pct,
                 result.trade_count,
                 result.turnover_pct,
                 to_f64(result.fees),
@@ -986,6 +1169,10 @@ impl Display for EquityPortfolioReport {
                 to_f64(result.final_cash),
             )?;
         }
+        writeln!(
+            formatter,
+            "P/L excludes deposits; TWR, CAGR, volatility, Sharpe, and drawdown are cash-flow adjusted. Contributions buy underweight assets before any scheduled drift rebalance."
+        )?;
         writeln!(
             formatter,
             "Rebalances are decided from the previous common-session close and execute on the next common session; histories are restricted to dates present for every asset."
@@ -997,6 +1184,11 @@ impl Display for EquityPortfolioWalkForwardReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(formatter, "Portfolio allocation walk-forward report")?;
         writeln!(formatter, "Portfolio: {} ({})", self.name, self.currency)?;
+        writeln!(
+            formatter,
+            "Monthly contribution per held-out simulation: {}",
+            self.monthly_contribution
+        )?;
         writeln!(
             formatter,
             "Assets: {} | Common sessions: {}",
@@ -1037,6 +1229,36 @@ impl Display for EquityPortfolioWalkForwardReport {
                 result.average_turnover_pct,
             )?;
         }
+        writeln!(
+            formatter,
+            "Selected {} allocations by held-out window{}",
+            if self.monthly_contribution > Decimal::ZERO {
+                "buy-only"
+            } else {
+                "static"
+            },
+            if self.monthly_contribution > Decimal::ZERO {
+                " (contribution-first)"
+            } else {
+                ""
+            }
+        )?;
+        writeln!(
+            formatter,
+            "window allocation                      twr% vs_first% sharpe    dd%"
+        )?;
+        for detail in &self.window_details {
+            writeln!(
+                formatter,
+                "{:>6} {:<29} {:>7.2} {:>9.2} {:>6.2} {:>6.2}",
+                detail.window_number,
+                detail.allocation,
+                detail.return_pct,
+                detail.versus_first_asset_pct,
+                detail.sharpe_ratio,
+                detail.max_drawdown_pct,
+            )?;
+        }
         writeln!(formatter, "Held-out window dates")?;
         for (index, window) in self.windows.iter().enumerate() {
             writeln!(
@@ -1073,6 +1295,31 @@ fn walk_forward_allocations(config: &PortfolioConfig) -> Result<Vec<Vec<i64>>> {
             .map(|asset| asset.target_weight_bps)
             .collect(),
     ])
+}
+
+fn walk_forward_detail_allocations(
+    config: &PortfolioConfig,
+    allocations: &[Vec<i64>],
+) -> Vec<Vec<i64>> {
+    let configured = config
+        .assets
+        .iter()
+        .map(|asset| asset.target_weight_bps)
+        .collect::<Vec<_>>();
+    let mut details = Vec::new();
+    if config.assets.len() == 2 {
+        let growth_tilt = vec![8_000, 2_000];
+        if allocations.contains(&growth_tilt) {
+            details.push(growth_tilt);
+        }
+    }
+    if allocations.contains(&configured) && !details.contains(&configured) {
+        details.push(configured);
+    }
+    if details.is_empty() {
+        details.extend(allocations.iter().take(2).cloned());
+    }
+    details
 }
 
 fn allocation_label(weights_bps: &[i64]) -> String {
@@ -1127,8 +1374,8 @@ fn default_walk_forward_step_sessions() -> usize {
 mod tests {
     use super::{
         AssetInput, PortfolioAssetConfig, PortfolioConfig, PortfolioState,
-        PortfolioWalkForwardConfig, RebalanceFrequency, align_sessions, rebalance, run,
-        run_walk_forward, walk_forward_allocations,
+        PortfolioWalkForwardConfig, RebalanceFrequency, align_sessions, cash_flow_adjusted_curve,
+        invest_cash_to_underweights, rebalance, run, run_walk_forward, walk_forward_allocations,
     };
     use crate::decimal::Decimal;
     use crate::equity::price_data::{
@@ -1146,6 +1393,7 @@ mod tests {
             name: "test portfolio".to_string(),
             currency: "GBP".to_string(),
             initial_cash: decimal("10000"),
+            monthly_contribution: Decimal::ZERO,
             commission_per_order: decimal("1"),
             commission_bps: 0,
             spread_bps: 0,
@@ -1262,6 +1510,8 @@ mod tests {
             fees: Decimal::ZERO,
             friction: Decimal::ZERO,
             equity_curve: Vec::new(),
+            external_flows: Vec::new(),
+            total_contributions: Decimal::ZERO,
         };
         let prices = vec![decimal("100"), decimal("100")];
 
@@ -1273,6 +1523,41 @@ mod tests {
     }
 
     #[test]
+    fn cash_flow_adjustment_does_not_treat_deposits_as_returns() {
+        let curve = vec![decimal("10000"), decimal("10500"), decimal("11000")];
+        let flows = vec![Decimal::ZERO, decimal("500"), decimal("500")];
+
+        let adjusted = cash_flow_adjusted_curve(&curve, &flows);
+
+        assert_eq!(adjusted, vec![decimal("10000"); 3]);
+    }
+
+    #[test]
+    fn contribution_cash_buys_the_underweight_asset_without_selling() {
+        let mut config = config();
+        config.allow_fractional_shares = true;
+        config.commission_per_order = Decimal::ZERO;
+        let mut state = PortfolioState {
+            cash: decimal("1000"),
+            shares: vec![decimal("70"), decimal("20")],
+            trade_count: 0,
+            traded_value: Decimal::ZERO,
+            fees: Decimal::ZERO,
+            friction: Decimal::ZERO,
+            equity_curve: Vec::new(),
+            external_flows: Vec::new(),
+            total_contributions: decimal("1000"),
+        };
+        let prices = vec![decimal("100"), decimal("100")];
+
+        invest_cash_to_underweights(&config, &mut state, &prices, &prices, &[7000, 3000]);
+
+        assert_eq!(state.shares, vec![decimal("70"), decimal("30")]);
+        assert_eq!(state.cash, Decimal::ZERO);
+        assert_eq!(state.trade_count, 1);
+    }
+
+    #[test]
     fn runs_repository_portfolio_fixture_end_to_end() {
         let report = run("config/equity-portfolio.example.toml")
             .expect("portfolio fixture should produce a report");
@@ -1280,7 +1565,7 @@ mod tests {
 
         assert_eq!(report.common_session_count, 15);
         assert_eq!(report.assets.len(), 2);
-        assert!(output.contains("Static target"));
+        assert!(output.contains("Buy-only target"));
         assert!(output.contains("Monthly rebalance"));
         assert!(output.contains("fewer than one assumed trading year"));
     }
