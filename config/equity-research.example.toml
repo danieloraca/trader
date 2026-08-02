@@ -12,6 +12,8 @@ allow_fractional_shares = false
 
 annual_trading_days = 252
 annual_risk_free_rate_pct = 0.0
+# Vanguard's accumulating share class retains dividends, but leave this false
+# unless the entire imported price series is explicitly split-adjusted.
 prices_are_adjusted = false
 
 monthly_dca_amount = 500.0

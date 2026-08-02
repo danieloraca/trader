@@ -4,9 +4,19 @@ Rust trading bot foundation for Raspberry Pi paper-live testing.
 
 ## Equity ETF Research
 
-The equity path is an offline research command and is isolated from the Kraken daemon. It reads daily OHLCV CSV data and does not contact a broker or write to the trading database.
+The equity path is an offline research command and is isolated from the Kraken daemon. It reads daily OHLCV CSV files or official close-only Excel histories and does not contact a broker or write to the trading database.
 
-Prepare a comma-separated file with strictly increasing daily rows:
+For VWRP, open Vanguard's [fund page](https://www.vanguard.co.uk/uk-fund-directory/product/etf/equity/9679/ftse-all-world-ucits-etf-usd-accumulating), select **Prices and distribution**, and use **Download prices** under **Historical Prices**. The downloaded `.xlsx` can be used directly:
+
+```sh
+target/release/trader \
+  --config config/equity-research.example.toml \
+  --backtest-equity data/vwrp-history.xlsx
+```
+
+The spreadsheet importer finds the header row, selects `Market price (GBP)` ahead of the USD NAV, accepts Vanguard's displayed date format and currency symbols, and reverses newest-first files into chronological order.
+
+Other providers can supply a comma-separated file with daily rows:
 
 ```csv
 date,open,high,low,close,volume
@@ -19,7 +29,7 @@ Run the comparison:
 ```sh
 cargo run --release -- \
   --config config/equity-research.example.toml \
-  --backtest-equity-csv data/vwrp-daily.csv
+  --backtest-equity data/vwrp-daily.csv
 ```
 
 Exercise the command with the small synthetic fixture (it is a parser/demo fixture, not research data):
@@ -27,10 +37,13 @@ Exercise the command with the small synthetic fixture (it is a parser/demo fixtu
 ```sh
 cargo run -- \
   --config config/equity-research.example.toml \
-  --backtest-equity-csv examples/equity-daily-sample.csv
+  --backtest-equity examples/equity-daily-sample.csv
 ```
 
-The report compares buy-and-hold, finite-cash monthly DCA, moving-average crossover, and channel breakout. Close-based decisions execute at the next session open to avoid look-ahead bias. It reports return, CAGR, annualized volatility, Sharpe ratio, maximum drawdown, turnover, fees, execution friction, exposure, and performance versus buy-and-hold.
+The Vanguard-shaped close-only fixture is available at
+`examples/equity-vanguard-close-sample.csv`.
+
+The report compares buy-and-hold, finite-cash monthly DCA, moving-average crossover, and channel breakout. Close-based decisions execute at the next session open for OHLCV data and at the next session close for close-only data, avoiding look-ahead bias in both cases. Close-only breakout channels use closing prices. The report includes return, CAGR, annualized volatility, Sharpe ratio, maximum drawdown, turnover, fees, execution friction, exposure, and performance versus buy-and-hold.
 
 The importer validates dates and OHLC relationships but cannot determine whether a vendor adjusted prices for splits or dividends. Set `prices_are_adjusted = true` only when the entire OHLC series is adjusted consistently. Otherwise the result is price return, not a reliable total-return comparison. The initial implementation keeps the portfolio and instrument in the configured instrument currency; `fx_bps` models a conversion charge but not changing FX rates.
 

@@ -22,11 +22,11 @@ use crate::error::Result;
 fn main() -> Result<()> {
     let runtime = config::RuntimeOptions::from_runtime()?;
 
-    if runtime.command == RuntimeCommand::BacktestEquityCsv {
-        let csv_path = runtime.backtest_equity_csv_path.as_deref().ok_or_else(|| {
-            error::BotError::Config("--backtest-equity-csv requires an OHLCV CSV path".to_string())
+    if runtime.command == RuntimeCommand::BacktestEquity {
+        let price_path = runtime.backtest_equity_path.as_deref().ok_or_else(|| {
+            error::BotError::Config("--backtest-equity requires a daily price file".to_string())
         })?;
-        let report = equity::run(&runtime.config_path, csv_path)?;
+        let report = equity::run(&runtime.config_path, price_path)?;
         println!("{report}");
         return Ok(());
     }
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
             println!("{report}");
             return Ok(());
         }
-        RuntimeCommand::BacktestEquityCsv => unreachable!("handled before daemon config loading"),
+        RuntimeCommand::BacktestEquity => unreachable!("handled before daemon config loading"),
         RuntimeCommand::SweepSqlite => {
             let sqlite_path = runtime.sweep_sqlite_path.as_deref().ok_or_else(|| {
                 error::BotError::Config("--sweep-sqlite requires a sqlite path".to_string())

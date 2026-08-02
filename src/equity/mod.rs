@@ -1,4 +1,4 @@
-mod csv_data;
+mod price_data;
 mod simulation;
 
 use crate::decimal::Decimal;
@@ -75,11 +75,11 @@ impl Display for AssetClass {
 
 pub fn run(
     config_path: impl AsRef<Path>,
-    csv_path: impl AsRef<Path>,
+    price_path: impl AsRef<Path>,
 ) -> Result<EquityResearchReport> {
     let config = load_config(config_path)?;
-    let bars = csv_data::load(csv_path)?;
-    simulation::run(&config, &bars)
+    let data = price_data::load(price_path)?;
+    simulation::run(&config, &data)
 }
 
 fn load_config(path: impl AsRef<Path>) -> Result<EquityResearchConfig> {

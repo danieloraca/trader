@@ -1,4 +1,4 @@
-use super::csv_data::DailyBar;
+use super::price_data::{DailyBar, DailyPriceData, DailyPriceKind, InputFormat};
 use super::{EquityResearchConfig, Instrument};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
@@ -14,6 +14,9 @@ pub struct EquityResearchReport {
     last_date: String,
     session_count: usize,
     volume_session_count: usize,
+    data_kind: DailyPriceKind,
+    input_format: InputFormat,
+    price_column: String,
     annual_trading_days: usize,
     initial_cash: Decimal,
     commission_per_order: Decimal,
@@ -66,7 +69,8 @@ struct PortfolioState {
     equity_curve: Vec<Decimal>,
 }
 
-pub fn run(config: &EquityResearchConfig, bars: &[DailyBar]) -> Result<EquityResearchReport> {
+pub fn run(config: &EquityResearchConfig, data: &DailyPriceData) -> Result<EquityResearchReport> {
+    let bars = &data.bars;
     if bars.len() < 2 {
         return Err(BotError::MarketData(
             "equity research requires at least two daily bars".to_string(),
@@ -85,13 +89,13 @@ pub fn run(config: &EquityResearchConfig, bars: &[DailyBar]) -> Result<EquityRes
                 "Breakout {}/{}",
                 config.breakout_entry_window, config.breakout_exit_window
             ),
-            breakout_actions(config, bars),
+            breakout_actions(config, bars, data.kind),
         ),
     ];
 
     let mut results = plans
         .into_iter()
-        .map(|(name, actions)| simulate(name, config, bars, &actions))
+        .map(|(name, actions)| simulate(name, config, bars, &actions, data.kind))
         .collect::<Vec<_>>();
     let hold_return = results[0].return_pct;
     for result in &mut results {
@@ -104,6 +108,9 @@ pub fn run(config: &EquityResearchConfig, bars: &[DailyBar]) -> Result<EquityRes
         last_date: bars[bars.len() - 1].date_text.clone(),
         session_count: bars.len(),
         volume_session_count: bars.iter().filter(|bar| bar.volume.is_some()).count(),
+        data_kind: data.kind,
+        input_format: data.input_format,
+        price_column: data.price_column.clone(),
         annual_trading_days: config.annual_trading_days,
         initial_cash: config.initial_cash,
         commission_per_order: config.commission_per_order,
@@ -165,7 +172,11 @@ fn moving_average_actions(config: &EquityResearchConfig, bars: &[DailyBar]) -> V
     actions
 }
 
-fn breakout_actions(config: &EquityResearchConfig, bars: &[DailyBar]) -> Vec<Vec<Action>> {
+fn breakout_actions(
+    config: &EquityResearchConfig,
+    bars: &[DailyBar],
+    data_kind: DailyPriceKind,
+) -> Vec<Vec<Action>> {
     let mut actions = empty_actions(bars.len());
     let warmup = config
         .breakout_entry_window
@@ -180,7 +191,10 @@ fn breakout_actions(config: &EquityResearchConfig, bars: &[DailyBar]) -> Vec<Vec
         if !invested {
             let previous_high = bars[index - config.breakout_entry_window..index]
                 .iter()
-                .map(|bar| bar.high)
+                .map(|bar| match data_kind {
+                    DailyPriceKind::Ohlcv => bar.high,
+                    DailyPriceKind::CloseOnly => bar.close,
+                })
                 .max()
                 .expect("entry window should not be empty");
             if close > previous_high {
@@ -190,7 +204,10 @@ fn breakout_actions(config: &EquityResearchConfig, bars: &[DailyBar]) -> Vec<Vec
         } else {
             let previous_low = bars[index - config.breakout_exit_window..index]
                 .iter()
-                .map(|bar| bar.low)
+                .map(|bar| match data_kind {
+                    DailyPriceKind::Ohlcv => bar.low,
+                    DailyPriceKind::CloseOnly => bar.close,
+                })
                 .min()
                 .expect("exit window should not be empty");
             if close < previous_low {
@@ -219,6 +236,7 @@ fn simulate(
     config: &EquityResearchConfig,
     bars: &[DailyBar],
     actions: &[Vec<Action>],
+    data_kind: DailyPriceKind,
 ) -> StrategyResult {
     let mut state = PortfolioState {
         cash: config.initial_cash,
@@ -232,17 +250,21 @@ fn simulate(
     };
 
     for (bar, day_actions) in bars.iter().zip(actions) {
+        let market_price = match data_kind {
+            DailyPriceKind::Ohlcv => bar.open,
+            DailyPriceKind::CloseOnly => bar.close,
+        };
         for action in day_actions {
             match action {
                 Action::BuyAll => {
                     let budget = state.cash;
-                    buy(config, &mut state, bar.open, budget);
+                    buy(config, &mut state, market_price, budget);
                 }
                 Action::BuyAmount(amount) => {
                     let budget = (*amount).min(state.cash);
-                    buy(config, &mut state, bar.open, budget);
+                    buy(config, &mut state, market_price, budget);
                 }
-                Action::SellAll => sell_all(config, &mut state, bar.open),
+                Action::SellAll => sell_all(config, &mut state, market_price),
             }
         }
         if state.shares > Decimal::ZERO {
@@ -452,7 +474,7 @@ fn percent_ratio(numerator: Decimal, denominator: Decimal) -> f64 {
 
 impl Display for EquityResearchReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(formatter, "Equity CSV research report")?;
+        writeln!(formatter, "Equity price research report")?;
         writeln!(
             formatter,
             "Instrument: {} ({}; {}; {})",
@@ -465,6 +487,11 @@ impl Display for EquityResearchReport {
             formatter,
             "Sessions: {} ({} to {}; {} assumed/year)",
             self.session_count, self.first_date, self.last_date, self.annual_trading_days
+        )?;
+        writeln!(
+            formatter,
+            "Input: {} {}; valuation column: {}",
+            self.input_format, self.data_kind, self.price_column
         )?;
         writeln!(
             formatter,
@@ -540,9 +567,13 @@ impl Display for EquityResearchReport {
                 to_f64(result.final_shares),
             )?;
         }
+        let execution_point = match self.data_kind {
+            DailyPriceKind::Ohlcv => "next session open",
+            DailyPriceKind::CloseOnly => "next session close",
+        };
         writeln!(
             formatter,
-            "Signals based on a session close execute at the next session open; final positions are marked to the last close."
+            "Signals based on a session close execute at the {execution_point}; final positions are marked to the last close."
         )
     }
 }
@@ -551,7 +582,9 @@ impl Display for EquityResearchReport {
 mod tests {
     use super::{Action, moving_average_actions, run};
     use crate::decimal::Decimal;
-    use crate::equity::csv_data::{DailyBar, TradingDate};
+    use crate::equity::price_data::{
+        DailyBar, DailyPriceData, DailyPriceKind, InputFormat, TradingDate,
+    };
     use crate::equity::{AssetClass, EquityResearchConfig, Instrument};
 
     fn decimal(value: &str) -> Decimal {
@@ -607,6 +640,15 @@ mod tests {
             .collect()
     }
 
+    fn data(kind: DailyPriceKind) -> DailyPriceData {
+        DailyPriceData {
+            bars: bars(),
+            kind,
+            input_format: InputFormat::Csv,
+            price_column: "close".to_string(),
+        }
+    }
+
     #[test]
     fn close_based_ma_signal_executes_on_next_open() {
         let actions = moving_average_actions(&config(), &bars());
@@ -616,7 +658,7 @@ mod tests {
 
     #[test]
     fn compares_four_strategies_with_costs() {
-        let report = run(&config(), &bars()).expect("research should run");
+        let report = run(&config(), &data(DailyPriceKind::Ohlcv)).expect("research should run");
         let output = report.to_string();
 
         assert!(output.contains("Buy and hold"));
@@ -624,5 +666,13 @@ mod tests {
         assert!(output.contains("MA 2/3"));
         assert!(output.contains("Breakout 3/2"));
         assert!(output.contains("next session open"));
+    }
+
+    #[test]
+    fn close_only_data_executes_at_following_close() {
+        let report = run(&config(), &data(DailyPriceKind::CloseOnly))
+            .expect("close-only research should run");
+
+        assert!(report.to_string().contains("next session close"));
     }
 }

@@ -6,6 +6,7 @@ default-run = "trader"
 
 [dependencies]
 base64 = "0.22"
+calamine = { version = "0.31", features = ["dates"] }
 csv = "1"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
