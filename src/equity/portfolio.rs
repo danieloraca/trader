@@ -1328,9 +1328,10 @@ fn walk_forward_detail_allocations(
         .collect::<Vec<_>>();
     let mut details = Vec::new();
     if config.assets.len() == 2 {
-        let growth_tilt = vec![8_000, 2_000];
-        if allocations.contains(&growth_tilt) {
-            details.push(growth_tilt);
+        for comparison in [vec![8_000, 2_000], vec![7_000, 3_000]] {
+            if allocations.contains(&comparison) {
+                details.push(comparison);
+            }
         }
     }
     if allocations.contains(&configured) && !details.contains(&configured) {
@@ -1404,7 +1405,7 @@ mod tests {
         AssetInput, PortfolioAssetConfig, PortfolioConfig, PortfolioState,
         PortfolioWalkForwardConfig, RebalanceFrequency, align_sessions, cash_flow_adjusted_curve,
         invest_cash_to_underweights, load_config, rebalance, run, run_walk_forward,
-        validate_common_session_count, walk_forward_allocations,
+        validate_common_session_count, walk_forward_allocations, walk_forward_detail_allocations,
     };
     use crate::decimal::Decimal;
     use crate::equity::price_data::{
@@ -1505,6 +1506,18 @@ mod tests {
         assert_eq!(allocations[0], vec![10_000, 0]);
         assert_eq!(allocations[3], vec![7_000, 3_000]);
         assert_eq!(allocations[10], vec![0, 10_000]);
+    }
+
+    #[test]
+    fn details_include_both_balanced_candidate_allocations() {
+        let mut config = config();
+        config.assets[0].target_weight_bps = 8_000;
+        config.assets[1].target_weight_bps = 2_000;
+        let allocations = walk_forward_allocations(&config).expect("grid should build");
+
+        let details = walk_forward_detail_allocations(&config, &allocations);
+
+        assert_eq!(details, vec![vec![8_000, 2_000], vec![7_000, 3_000]]);
     }
 
     #[test]
