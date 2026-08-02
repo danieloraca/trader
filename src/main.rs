@@ -43,6 +43,11 @@ fn main() -> Result<()> {
         println!("{report}");
         return Ok(());
     }
+    if runtime.command == RuntimeCommand::WalkForwardEquityPortfolio {
+        let report = equity::run_portfolio_walk_forward(&runtime.config_path)?;
+        println!("{report}");
+        return Ok(());
+    }
 
     let config = config::Config::load_from_path(&runtime.config_path)?;
 
@@ -62,6 +67,9 @@ fn main() -> Result<()> {
         }
         RuntimeCommand::BacktestEquity => unreachable!("handled before daemon config loading"),
         RuntimeCommand::BacktestEquityPortfolio => {
+            unreachable!("handled before daemon config loading")
+        }
+        RuntimeCommand::WalkForwardEquityPortfolio => {
             unreachable!("handled before daemon config loading")
         }
         RuntimeCommand::WalkForwardEquity => {

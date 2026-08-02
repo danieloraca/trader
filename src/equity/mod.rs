@@ -10,7 +10,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
 
-pub use portfolio::EquityPortfolioReport;
+pub use portfolio::{EquityPortfolioReport, EquityPortfolioWalkForwardReport};
 pub use simulation::EquityResearchReport;
 pub use walk_forward::EquityWalkForwardReport;
 
@@ -134,6 +134,12 @@ pub fn run_walk_forward(
 
 pub fn run_portfolio(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
     portfolio::run(config_path)
+}
+
+pub fn run_portfolio_walk_forward(
+    config_path: impl AsRef<Path>,
+) -> Result<EquityPortfolioWalkForwardReport> {
+    portfolio::run_walk_forward(config_path)
 }
 
 fn load_config(path: impl AsRef<Path>) -> Result<EquityResearchConfig> {

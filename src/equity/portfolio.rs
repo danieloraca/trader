@@ -41,7 +41,35 @@ struct PortfolioConfig {
     rebalance_threshold_bps: i64,
     #[serde(default = "default_rebalance_frequencies")]
     rebalance_frequencies: Vec<RebalanceFrequency>,
+    #[serde(default)]
+    walk_forward: PortfolioWalkForwardConfig,
     assets: Vec<PortfolioAssetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PortfolioWalkForwardConfig {
+    #[serde(default = "default_walk_forward_train_sessions")]
+    train_sessions: usize,
+    #[serde(default = "default_walk_forward_test_sessions")]
+    test_sessions: usize,
+    #[serde(default = "default_walk_forward_step_sessions")]
+    step_sessions: usize,
+    #[serde(default)]
+    allocations_bps: Vec<Vec<i64>>,
+    #[serde(default = "default_rebalance_frequencies")]
+    rebalance_frequencies: Vec<RebalanceFrequency>,
+}
+
+impl Default for PortfolioWalkForwardConfig {
+    fn default() -> Self {
+        Self {
+            train_sessions: default_walk_forward_train_sessions(),
+            test_sessions: default_walk_forward_test_sessions(),
+            step_sessions: default_walk_forward_step_sessions(),
+            allocations_bps: Vec::new(),
+            rebalance_frequencies: default_rebalance_frequencies(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +159,39 @@ pub struct EquityPortfolioReport {
     results: Vec<PortfolioResult>,
 }
 
+pub struct EquityPortfolioWalkForwardReport {
+    name: String,
+    currency: String,
+    asset_symbols: Vec<String>,
+    common_session_count: usize,
+    train_sessions: usize,
+    test_sessions: usize,
+    step_sessions: usize,
+    windows: Vec<PortfolioWindow>,
+    results: Vec<PortfolioWalkForwardResult>,
+}
+
+struct PortfolioWindow {
+    train_start: String,
+    train_end: String,
+    test_start: String,
+    test_end: String,
+}
+
+struct PortfolioWalkForwardResult {
+    allocation: String,
+    policy: String,
+    average_train_return_pct: f64,
+    average_return_pct: f64,
+    worst_return_pct: f64,
+    average_train_sharpe: f64,
+    average_sharpe: f64,
+    worst_drawdown_pct: f64,
+    average_vs_first_asset_pct: f64,
+    average_trades: f64,
+    average_turnover_pct: f64,
+}
+
 struct AssetSummary {
     symbol: String,
     target_weight_bps: i64,
@@ -207,6 +268,117 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
     })
 }
 
+pub fn run_walk_forward(config_path: impl AsRef<Path>) -> Result<EquityPortfolioWalkForwardReport> {
+    let config_path = config_path.as_ref();
+    let config = load_config(config_path)?;
+    let inputs = load_assets(config_path, &config)?;
+    let sessions = align_sessions(&inputs)?;
+    let walk_forward = config.walk_forward.clone();
+    let allocations = walk_forward_allocations(&config)?;
+
+    let mut windows = Vec::new();
+    let mut evaluation_ranges = Vec::new();
+    let mut train_start = 0;
+    while train_start + walk_forward.train_sessions + walk_forward.test_sessions <= sessions.len() {
+        let train_end = train_start + walk_forward.train_sessions;
+        let test_end = train_end + walk_forward.test_sessions;
+        windows.push(PortfolioWindow {
+            train_start: sessions[train_start].date_text.clone(),
+            train_end: sessions[train_end - 1].date_text.clone(),
+            test_start: sessions[train_end].date_text.clone(),
+            test_end: sessions[test_end - 1].date_text.clone(),
+        });
+        evaluation_ranges.push((train_start..train_end, train_end..test_end));
+        train_start += walk_forward.step_sessions;
+    }
+    if windows.is_empty() {
+        return Err(BotError::MarketData(format!(
+            "portfolio walk-forward needs at least {} common sessions, found {}",
+            walk_forward.train_sessions + walk_forward.test_sessions,
+            sessions.len()
+        )));
+    }
+
+    let mut policies = vec![None];
+    policies.extend(walk_forward.rebalance_frequencies.iter().copied().map(Some));
+    let mut results = Vec::new();
+    for allocation in &allocations {
+        for frequency in &policies {
+            let mut returns = Vec::new();
+            let mut train_returns = Vec::new();
+            let mut sharpes = Vec::new();
+            let mut train_sharpes = Vec::new();
+            let mut drawdowns = Vec::new();
+            let mut versus_first_asset = Vec::new();
+            let mut trades = 0usize;
+            let mut turnover = 0.0;
+            for (train_range, test_range) in &evaluation_ranges {
+                let train_result = simulate_target_portfolio_with_weights(
+                    &config,
+                    &sessions[train_range.clone()],
+                    *frequency,
+                    allocation,
+                );
+                let window_sessions = &sessions[test_range.clone()];
+                let result = simulate_target_portfolio_with_weights(
+                    &config,
+                    window_sessions,
+                    *frequency,
+                    allocation,
+                );
+                let benchmark =
+                    simulate_single_asset(&config, window_sessions, 0, &config.assets[0].symbol);
+                train_returns.push(train_result.return_pct);
+                train_sharpes.push(train_result.sharpe_ratio);
+                returns.push(result.return_pct);
+                sharpes.push(result.sharpe_ratio);
+                drawdowns.push(result.max_drawdown_pct);
+                versus_first_asset.push(result.return_pct - benchmark.return_pct);
+                trades += result.trade_count;
+                turnover += result.turnover_pct;
+            }
+            let window_count = evaluation_ranges.len() as f64;
+            results.push(PortfolioWalkForwardResult {
+                allocation: allocation_label(allocation),
+                policy: frequency
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "Static".to_string()),
+                average_train_return_pct: average(&train_returns),
+                average_return_pct: average(&returns),
+                worst_return_pct: returns.iter().copied().fold(f64::INFINITY, f64::min),
+                average_train_sharpe: average(&train_sharpes),
+                average_sharpe: average(&sharpes),
+                worst_drawdown_pct: drawdowns.iter().copied().fold(0.0, f64::max),
+                average_vs_first_asset_pct: average(&versus_first_asset),
+                average_trades: trades as f64 / window_count,
+                average_turnover_pct: turnover / window_count,
+            });
+        }
+    }
+    results.sort_by(|left, right| {
+        right
+            .average_sharpe
+            .total_cmp(&left.average_sharpe)
+            .then_with(|| right.average_return_pct.total_cmp(&left.average_return_pct))
+    });
+
+    Ok(EquityPortfolioWalkForwardReport {
+        name: config.name,
+        currency: config.currency,
+        asset_symbols: config
+            .assets
+            .into_iter()
+            .map(|asset| asset.symbol)
+            .collect(),
+        common_session_count: sessions.len(),
+        train_sessions: walk_forward.train_sessions,
+        test_sessions: walk_forward.test_sessions,
+        step_sessions: walk_forward.step_sessions,
+        windows,
+        results,
+    })
+}
+
 fn load_config(path: &Path) -> Result<PortfolioConfig> {
     let contents = fs::read_to_string(path).map_err(|error| {
         BotError::Config(format!(
@@ -274,6 +446,7 @@ impl PortfolioConfig {
                 "equity portfolio rebalance frequencies must be non-empty and unique".to_string(),
             ));
         }
+        self.walk_forward.validate(self.assets.len())?;
 
         let mut symbols = HashSet::new();
         let mut paths = HashSet::new();
@@ -296,6 +469,47 @@ impl PortfolioConfig {
             return Err(BotError::Config(format!(
                 "portfolio target weights must total 10000 bps, got {weight_total}"
             )));
+        }
+        Ok(())
+    }
+}
+
+impl PortfolioWalkForwardConfig {
+    fn validate(&self, asset_count: usize) -> Result<()> {
+        if self.train_sessions == 0
+            || self.test_sessions < 2
+            || self.step_sessions < self.test_sessions
+        {
+            return Err(BotError::Config(
+                "portfolio walk-forward requires positive training, at least two test sessions, and a step no shorter than the test window"
+                    .to_string(),
+            ));
+        }
+        if self.rebalance_frequencies.is_empty()
+            || self
+                .rebalance_frequencies
+                .iter()
+                .collect::<HashSet<_>>()
+                .len()
+                != self.rebalance_frequencies.len()
+        {
+            return Err(BotError::Config(
+                "portfolio walk-forward rebalance frequencies must be non-empty and unique"
+                    .to_string(),
+            ));
+        }
+        let mut unique = HashSet::new();
+        for allocation in &self.allocations_bps {
+            if allocation.len() != asset_count
+                || allocation.iter().any(|weight| *weight < 0)
+                || allocation.iter().sum::<i64>() != 10_000
+                || !unique.insert(allocation.clone())
+            {
+                return Err(BotError::Config(
+                    "each portfolio walk-forward allocation must be unique, non-negative, match the asset count, and total 10000 bps"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -426,9 +640,23 @@ fn simulate_target_portfolio(
     sessions: &[AlignedSession],
     frequency: Option<RebalanceFrequency>,
 ) -> PortfolioResult {
+    let weights = config
+        .assets
+        .iter()
+        .map(|asset| asset.target_weight_bps)
+        .collect::<Vec<_>>();
+    simulate_target_portfolio_with_weights(config, sessions, frequency, &weights)
+}
+
+fn simulate_target_portfolio_with_weights(
+    config: &PortfolioConfig,
+    sessions: &[AlignedSession],
+    frequency: Option<RebalanceFrequency>,
+    weights_bps: &[i64],
+) -> PortfolioResult {
     let mut state = new_state(config, sessions.len());
-    for (asset_index, asset) in config.assets.iter().enumerate() {
-        let budget = bps_value(config.initial_cash, asset.target_weight_bps);
+    for (asset_index, weight_bps) in weights_bps.iter().enumerate() {
+        let budget = bps_value(config.initial_cash, *weight_bps);
         buy_with_budget(
             config,
             &mut state,
@@ -450,6 +678,7 @@ fn simulate_target_portfolio(
                 &mut state,
                 &sessions[index - 1].close_prices,
                 &sessions[index].execution_prices,
+                weights_bps,
             );
         }
         record_equity(&mut state, &sessions[index].close_prices);
@@ -478,30 +707,33 @@ fn rebalance(
     state: &mut PortfolioState,
     decision_prices: &[Decimal],
     execution_prices: &[Decimal],
+    weights_bps: &[i64],
 ) {
     let portfolio_value = portfolio_value(state, decision_prices);
-    let threshold_breached = config.assets.iter().enumerate().any(|(index, asset)| {
-        let current_value = state.shares[index] * decision_prices[index];
-        let current_weight_bps = if portfolio_value > Decimal::ZERO {
-            ((current_value.micro_units() as i128 * BPS_DENOMINATOR)
-                / portfolio_value.micro_units() as i128) as i64
-        } else {
-            0
-        };
-        (current_weight_bps - asset.target_weight_bps).abs() >= config.rebalance_threshold_bps
-    });
+    let threshold_breached = weights_bps
+        .iter()
+        .enumerate()
+        .any(|(index, target_weight_bps)| {
+            let current_value = state.shares[index] * decision_prices[index];
+            let current_weight_bps = if portfolio_value > Decimal::ZERO {
+                ((current_value.micro_units() as i128 * BPS_DENOMINATOR)
+                    / portfolio_value.micro_units() as i128) as i64
+            } else {
+                0
+            };
+            (current_weight_bps - *target_weight_bps).abs() >= config.rebalance_threshold_bps
+        });
     if !threshold_breached {
         return;
     }
 
-    let desired_shares = config
-        .assets
+    let desired_shares = weights_bps
         .iter()
         .enumerate()
-        .map(|(index, asset)| {
+        .map(|(index, target_weight_bps)| {
             normalize_quantity(
                 config,
-                bps_value(portfolio_value, asset.target_weight_bps) / decision_prices[index],
+                bps_value(portfolio_value, *target_weight_bps) / decision_prices[index],
             )
         })
         .collect::<Vec<_>>();
@@ -761,6 +993,100 @@ impl Display for EquityPortfolioReport {
     }
 }
 
+impl Display for EquityPortfolioWalkForwardReport {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(formatter, "Portfolio allocation walk-forward report")?;
+        writeln!(formatter, "Portfolio: {} ({})", self.name, self.currency)?;
+        writeln!(
+            formatter,
+            "Assets: {} | Common sessions: {}",
+            self.asset_symbols.join(" / "),
+            self.common_session_count
+        )?;
+        writeln!(
+            formatter,
+            "Plan: {} train / {} test / {} step sessions; {} non-overlapping held-out windows",
+            self.train_sessions,
+            self.test_sessions,
+            self.step_sessions,
+            self.windows.len()
+        )?;
+        writeln!(
+            formatter,
+            "Ranked by average held-out Sharpe; vs_first compares return with holding {} alone.",
+            self.asset_symbols[0]
+        )?;
+        writeln!(
+            formatter,
+            "allocation                    policy      train_ret% test_ret% worst_ret% train_sh test_sh worst_dd% vs_first% trades turnover%"
+        )?;
+        for result in &self.results {
+            writeln!(
+                formatter,
+                "{:<29} {:<11} {:>9.2} {:>9.2} {:>10.2} {:>8.2} {:>7.2} {:>9.2} {:>9.2} {:>6.1} {:>9.2}",
+                result.allocation,
+                result.policy,
+                result.average_train_return_pct,
+                result.average_return_pct,
+                result.worst_return_pct,
+                result.average_train_sharpe,
+                result.average_sharpe,
+                result.worst_drawdown_pct,
+                result.average_vs_first_asset_pct,
+                result.average_trades,
+                result.average_turnover_pct,
+            )?;
+        }
+        writeln!(formatter, "Held-out window dates")?;
+        for (index, window) in self.windows.iter().enumerate() {
+            writeln!(
+                formatter,
+                " {:>2}: train {}..{} | test {}..{}",
+                index + 1,
+                window.train_start,
+                window.train_end,
+                window.test_start,
+                window.test_end
+            )?;
+        }
+        writeln!(
+            formatter,
+            "Each test window starts from the configured cash balance. Reviewing these results consumes the windows for research; future unseen data is still required."
+        )
+    }
+}
+
+fn walk_forward_allocations(config: &PortfolioConfig) -> Result<Vec<Vec<i64>>> {
+    if !config.walk_forward.allocations_bps.is_empty() {
+        return Ok(config.walk_forward.allocations_bps.clone());
+    }
+    if config.assets.len() == 2 {
+        return Ok((0..=10)
+            .rev()
+            .map(|first_tenths| vec![first_tenths * 1_000, (10 - first_tenths) * 1_000])
+            .collect());
+    }
+    Ok(vec![
+        config
+            .assets
+            .iter()
+            .map(|asset| asset.target_weight_bps)
+            .collect(),
+    ])
+}
+
+fn allocation_label(weights_bps: &[i64]) -> String {
+    weights_bps
+        .iter()
+        .map(|weight| format!("{:.0}%", *weight as f64 / 100.0))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn average(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
 fn default_commission_per_order() -> Decimal {
     Decimal::from_micro_units(1_000_000)
 }
@@ -785,17 +1111,31 @@ fn default_rebalance_frequencies() -> Vec<RebalanceFrequency> {
     vec![RebalanceFrequency::Quarterly, RebalanceFrequency::Yearly]
 }
 
+fn default_walk_forward_train_sessions() -> usize {
+    756
+}
+
+fn default_walk_forward_test_sessions() -> usize {
+    252
+}
+
+fn default_walk_forward_step_sessions() -> usize {
+    252
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetInput, PortfolioAssetConfig, PortfolioConfig, PortfolioState, RebalanceFrequency,
-        align_sessions, rebalance, run,
+        AssetInput, PortfolioAssetConfig, PortfolioConfig, PortfolioState,
+        PortfolioWalkForwardConfig, RebalanceFrequency, align_sessions, rebalance, run,
+        run_walk_forward, walk_forward_allocations,
     };
     use crate::decimal::Decimal;
     use crate::equity::price_data::{
         DailyBar, DailyPriceData, DailyPriceKind, InputFormat, TradingDate,
     };
     use std::path::PathBuf;
+    use std::{fs, process};
 
     fn decimal(value: &str) -> Decimal {
         Decimal::from_decimal_str(value).expect("decimal should parse")
@@ -816,6 +1156,7 @@ mod tests {
             annual_risk_free_rate_pct: 0.0,
             rebalance_threshold_bps: 100,
             rebalance_frequencies: vec![RebalanceFrequency::Quarterly],
+            walk_forward: PortfolioWalkForwardConfig::default(),
             assets: vec![
                 PortfolioAssetConfig {
                     symbol: "A".to_string(),
@@ -879,6 +1220,26 @@ mod tests {
     }
 
     #[test]
+    fn defaults_two_asset_walk_forward_to_ten_percent_weight_steps() {
+        let allocations = walk_forward_allocations(&config()).expect("grid should build");
+
+        assert_eq!(allocations.len(), 11);
+        assert_eq!(allocations[0], vec![10_000, 0]);
+        assert_eq!(allocations[3], vec![7_000, 3_000]);
+        assert_eq!(allocations[10], vec![0, 10_000]);
+    }
+
+    #[test]
+    fn rejects_invalid_walk_forward_allocation() {
+        let mut config = config();
+        config.walk_forward.allocations_bps = vec![vec![8_000, 1_000]];
+
+        let error = config.validate().expect_err("allocation should fail");
+
+        assert!(error.to_string().contains("allocation"));
+    }
+
+    #[test]
     fn aligns_only_dates_present_for_every_asset() {
         let inputs = vec![input("A", &[1, 2, 3]), input("B", &[2, 3, 4])];
 
@@ -904,7 +1265,7 @@ mod tests {
         };
         let prices = vec![decimal("100"), decimal("100")];
 
-        rebalance(&config, &mut state, &prices, &prices);
+        rebalance(&config, &mut state, &prices, &prices, &[7000, 3000]);
 
         assert_eq!(state.shares, vec![decimal("70"), decimal("30")]);
         assert_eq!(state.cash, Decimal::ZERO);
@@ -922,5 +1283,81 @@ mod tests {
         assert!(output.contains("Static target"));
         assert!(output.contains("Monthly rebalance"));
         assert!(output.contains("fewer than one assumed trading year"));
+    }
+
+    #[test]
+    fn runs_portfolio_walk_forward_end_to_end() {
+        let directory = std::env::temp_dir().join(format!(
+            "trader-portfolio-walk-forward-{}-{}",
+            process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&directory).expect("temp directory should be created");
+        let first = directory.join("first.csv");
+        let second = directory.join("second.csv");
+        let config_path = directory.join("portfolio.toml");
+        let dates = (1..=10)
+            .map(|day| format!("2026-01-{day:02}"))
+            .collect::<Vec<_>>();
+        let first_csv = std::iter::once("date,close".to_string())
+            .chain(
+                dates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, date)| format!("{date},{}", 100 + index)),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let second_csv = std::iter::once("date,close".to_string())
+            .chain(dates.iter().map(|date| format!("{date},100")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&first, first_csv).expect("first history should write");
+        fs::write(&second, second_csv).expect("second history should write");
+        fs::write(
+            &config_path,
+            format!(
+                r#"[equity_portfolio]
+name = "test"
+currency = "GBP"
+initial_cash = 10000
+commission_per_order = 0
+spread_bps = 0
+slippage_bps = 0
+allow_fractional_shares = true
+rebalance_frequencies = ["quarterly"]
+
+[equity_portfolio.walk_forward]
+train_sessions = 4
+test_sessions = 2
+step_sessions = 2
+allocations_bps = [[10000, 0], [5000, 5000]]
+rebalance_frequencies = ["quarterly"]
+
+[[equity_portfolio.assets]]
+symbol = "A"
+price_file = "{}"
+target_weight_bps = 7000
+
+[[equity_portfolio.assets]]
+symbol = "B"
+price_file = "{}"
+target_weight_bps = 3000
+"#,
+                first.to_string_lossy(),
+                second.to_string_lossy()
+            ),
+        )
+        .expect("config should write");
+
+        let report = run_walk_forward(&config_path).expect("walk-forward should run");
+        let output = report.to_string();
+
+        assert_eq!(report.windows.len(), 3);
+        assert_eq!(report.results.len(), 4);
+        assert!(output.contains("100% / 0%"));
+        assert!(output.contains("50% / 50%"));
+        assert!(output.contains("3 non-overlapping held-out windows"));
+        let _ = fs::remove_dir_all(directory);
     }
 }

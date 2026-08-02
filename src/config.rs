@@ -482,6 +482,7 @@ pub enum RuntimeCommand {
     BacktestSqlite,
     BacktestEquity,
     BacktestEquityPortfolio,
+    WalkForwardEquityPortfolio,
     WalkForwardEquity,
     SweepSqlite,
     SweepCandlesSqlite,
@@ -953,6 +954,8 @@ impl RuntimeOptions {
                 walk_forward_equity_path = Some(path);
             } else if arg == "--backtest-equity-portfolio" {
                 command = RuntimeCommand::BacktestEquityPortfolio;
+            } else if arg == "--walk-forward-equity-portfolio" {
+                command = RuntimeCommand::WalkForwardEquityPortfolio;
             } else if arg == "--sweep-sqlite" {
                 let Some(path) = args.next() else {
                     return Err(BotError::Config(
@@ -1637,6 +1640,22 @@ verbose = true
         .expect("runtime options should parse");
 
         assert_eq!(options.command, RuntimeCommand::BacktestEquityPortfolio);
+    }
+
+    #[test]
+    fn accepts_walk_forward_equity_portfolio_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "config/equity-portfolio.example.toml".to_string(),
+                "--walk-forward-equity-portfolio".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.command, RuntimeCommand::WalkForwardEquityPortfolio);
     }
 
     #[test]

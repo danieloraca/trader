@@ -69,6 +69,16 @@ target/release/trader \
 
 Portfolio asset paths are resolved relative to the config file. Target weights use basis points and must total `10000`; for example, `7000` and `3000` represent 70% and 30%. Rebalances are scheduled monthly, quarterly, or yearly, decided from the previous common-session close, and executed on the next common session. A drift threshold avoids small trades. All inputs must represent prices in the configured portfolio currency because changing FX rates are not modeled.
 
+Compare allocation weights and rebalance policies over rolling, non-overlapping held-out periods:
+
+```sh
+target/release/trader \
+  --config config/equity-portfolio.example.toml \
+  --walk-forward-equity-portfolio
+```
+
+Configure allocation vectors under `[equity_portfolio.walk_forward]`; every vector must match the asset order and total `10000` basis points. If omitted, a two-asset portfolio automatically tests weights in 10% steps. Each held-out window starts with the configured cash balance. The report ranks combinations by average held-out Sharpe and also shows average and worst return, worst drawdown, turnover, and return versus holding the first configured asset alone.
+
 ## Safe Modes
 
 Use these modes in order:
