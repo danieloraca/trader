@@ -57,6 +57,18 @@ The default walk-forward plan uses three rolling training years and one-year non
 
 The importer validates dates and OHLC relationships but cannot determine whether a vendor adjusted prices for splits or dividends. Set `prices_are_adjusted = true` only when the entire OHLC series is adjusted consistently. Otherwise the result is price return, not a reliable total-return comparison. The initial implementation keeps the portfolio and instrument in the configured instrument currency; `fx_bps` models a conversion charge but not changing FX rates.
 
+## Multi-ETF Portfolio Research
+
+Portfolio research loads two or more daily price histories, restricts them to common trading dates, and compares cash, each asset held alone, the configured static allocation, and periodic rebalancing. Run the synthetic 70/30 equity-bond example:
+
+```sh
+target/release/trader \
+  --config config/equity-portfolio.example.toml \
+  --backtest-equity-portfolio
+```
+
+Portfolio asset paths are resolved relative to the config file. Target weights use basis points and must total `10000`; for example, `7000` and `3000` represent 70% and 30%. Rebalances are scheduled monthly, quarterly, or yearly, decided from the previous common-session close, and executed on the next common session. A drift threshold avoids small trades. All inputs must represent prices in the configured portfolio currency because changing FX rates are not modeled.
+
 ## Safe Modes
 
 Use these modes in order:

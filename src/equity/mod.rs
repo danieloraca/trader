@@ -1,3 +1,4 @@
+mod portfolio;
 mod price_data;
 mod simulation;
 mod walk_forward;
@@ -9,6 +10,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
 
+pub use portfolio::EquityPortfolioReport;
 pub use simulation::EquityResearchReport;
 pub use walk_forward::EquityWalkForwardReport;
 
@@ -128,6 +130,10 @@ pub fn run_walk_forward(
     let config = load_config(config_path)?;
     let data = price_data::load(price_path)?;
     walk_forward::run(&config, &data)
+}
+
+pub fn run_portfolio(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
+    portfolio::run(config_path)
 }
 
 fn load_config(path: impl AsRef<Path>) -> Result<EquityResearchConfig> {

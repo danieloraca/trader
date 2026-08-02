@@ -500,14 +500,14 @@ fn whole_shares(value: Decimal) -> Decimal {
     Decimal::from_micro_units((value.micro_units() / DECIMAL_SCALE) * DECIMAL_SCALE)
 }
 
-struct Statistics {
-    cagr_pct: f64,
-    volatility_pct: f64,
-    sharpe_ratio: f64,
-    max_drawdown_pct: f64,
+pub(super) struct Statistics {
+    pub(super) cagr_pct: f64,
+    pub(super) volatility_pct: f64,
+    pub(super) sharpe_ratio: f64,
+    pub(super) max_drawdown_pct: f64,
 }
 
-fn calculate_statistics(
+pub(super) fn calculate_statistics(
     equity_curve: &[Decimal],
     initial_cash: Decimal,
     annual_trading_days: usize,
@@ -572,11 +572,11 @@ fn calculate_statistics(
     }
 }
 
-fn to_f64(value: Decimal) -> f64 {
+pub(super) fn to_f64(value: Decimal) -> f64 {
     value.micro_units() as f64 / DECIMAL_SCALE as f64
 }
 
-fn percent_ratio(numerator: Decimal, denominator: Decimal) -> f64 {
+pub(super) fn percent_ratio(numerator: Decimal, denominator: Decimal) -> f64 {
     numerator.ratio_to(denominator) * 100.0
 }
 

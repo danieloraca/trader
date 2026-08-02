@@ -1,0 +1,26 @@
+[equity_portfolio]
+name = "70/30 equity-bond demo"
+currency = "GBP"
+initial_cash = 10000.0
+
+commission_per_order = 3.0
+commission_bps = 0
+spread_bps = 10
+slippage_bps = 5
+allow_fractional_shares = false
+prices_are_adjusted = false
+
+annual_trading_days = 252
+annual_risk_free_rate_pct = 0.0
+rebalance_threshold_bps = 100
+rebalance_frequencies = ["monthly", "quarterly", "yearly"]
+
+[[equity_portfolio.assets]]
+symbol = "GLOBAL_EQUITY"
+price_file = "../examples/equity-daily-sample.csv"
+target_weight_bps = 7000
+
+[[equity_portfolio.assets]]
+symbol = "GLOBAL_BOND"
+price_file = "../examples/bond-daily-sample.csv"
+target_weight_bps = 3000

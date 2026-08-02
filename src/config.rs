@@ -481,6 +481,7 @@ pub enum RuntimeCommand {
     Backtest,
     BacktestSqlite,
     BacktestEquity,
+    BacktestEquityPortfolio,
     WalkForwardEquity,
     SweepSqlite,
     SweepCandlesSqlite,
@@ -950,6 +951,8 @@ impl RuntimeOptions {
                 };
                 command = RuntimeCommand::WalkForwardEquity;
                 walk_forward_equity_path = Some(path);
+            } else if arg == "--backtest-equity-portfolio" {
+                command = RuntimeCommand::BacktestEquityPortfolio;
             } else if arg == "--sweep-sqlite" {
                 let Some(path) = args.next() else {
                     return Err(BotError::Config(
@@ -1618,6 +1621,22 @@ verbose = true
             options.walk_forward_equity_path.as_deref(),
             Some("data/vwrp.xlsx")
         );
+    }
+
+    #[test]
+    fn accepts_backtest_equity_portfolio_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "config/equity-portfolio.example.toml".to_string(),
+                "--backtest-equity-portfolio".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.command, RuntimeCommand::BacktestEquityPortfolio);
     }
 
     #[test]
