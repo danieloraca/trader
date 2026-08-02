@@ -1,5 +1,6 @@
 mod price_data;
 mod simulation;
+mod walk_forward;
 
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
@@ -9,6 +10,7 @@ use std::fs;
 use std::path::Path;
 
 pub use simulation::EquityResearchReport;
+pub use walk_forward::EquityWalkForwardReport;
 
 #[derive(Debug, Clone, Deserialize)]
 struct EquityResearchFile {
@@ -47,6 +49,43 @@ pub struct EquityResearchConfig {
     pub breakout_entry_window: usize,
     #[serde(default = "default_breakout_exit_window")]
     pub breakout_exit_window: usize,
+    #[serde(default)]
+    pub walk_forward: EquityWalkForwardConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EquityWalkForwardConfig {
+    #[serde(default = "default_walk_forward_train_sessions")]
+    pub train_sessions: usize,
+    #[serde(default = "default_walk_forward_test_sessions")]
+    pub test_sessions: usize,
+    #[serde(default = "default_walk_forward_step_sessions")]
+    pub step_sessions: usize,
+    #[serde(default = "default_walk_forward_minimum_test_trades")]
+    pub minimum_test_trades_per_window: usize,
+    #[serde(default = "default_walk_forward_ma_fast_windows")]
+    pub ma_fast_windows: Vec<usize>,
+    #[serde(default = "default_walk_forward_ma_slow_windows")]
+    pub ma_slow_windows: Vec<usize>,
+    #[serde(default = "default_walk_forward_breakout_entry_windows")]
+    pub breakout_entry_windows: Vec<usize>,
+    #[serde(default = "default_walk_forward_breakout_exit_windows")]
+    pub breakout_exit_windows: Vec<usize>,
+}
+
+impl Default for EquityWalkForwardConfig {
+    fn default() -> Self {
+        Self {
+            train_sessions: default_walk_forward_train_sessions(),
+            test_sessions: default_walk_forward_test_sessions(),
+            step_sessions: default_walk_forward_step_sessions(),
+            minimum_test_trades_per_window: default_walk_forward_minimum_test_trades(),
+            ma_fast_windows: default_walk_forward_ma_fast_windows(),
+            ma_slow_windows: default_walk_forward_ma_slow_windows(),
+            breakout_entry_windows: default_walk_forward_breakout_entry_windows(),
+            breakout_exit_windows: default_walk_forward_breakout_exit_windows(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +119,15 @@ pub fn run(
     let config = load_config(config_path)?;
     let data = price_data::load(price_path)?;
     simulation::run(&config, &data)
+}
+
+pub fn run_walk_forward(
+    config_path: impl AsRef<Path>,
+    price_path: impl AsRef<Path>,
+) -> Result<EquityWalkForwardReport> {
+    let config = load_config(config_path)?;
+    let data = price_data::load(price_path)?;
+    walk_forward::run(&config, &data)
 }
 
 fn load_config(path: impl AsRef<Path>) -> Result<EquityResearchConfig> {
@@ -160,6 +208,61 @@ impl EquityResearchConfig {
                 "breakout entry and exit windows must be positive".to_string(),
             ));
         }
+        self.walk_forward.validate()?;
+        Ok(())
+    }
+}
+
+impl EquityWalkForwardConfig {
+    fn validate(&self) -> Result<()> {
+        if self.train_sessions == 0 || self.test_sessions == 0 || self.step_sessions == 0 {
+            return Err(BotError::Config(
+                "equity walk-forward train, test, and step sessions must be positive".to_string(),
+            ));
+        }
+        if self.step_sessions < self.test_sessions {
+            return Err(BotError::Config(
+                "equity walk-forward step sessions must be at least the test sessions to keep held-out windows non-overlapping"
+                    .to_string(),
+            ));
+        }
+        if self.minimum_test_trades_per_window == 0 {
+            return Err(BotError::Config(
+                "equity walk-forward minimum test trades must be positive".to_string(),
+            ));
+        }
+        for (name, values) in [
+            ("MA fast", self.ma_fast_windows.as_slice()),
+            ("MA slow", self.ma_slow_windows.as_slice()),
+            ("breakout entry", self.breakout_entry_windows.as_slice()),
+            ("breakout exit", self.breakout_exit_windows.as_slice()),
+        ] {
+            if values.is_empty() || values.contains(&0) {
+                return Err(BotError::Config(format!(
+                    "equity walk-forward {name} windows must be non-empty and positive"
+                )));
+            }
+        }
+        if !self
+            .ma_fast_windows
+            .iter()
+            .any(|fast| self.ma_slow_windows.iter().any(|slow| fast < slow))
+        {
+            return Err(BotError::Config(
+                "equity walk-forward needs at least one MA fast window below a slow window"
+                    .to_string(),
+            ));
+        }
+        if !self
+            .breakout_entry_windows
+            .iter()
+            .any(|entry| self.breakout_exit_windows.iter().any(|exit| exit < entry))
+        {
+            return Err(BotError::Config(
+                "equity walk-forward needs at least one breakout exit window below an entry window"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -200,6 +303,38 @@ fn default_breakout_exit_window() -> usize {
     20
 }
 
+fn default_walk_forward_train_sessions() -> usize {
+    756
+}
+
+fn default_walk_forward_test_sessions() -> usize {
+    252
+}
+
+fn default_walk_forward_step_sessions() -> usize {
+    252
+}
+
+fn default_walk_forward_minimum_test_trades() -> usize {
+    1
+}
+
+fn default_walk_forward_ma_fast_windows() -> Vec<usize> {
+    vec![20, 50, 100]
+}
+
+fn default_walk_forward_ma_slow_windows() -> Vec<usize> {
+    vec![100, 150, 200, 250]
+}
+
+fn default_walk_forward_breakout_entry_windows() -> Vec<usize> {
+    vec![20, 55, 100]
+}
+
+fn default_walk_forward_breakout_exit_windows() -> Vec<usize> {
+    vec![10, 20, 50]
+}
+
 #[cfg(test)]
 mod tests {
     use super::load_config;
@@ -231,6 +366,8 @@ currency = "GBP"
         assert_eq!(config.instrument.symbol, "VWRP.L");
         assert_eq!(config.initial_cash.to_string(), "10000");
         assert_eq!(config.ma_slow_window, 50);
+        assert_eq!(config.walk_forward.train_sessions, 756);
+        assert_eq!(config.walk_forward.test_sessions, 252);
         fs::remove_file(path).expect("config should remove");
     }
 }

@@ -30,6 +30,14 @@ fn main() -> Result<()> {
         println!("{report}");
         return Ok(());
     }
+    if runtime.command == RuntimeCommand::WalkForwardEquity {
+        let price_path = runtime.walk_forward_equity_path.as_deref().ok_or_else(|| {
+            error::BotError::Config("--walk-forward-equity requires a daily price file".to_string())
+        })?;
+        let report = equity::run_walk_forward(&runtime.config_path, price_path)?;
+        println!("{report}");
+        return Ok(());
+    }
 
     let config = config::Config::load_from_path(&runtime.config_path)?;
 
@@ -48,6 +56,9 @@ fn main() -> Result<()> {
             return Ok(());
         }
         RuntimeCommand::BacktestEquity => unreachable!("handled before daemon config loading"),
+        RuntimeCommand::WalkForwardEquity => {
+            unreachable!("handled before daemon config loading")
+        }
         RuntimeCommand::SweepSqlite => {
             let sqlite_path = runtime.sweep_sqlite_path.as_deref().ok_or_else(|| {
                 error::BotError::Config("--sweep-sqlite requires a sqlite path".to_string())

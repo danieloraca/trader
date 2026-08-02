@@ -45,6 +45,16 @@ The Vanguard-shaped close-only fixture is available at
 
 The report compares buy-and-hold, finite-cash monthly DCA, moving-average crossover, and channel breakout. Close-based decisions execute at the next session open for OHLCV data and at the next session close for close-only data, avoiding look-ahead bias in both cases. Close-only breakout channels use closing prices. The report includes return, CAGR, annualized volatility, Sharpe ratio, maximum drawdown, turnover, fees, execution friction, exposure, and performance versus buy-and-hold.
 
+Run the rolling equity parameter sweep against the same file:
+
+```sh
+target/release/trader \
+  --config config/equity-research.example.toml \
+  --walk-forward-equity data/vwrp-history.xlsx
+```
+
+The default walk-forward plan uses three rolling training years and one-year non-overlapping held-out test windows. It tests configurable MA and breakout grids, warms each strategy only from its training window, resets the portfolio to the configured initial cash for every test window, and compares held-out results with cash and buy-and-hold. Reviewing the report consumes those test windows for research; selected parameters still require later unseen data before deployment.
+
 The importer validates dates and OHLC relationships but cannot determine whether a vendor adjusted prices for splits or dividends. Set `prices_are_adjusted = true` only when the entire OHLC series is adjusted consistently. Otherwise the result is price return, not a reliable total-return comparison. The initial implementation keeps the portfolio and instrument in the configured instrument currency; `fx_bps` models a conversion charge but not changing FX rates.
 
 ## Safe Modes

@@ -22,6 +22,18 @@ ma_slow_window = 200
 breakout_entry_window = 55
 breakout_exit_window = 20
 
+[equity_research.walk_forward]
+# Three rolling training years followed by one held-out year. The test windows
+# do not overlap with this step size.
+train_sessions = 756
+test_sessions = 252
+step_sessions = 252
+minimum_test_trades_per_window = 1
+ma_fast_windows = [20, 50, 100]
+ma_slow_windows = [100, 150, 200, 250]
+breakout_entry_windows = [20, 55, 100]
+breakout_exit_windows = [10, 20, 50]
+
 [equity_research.instrument]
 symbol = "VWRP.L"
 asset_class = "etf"

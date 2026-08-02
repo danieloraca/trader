@@ -481,6 +481,7 @@ pub enum RuntimeCommand {
     Backtest,
     BacktestSqlite,
     BacktestEquity,
+    WalkForwardEquity,
     SweepSqlite,
     SweepCandlesSqlite,
     WalkForwardSqlite,
@@ -492,6 +493,7 @@ pub struct RuntimeOptions {
     pub command: RuntimeCommand,
     pub backtest_sqlite_path: Option<String>,
     pub backtest_equity_path: Option<String>,
+    pub walk_forward_equity_path: Option<String>,
     pub sweep_sqlite_path: Option<String>,
     pub sweep_candles_sqlite_path: Option<String>,
     pub walk_forward_sqlite_path: Option<String>,
@@ -911,6 +913,7 @@ impl RuntimeOptions {
         let mut command = RuntimeCommand::Run;
         let mut backtest_sqlite_path = None;
         let mut backtest_equity_path = None;
+        let mut walk_forward_equity_path = None;
         let mut sweep_sqlite_path = None;
         let mut sweep_candles_sqlite_path = None;
         let mut walk_forward_sqlite_path = None;
@@ -939,6 +942,14 @@ impl RuntimeOptions {
                 };
                 command = RuntimeCommand::BacktestEquity;
                 backtest_equity_path = Some(path);
+            } else if arg == "--walk-forward-equity" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--walk-forward-equity requires a daily price file path".to_string(),
+                    ));
+                };
+                command = RuntimeCommand::WalkForwardEquity;
+                walk_forward_equity_path = Some(path);
             } else if arg == "--sweep-sqlite" {
                 let Some(path) = args.next() else {
                     return Err(BotError::Config(
@@ -973,6 +984,7 @@ impl RuntimeOptions {
             command,
             backtest_sqlite_path,
             backtest_equity_path,
+            walk_forward_equity_path,
             sweep_sqlite_path,
             sweep_candles_sqlite_path,
             walk_forward_sqlite_path,
@@ -1584,6 +1596,27 @@ verbose = true
         assert_eq!(
             options.backtest_equity_path.as_deref(),
             Some("data/vwrp.csv")
+        );
+    }
+
+    #[test]
+    fn accepts_walk_forward_equity_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "config/equity-research.example.toml".to_string(),
+                "--walk-forward-equity".to_string(),
+                "data/vwrp.xlsx".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.command, RuntimeCommand::WalkForwardEquity);
+        assert_eq!(
+            options.walk_forward_equity_path.as_deref(),
+            Some("data/vwrp.xlsx")
         );
     }
 

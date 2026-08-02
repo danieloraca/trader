@@ -33,20 +33,20 @@ pub struct EquityResearchReport {
 }
 
 #[derive(Debug, Clone)]
-struct StrategyResult {
+pub(super) struct StrategyResult {
     name: String,
     final_value: Decimal,
     profit_loss: Decimal,
-    return_pct: f64,
+    pub(super) return_pct: f64,
     cagr_pct: f64,
     volatility_pct: f64,
-    sharpe_ratio: f64,
-    max_drawdown_pct: f64,
+    pub(super) sharpe_ratio: f64,
+    pub(super) max_drawdown_pct: f64,
     versus_hold_pct: f64,
-    trade_count: usize,
-    turnover_pct: f64,
-    total_fees: Decimal,
-    execution_friction: Decimal,
+    pub(super) trade_count: usize,
+    pub(super) turnover_pct: f64,
+    pub(super) total_fees: Decimal,
+    pub(super) execution_friction: Decimal,
     exposure_pct: f64,
     final_shares: Decimal,
 }
@@ -150,15 +150,23 @@ fn monthly_dca_actions(config: &EquityResearchConfig, bars: &[DailyBar]) -> Vec<
 }
 
 fn moving_average_actions(config: &EquityResearchConfig, bars: &[DailyBar]) -> Vec<Vec<Action>> {
+    moving_average_actions_for_windows(bars, config.ma_fast_window, config.ma_slow_window)
+}
+
+fn moving_average_actions_for_windows(
+    bars: &[DailyBar],
+    fast_window: usize,
+    slow_window: usize,
+) -> Vec<Vec<Action>> {
     let mut actions = empty_actions(bars.len());
-    if bars.len() <= config.ma_slow_window {
+    if bars.len() <= slow_window {
         return actions;
     }
 
     let mut previous_invested = None;
-    for index in (config.ma_slow_window - 1)..(bars.len() - 1) {
-        let slow_start = index + 1 - config.ma_slow_window;
-        let fast_start = index + 1 - config.ma_fast_window;
+    for index in (slow_window - 1)..(bars.len() - 1) {
+        let slow_start = index + 1 - slow_window;
+        let fast_start = index + 1 - fast_window;
         let slow = average_close(&bars[slow_start..=index]);
         let fast = average_close(&bars[fast_start..=index]);
         let invested = fast > slow;
@@ -179,10 +187,22 @@ fn breakout_actions(
     bars: &[DailyBar],
     data_kind: DailyPriceKind,
 ) -> Vec<Vec<Action>> {
+    breakout_actions_for_windows(
+        bars,
+        data_kind,
+        config.breakout_entry_window,
+        config.breakout_exit_window,
+    )
+}
+
+fn breakout_actions_for_windows(
+    bars: &[DailyBar],
+    data_kind: DailyPriceKind,
+    entry_window: usize,
+    exit_window: usize,
+) -> Vec<Vec<Action>> {
     let mut actions = empty_actions(bars.len());
-    let warmup = config
-        .breakout_entry_window
-        .max(config.breakout_exit_window);
+    let warmup = entry_window.max(exit_window);
     if bars.len() <= warmup + 1 {
         return actions;
     }
@@ -191,7 +211,7 @@ fn breakout_actions(
     for index in warmup..(bars.len() - 1) {
         let close = bars[index].close;
         if !invested {
-            let previous_high = bars[index - config.breakout_entry_window..index]
+            let previous_high = bars[index - entry_window..index]
                 .iter()
                 .map(|bar| match data_kind {
                     DailyPriceKind::Ohlcv => bar.high,
@@ -204,7 +224,7 @@ fn breakout_actions(
                 invested = true;
             }
         } else {
-            let previous_low = bars[index - config.breakout_exit_window..index]
+            let previous_low = bars[index - exit_window..index]
                 .iter()
                 .map(|bar| match data_kind {
                     DailyPriceKind::Ohlcv => bar.low,
@@ -240,6 +260,19 @@ fn simulate(
     actions: &[Vec<Action>],
     data_kind: DailyPriceKind,
 ) -> StrategyResult {
+    simulate_from(name, config, bars, actions, data_kind, 0)
+}
+
+fn simulate_from(
+    name: String,
+    config: &EquityResearchConfig,
+    bars: &[DailyBar],
+    actions: &[Vec<Action>],
+    data_kind: DailyPriceKind,
+    start_index: usize,
+) -> StrategyResult {
+    let bars_in_scope = &bars[start_index..];
+    let actions_in_scope = &actions[start_index..];
     let mut state = PortfolioState {
         cash: config.initial_cash,
         shares: Decimal::ZERO,
@@ -248,14 +281,25 @@ fn simulate(
         fees: Decimal::ZERO,
         execution_friction: Decimal::ZERO,
         exposed_sessions: 0,
-        equity_curve: Vec::with_capacity(bars.len()),
+        equity_curve: Vec::with_capacity(bars_in_scope.len()),
     };
 
-    for (bar, day_actions) in bars.iter().zip(actions) {
-        let market_price = match data_kind {
-            DailyPriceKind::Ohlcv => bar.open,
-            DailyPriceKind::CloseOnly => bar.close,
-        };
+    let was_invested = actions[..start_index]
+        .iter()
+        .flatten()
+        .fold(false, |_invested, action| match action {
+            Action::BuyAll | Action::BuyAmount(_) => true,
+            Action::SellAll => false,
+        });
+    if was_invested {
+        let first_bar = &bars_in_scope[0];
+        let market_price = execution_market_price(first_bar, data_kind);
+        let budget = state.cash;
+        buy(config, &mut state, market_price, budget);
+    }
+
+    for (bar, day_actions) in bars_in_scope.iter().zip(actions_in_scope) {
+        let market_price = execution_market_price(bar, data_kind);
         for action in day_actions {
             match action {
                 Action::BuyAll => {
@@ -304,9 +348,71 @@ fn simulate(
         turnover_pct: percent_ratio(state.traded_value, config.initial_cash),
         total_fees: state.fees,
         execution_friction: state.execution_friction,
-        exposure_pct: state.exposed_sessions as f64 / bars.len() as f64 * 100.0,
+        exposure_pct: state.exposed_sessions as f64 / bars_in_scope.len() as f64 * 100.0,
         final_shares: state.shares,
     }
+}
+
+fn execution_market_price(bar: &DailyBar, data_kind: DailyPriceKind) -> Decimal {
+    match data_kind {
+        DailyPriceKind::Ohlcv => bar.open,
+        DailyPriceKind::CloseOnly => bar.close,
+    }
+}
+
+pub(super) fn evaluate_buy_and_hold(
+    config: &EquityResearchConfig,
+    bars: &[DailyBar],
+    data_kind: DailyPriceKind,
+    start_index: usize,
+) -> StrategyResult {
+    let actions = buy_and_hold_actions(bars);
+    simulate_from(
+        "Buy and hold".to_string(),
+        config,
+        bars,
+        &actions,
+        data_kind,
+        start_index,
+    )
+}
+
+pub(super) fn evaluate_moving_average(
+    config: &EquityResearchConfig,
+    bars: &[DailyBar],
+    data_kind: DailyPriceKind,
+    fast_window: usize,
+    slow_window: usize,
+    start_index: usize,
+) -> StrategyResult {
+    let actions = moving_average_actions_for_windows(bars, fast_window, slow_window);
+    simulate_from(
+        format!("MA {fast_window}/{slow_window}"),
+        config,
+        bars,
+        &actions,
+        data_kind,
+        start_index,
+    )
+}
+
+pub(super) fn evaluate_breakout(
+    config: &EquityResearchConfig,
+    bars: &[DailyBar],
+    data_kind: DailyPriceKind,
+    entry_window: usize,
+    exit_window: usize,
+    start_index: usize,
+) -> StrategyResult {
+    let actions = breakout_actions_for_windows(bars, data_kind, entry_window, exit_window);
+    simulate_from(
+        format!("Breakout {entry_window}/{exit_window}"),
+        config,
+        bars,
+        &actions,
+        data_kind,
+        start_index,
+    )
 }
 
 fn buy(
@@ -589,7 +695,7 @@ impl Display for EquityResearchReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, moving_average_actions, run};
+    use super::{Action, evaluate_buy_and_hold, moving_average_actions, run};
     use crate::decimal::Decimal;
     use crate::equity::price_data::{
         DailyBar, DailyPriceData, DailyPriceKind, InputFormat, TradingDate,
@@ -623,6 +729,7 @@ mod tests {
             ma_slow_window: 3,
             breakout_entry_window: 3,
             breakout_exit_window: 2,
+            walk_forward: Default::default(),
         }
     }
 
@@ -684,5 +791,14 @@ mod tests {
             .expect("close-only research should run");
 
         assert!(report.to_string().contains("next session close"));
+    }
+
+    #[test]
+    fn held_out_buy_and_hold_enters_at_test_start() {
+        let bars = bars();
+        let result = evaluate_buy_and_hold(&config(), &bars, DailyPriceKind::CloseOnly, 3);
+
+        assert_eq!(result.trade_count, 1);
+        assert!(result.return_pct < 0.0);
     }
 }
