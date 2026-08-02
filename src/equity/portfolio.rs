@@ -223,6 +223,22 @@ struct AssetSummary {
     path: PathBuf,
 }
 
+pub(super) struct PortfolioPlanningContext {
+    pub(super) name: String,
+    pub(super) currency: String,
+    pub(super) price_date: String,
+    pub(super) commission_per_order: Decimal,
+    pub(super) commission_bps: i64,
+    pub(super) assets: Vec<PortfolioPlanningAsset>,
+}
+
+pub(super) struct PortfolioPlanningAsset {
+    pub(super) symbol: String,
+    pub(super) target_weight_bps: i64,
+    pub(super) market_price: Decimal,
+    pub(super) estimated_buy_price: Decimal,
+}
+
 pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
     let config_path = config_path.as_ref();
     let config = load_config(config_path)?;
@@ -287,6 +303,42 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
         rebalance_threshold_bps: config.rebalance_threshold_bps,
         assets,
         results,
+    })
+}
+
+pub(super) fn load_planning_context(
+    config_path: impl AsRef<Path>,
+) -> Result<PortfolioPlanningContext> {
+    let config_path = config_path.as_ref();
+    let config = load_config(config_path)?;
+    let inputs = load_assets(config_path, &config)?;
+    let sessions = align_sessions(&inputs)?;
+    validate_common_session_count(&config, sessions.len())?;
+    let latest = sessions
+        .last()
+        .expect("aligned portfolio histories should not be empty");
+    let assets = config
+        .assets
+        .iter()
+        .enumerate()
+        .map(|(index, asset)| PortfolioPlanningAsset {
+            symbol: asset.symbol.clone(),
+            target_weight_bps: asset.target_weight_bps,
+            market_price: latest.close_prices[index],
+            estimated_buy_price: adjusted_execution_price(
+                &config,
+                latest.close_prices[index],
+                true,
+            ),
+        })
+        .collect();
+    Ok(PortfolioPlanningContext {
+        name: config.name,
+        currency: config.currency,
+        price_date: latest.date_text.clone(),
+        commission_per_order: config.commission_per_order,
+        commission_bps: config.commission_bps,
+        assets,
     })
 }
 

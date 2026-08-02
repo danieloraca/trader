@@ -1,3 +1,4 @@
+mod contribution_plan;
 mod portfolio;
 mod price_data;
 mod simulation;
@@ -10,6 +11,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
 
+pub use contribution_plan::ContributionPlanReport;
 pub use portfolio::{EquityPortfolioReport, EquityPortfolioWalkForwardReport};
 pub use simulation::EquityResearchReport;
 pub use walk_forward::EquityWalkForwardReport;
@@ -140,6 +142,13 @@ pub fn run_portfolio_walk_forward(
     config_path: impl AsRef<Path>,
 ) -> Result<EquityPortfolioWalkForwardReport> {
     portfolio::run_walk_forward(config_path)
+}
+
+pub fn run_contribution_plan(
+    config_path: impl AsRef<Path>,
+    holdings_path: impl AsRef<Path>,
+) -> Result<ContributionPlanReport> {
+    contribution_plan::run(config_path, holdings_path)
 }
 
 fn load_config(path: impl AsRef<Path>) -> Result<EquityResearchConfig> {

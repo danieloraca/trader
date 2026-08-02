@@ -48,6 +48,20 @@ fn main() -> Result<()> {
         println!("{report}");
         return Ok(());
     }
+    if runtime.command == RuntimeCommand::PlanEquityPortfolioContribution {
+        let holdings_path = runtime
+            .contribution_plan_holdings_path
+            .as_deref()
+            .ok_or_else(|| {
+                error::BotError::Config(
+                    "--plan-equity-portfolio-contribution requires a holdings TOML path"
+                        .to_string(),
+                )
+            })?;
+        let report = equity::run_contribution_plan(&runtime.config_path, holdings_path)?;
+        println!("{report}");
+        return Ok(());
+    }
 
     let config = config::Config::load_from_path(&runtime.config_path)?;
 
@@ -70,6 +84,9 @@ fn main() -> Result<()> {
             unreachable!("handled before daemon config loading")
         }
         RuntimeCommand::WalkForwardEquityPortfolio => {
+            unreachable!("handled before daemon config loading")
+        }
+        RuntimeCommand::PlanEquityPortfolioContribution => {
             unreachable!("handled before daemon config loading")
         }
         RuntimeCommand::WalkForwardEquity => {

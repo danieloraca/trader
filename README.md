@@ -89,6 +89,16 @@ target/release/trader \
 
 The proxy configuration requires at least 2,000 common sessions and five held-out windows. It uses accumulation-fund NAVs and fractional units to avoid proxy unit-price differences distorting the allocation test. These proxies validate the allocation concept over a longer, different history; they do not represent directly executable ETF prices.
 
+Generate an offline whole-share contribution plan from current holdings and the latest common prices in the configured histories:
+
+```sh
+target/release/trader \
+  --config config/equity-portfolio.toml \
+  --plan-equity-portfolio-contribution config/equity-portfolio-holdings.toml
+```
+
+Start from `config/equity-portfolio-holdings.example.toml`, set the cash currently available and the whole-share quantity held for every configured asset, and keep the symbols identical to the portfolio config. The planner recommends buys only, includes configured commissions and execution friction, and stops when another affordable whole share would not improve total allocation drift. It uses historical closing prices for planning and never places orders.
+
 ## Safe Modes
 
 Use these modes in order:

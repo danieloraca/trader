@@ -482,6 +482,7 @@ pub enum RuntimeCommand {
     BacktestSqlite,
     BacktestEquity,
     BacktestEquityPortfolio,
+    PlanEquityPortfolioContribution,
     WalkForwardEquityPortfolio,
     WalkForwardEquity,
     SweepSqlite,
@@ -496,6 +497,7 @@ pub struct RuntimeOptions {
     pub backtest_sqlite_path: Option<String>,
     pub backtest_equity_path: Option<String>,
     pub walk_forward_equity_path: Option<String>,
+    pub contribution_plan_holdings_path: Option<String>,
     pub sweep_sqlite_path: Option<String>,
     pub sweep_candles_sqlite_path: Option<String>,
     pub walk_forward_sqlite_path: Option<String>,
@@ -916,6 +918,7 @@ impl RuntimeOptions {
         let mut backtest_sqlite_path = None;
         let mut backtest_equity_path = None;
         let mut walk_forward_equity_path = None;
+        let mut contribution_plan_holdings_path = None;
         let mut sweep_sqlite_path = None;
         let mut sweep_candles_sqlite_path = None;
         let mut walk_forward_sqlite_path = None;
@@ -956,6 +959,15 @@ impl RuntimeOptions {
                 command = RuntimeCommand::BacktestEquityPortfolio;
             } else if arg == "--walk-forward-equity-portfolio" {
                 command = RuntimeCommand::WalkForwardEquityPortfolio;
+            } else if arg == "--plan-equity-portfolio-contribution" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--plan-equity-portfolio-contribution requires a holdings TOML path"
+                            .to_string(),
+                    ));
+                };
+                command = RuntimeCommand::PlanEquityPortfolioContribution;
+                contribution_plan_holdings_path = Some(path);
             } else if arg == "--sweep-sqlite" {
                 let Some(path) = args.next() else {
                     return Err(BotError::Config(
@@ -991,6 +1003,7 @@ impl RuntimeOptions {
             backtest_sqlite_path,
             backtest_equity_path,
             walk_forward_equity_path,
+            contribution_plan_holdings_path,
             sweep_sqlite_path,
             sweep_candles_sqlite_path,
             walk_forward_sqlite_path,
@@ -1656,6 +1669,30 @@ verbose = true
         .expect("runtime options should parse");
 
         assert_eq!(options.command, RuntimeCommand::WalkForwardEquityPortfolio);
+    }
+
+    #[test]
+    fn accepts_equity_portfolio_contribution_plan_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "config/equity-portfolio.toml".to_string(),
+                "--plan-equity-portfolio-contribution".to_string(),
+                "config/portfolio-holdings.toml".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(
+            options.command,
+            RuntimeCommand::PlanEquityPortfolioContribution
+        );
+        assert_eq!(
+            options.contribution_plan_holdings_path.as_deref(),
+            Some("config/portfolio-holdings.toml")
+        );
     }
 
     #[test]

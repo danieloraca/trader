@@ -19,10 +19,10 @@ rebalance_frequencies = ["quarterly", "yearly"]
 [[equity_portfolio.assets]]
 symbol = "VWRP.L"
 price_file = "../hist.xlsx"
-target_weight_bps = 7000
+target_weight_bps = 8000 # VWRP.L
+target_weight_bps = 2000 # VAGS.L
 
 [[equity_portfolio.assets]]
 symbol = "VAGS.L"
 price_file = "../bond-hist.xlsx"
 target_weight_bps = 3000
-

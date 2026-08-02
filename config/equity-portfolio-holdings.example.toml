@@ -1,0 +1,11 @@
+[portfolio_holdings]
+# Total cash currently available for this purchase, including the new contribution.
+available_cash = 500.0
+
+[[portfolio_holdings.assets]]
+symbol = "VWRP.L"
+shares = 0
+
+[[portfolio_holdings.assets]]
+symbol = "VAGS.L"
+shares = 0
