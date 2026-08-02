@@ -2,6 +2,38 @@
 
 Rust trading bot foundation for Raspberry Pi paper-live testing.
 
+## Equity ETF Research
+
+The equity path is an offline research command and is isolated from the Kraken daemon. It reads daily OHLCV CSV data and does not contact a broker or write to the trading database.
+
+Prepare a comma-separated file with strictly increasing daily rows:
+
+```csv
+date,open,high,low,close,volume
+2025-01-02,100.10,101.20,99.80,100.90,123456
+2025-01-03,100.95,102.00,100.50,101.70,135790
+```
+
+Run the comparison:
+
+```sh
+cargo run --release -- \
+  --config config/equity-research.example.toml \
+  --backtest-equity-csv data/vwrp-daily.csv
+```
+
+Exercise the command with the small synthetic fixture (it is a parser/demo fixture, not research data):
+
+```sh
+cargo run -- \
+  --config config/equity-research.example.toml \
+  --backtest-equity-csv examples/equity-daily-sample.csv
+```
+
+The report compares buy-and-hold, finite-cash monthly DCA, moving-average crossover, and channel breakout. Close-based decisions execute at the next session open to avoid look-ahead bias. It reports return, CAGR, annualized volatility, Sharpe ratio, maximum drawdown, turnover, fees, execution friction, exposure, and performance versus buy-and-hold.
+
+The importer validates dates and OHLC relationships but cannot determine whether a vendor adjusted prices for splits or dividends. Set `prices_are_adjusted = true` only when the entire OHLC series is adjusted consistently. Otherwise the result is price return, not a reliable total-return comparison. The initial implementation keeps the portfolio and instrument in the configured instrument currency; `fx_bps` models a conversion charge but not changing FX rates.
+
 ## Safe Modes
 
 Use these modes in order:

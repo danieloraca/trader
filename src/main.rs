@@ -3,6 +3,7 @@ mod backtest;
 mod candles;
 mod config;
 mod decimal;
+mod equity;
 mod error;
 mod exchange;
 mod market;
@@ -20,6 +21,16 @@ use crate::error::Result;
 
 fn main() -> Result<()> {
     let runtime = config::RuntimeOptions::from_runtime()?;
+
+    if runtime.command == RuntimeCommand::BacktestEquityCsv {
+        let csv_path = runtime.backtest_equity_csv_path.as_deref().ok_or_else(|| {
+            error::BotError::Config("--backtest-equity-csv requires an OHLCV CSV path".to_string())
+        })?;
+        let report = equity::run(&runtime.config_path, csv_path)?;
+        println!("{report}");
+        return Ok(());
+    }
+
     let config = config::Config::load_from_path(&runtime.config_path)?;
 
     match runtime.command {
@@ -36,6 +47,7 @@ fn main() -> Result<()> {
             println!("{report}");
             return Ok(());
         }
+        RuntimeCommand::BacktestEquityCsv => unreachable!("handled before daemon config loading"),
         RuntimeCommand::SweepSqlite => {
             let sqlite_path = runtime.sweep_sqlite_path.as_deref().ok_or_else(|| {
                 error::BotError::Config("--sweep-sqlite requires a sqlite path".to_string())

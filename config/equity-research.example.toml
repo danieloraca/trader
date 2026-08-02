@@ -1,0 +1,27 @@
+[equity_research]
+initial_cash = 10000.0
+
+# Replace these illustrative assumptions with the selected broker, venue, and
+# account-currency costs before relying on a report.
+commission_per_order = 3.0
+commission_bps = 0
+spread_bps = 10
+slippage_bps = 5
+fx_bps = 0
+allow_fractional_shares = false
+
+annual_trading_days = 252
+annual_risk_free_rate_pct = 0.0
+prices_are_adjusted = false
+
+monthly_dca_amount = 500.0
+ma_fast_window = 50
+ma_slow_window = 200
+breakout_entry_window = 55
+breakout_exit_window = 20
+
+[equity_research.instrument]
+symbol = "VWRP.L"
+asset_class = "etf"
+exchange = "LSE"
+currency = "GBP"

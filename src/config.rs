@@ -480,6 +480,7 @@ pub enum RuntimeCommand {
     Run,
     Backtest,
     BacktestSqlite,
+    BacktestEquityCsv,
     SweepSqlite,
     SweepCandlesSqlite,
     WalkForwardSqlite,
@@ -490,6 +491,7 @@ pub struct RuntimeOptions {
     pub config_path: String,
     pub command: RuntimeCommand,
     pub backtest_sqlite_path: Option<String>,
+    pub backtest_equity_csv_path: Option<String>,
     pub sweep_sqlite_path: Option<String>,
     pub sweep_candles_sqlite_path: Option<String>,
     pub walk_forward_sqlite_path: Option<String>,
@@ -908,6 +910,7 @@ impl RuntimeOptions {
         let mut config_path = env_config_path.unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
         let mut command = RuntimeCommand::Run;
         let mut backtest_sqlite_path = None;
+        let mut backtest_equity_csv_path = None;
         let mut sweep_sqlite_path = None;
         let mut sweep_candles_sqlite_path = None;
         let mut walk_forward_sqlite_path = None;
@@ -928,6 +931,14 @@ impl RuntimeOptions {
                 };
                 command = RuntimeCommand::BacktestSqlite;
                 backtest_sqlite_path = Some(path);
+            } else if arg == "--backtest-equity-csv" {
+                let Some(path) = args.next() else {
+                    return Err(BotError::Config(
+                        "--backtest-equity-csv requires a CSV path".to_string(),
+                    ));
+                };
+                command = RuntimeCommand::BacktestEquityCsv;
+                backtest_equity_csv_path = Some(path);
             } else if arg == "--sweep-sqlite" {
                 let Some(path) = args.next() else {
                     return Err(BotError::Config(
@@ -961,6 +972,7 @@ impl RuntimeOptions {
             config_path,
             command,
             backtest_sqlite_path,
+            backtest_equity_csv_path,
             sweep_sqlite_path,
             sweep_candles_sqlite_path,
             walk_forward_sqlite_path,
@@ -1532,6 +1544,27 @@ verbose = true
         assert_eq!(
             options.backtest_sqlite_path.as_deref(),
             Some("/var/lib/trader/trader.sqlite")
+        );
+    }
+
+    #[test]
+    fn accepts_backtest_equity_csv_argument() {
+        let options = RuntimeOptions::from_args_and_env(
+            [
+                "trader".to_string(),
+                "--config".to_string(),
+                "config/equity-research.example.toml".to_string(),
+                "--backtest-equity-csv".to_string(),
+                "data/vwrp.csv".to_string(),
+            ],
+            None,
+        )
+        .expect("runtime options should parse");
+
+        assert_eq!(options.command, RuntimeCommand::BacktestEquityCsv);
+        assert_eq!(
+            options.backtest_equity_csv_path.as_deref(),
+            Some("data/vwrp.csv")
         );
     }
 
