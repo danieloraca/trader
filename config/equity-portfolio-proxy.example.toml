@@ -1,0 +1,42 @@
+[equity_portfolio]
+name = "Global equity/bond accumulation-fund proxy validation"
+currency = "GBP"
+initial_cash = 10000.0
+monthly_contribution = 500.0
+
+commission_per_order = 3.0
+commission_bps = 0
+spread_bps = 10
+slippage_bps = 5
+allow_fractional_shares = true
+prices_are_adjusted = true
+
+annual_trading_days = 252
+minimum_common_sessions = 2000
+annual_risk_free_rate_pct = 0.0
+rebalance_threshold_bps = 100
+rebalance_frequencies = ["quarterly", "yearly"]
+
+[equity_portfolio.walk_forward]
+train_sessions = 756
+test_sessions = 252
+step_sessions = 252
+minimum_windows = 5
+allocations_bps = [
+  [10000, 0],
+  [9000, 1000],
+  [8000, 2000],
+  [7000, 3000],
+  [6000, 4000],
+]
+rebalance_frequencies = ["quarterly", "yearly"]
+
+[[equity_portfolio.assets]]
+symbol = "GLOBAL_ALL_CAP_PROXY"
+price_file = "../global-equity-proxy-hist.xlsx"
+target_weight_bps = 8000
+
+[[equity_portfolio.assets]]
+symbol = "GLOBAL_BOND_PROXY"
+price_file = "../global-bond-proxy-hist.xlsx"
+target_weight_bps = 2000

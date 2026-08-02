@@ -37,6 +37,8 @@ struct PortfolioConfig {
     prices_are_adjusted: bool,
     #[serde(default = "default_annual_trading_days")]
     annual_trading_days: usize,
+    #[serde(default = "default_minimum_common_sessions")]
+    minimum_common_sessions: usize,
     #[serde(default)]
     annual_risk_free_rate_pct: f64,
     #[serde(default = "default_rebalance_threshold_bps")]
@@ -56,6 +58,8 @@ struct PortfolioWalkForwardConfig {
     test_sessions: usize,
     #[serde(default = "default_walk_forward_step_sessions")]
     step_sessions: usize,
+    #[serde(default = "default_walk_forward_minimum_windows")]
+    minimum_windows: usize,
     #[serde(default)]
     allocations_bps: Vec<Vec<i64>>,
     #[serde(default = "default_rebalance_frequencies")]
@@ -68,6 +72,7 @@ impl Default for PortfolioWalkForwardConfig {
             train_sessions: default_walk_forward_train_sessions(),
             test_sessions: default_walk_forward_test_sessions(),
             step_sessions: default_walk_forward_step_sessions(),
+            minimum_windows: default_walk_forward_minimum_windows(),
             allocations_bps: Vec::new(),
             rebalance_frequencies: default_rebalance_frequencies(),
         }
@@ -223,6 +228,7 @@ pub fn run(config_path: impl AsRef<Path>) -> Result<EquityPortfolioReport> {
     let config = load_config(config_path)?;
     let inputs = load_assets(config_path, &config)?;
     let sessions = align_sessions(&inputs)?;
+    validate_common_session_count(&config, sessions.len())?;
 
     let mut results = Vec::new();
     results.push(cash_result(&config, &sessions));
@@ -289,6 +295,7 @@ pub fn run_walk_forward(config_path: impl AsRef<Path>) -> Result<EquityPortfolio
     let config = load_config(config_path)?;
     let inputs = load_assets(config_path, &config)?;
     let sessions = align_sessions(&inputs)?;
+    validate_common_session_count(&config, sessions.len())?;
     let walk_forward = config.walk_forward.clone();
     let allocations = walk_forward_allocations(&config)?;
 
@@ -307,11 +314,12 @@ pub fn run_walk_forward(config_path: impl AsRef<Path>) -> Result<EquityPortfolio
         evaluation_ranges.push((train_start..train_end, train_end..test_end));
         train_start += walk_forward.step_sessions;
     }
-    if windows.is_empty() {
+    if windows.len() < walk_forward.minimum_windows {
         return Err(BotError::MarketData(format!(
-            "portfolio walk-forward needs at least {} common sessions, found {}",
-            walk_forward.train_sessions + walk_forward.test_sessions,
-            sessions.len()
+            "portfolio walk-forward requires at least {} held-out windows, but {} common sessions produce {}",
+            walk_forward.minimum_windows,
+            sessions.len(),
+            windows.len()
         )));
     }
 
@@ -468,6 +476,7 @@ impl PortfolioConfig {
             ));
         }
         if self.annual_trading_days == 0
+            || self.minimum_common_sessions < 2
             || !self.annual_risk_free_rate_pct.is_finite()
             || self.annual_risk_free_rate_pct <= -100.0
         {
@@ -525,6 +534,7 @@ impl PortfolioWalkForwardConfig {
         if self.train_sessions == 0
             || self.test_sessions < 2
             || self.step_sessions < self.test_sessions
+            || self.minimum_windows == 0
         {
             return Err(BotError::Config(
                 "portfolio walk-forward requires positive training, at least two test sessions, and a step no shorter than the test window"
@@ -559,6 +569,16 @@ impl PortfolioWalkForwardConfig {
         }
         Ok(())
     }
+}
+
+fn validate_common_session_count(config: &PortfolioConfig, session_count: usize) -> Result<()> {
+    if session_count < config.minimum_common_sessions {
+        return Err(BotError::MarketData(format!(
+            "portfolio requires at least {} common sessions, found {session_count}",
+            config.minimum_common_sessions
+        )));
+    }
+    Ok(())
 }
 
 fn load_assets(config_path: &Path, config: &PortfolioConfig) -> Result<Vec<AssetInput>> {
@@ -1350,6 +1370,10 @@ fn default_annual_trading_days() -> usize {
     252
 }
 
+fn default_minimum_common_sessions() -> usize {
+    2
+}
+
 fn default_rebalance_threshold_bps() -> i64 {
     100
 }
@@ -1370,12 +1394,17 @@ fn default_walk_forward_step_sessions() -> usize {
     252
 }
 
+fn default_walk_forward_minimum_windows() -> usize {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AssetInput, PortfolioAssetConfig, PortfolioConfig, PortfolioState,
         PortfolioWalkForwardConfig, RebalanceFrequency, align_sessions, cash_flow_adjusted_curve,
-        invest_cash_to_underweights, rebalance, run, run_walk_forward, walk_forward_allocations,
+        invest_cash_to_underweights, load_config, rebalance, run, run_walk_forward,
+        validate_common_session_count, walk_forward_allocations,
     };
     use crate::decimal::Decimal;
     use crate::equity::price_data::{
@@ -1401,6 +1430,7 @@ mod tests {
             allow_fractional_shares: false,
             prices_are_adjusted: true,
             annual_trading_days: 252,
+            minimum_common_sessions: 2,
             annual_risk_free_rate_pct: 0.0,
             rebalance_threshold_bps: 100,
             rebalance_frequencies: vec![RebalanceFrequency::Quarterly],
@@ -1485,6 +1515,31 @@ mod tests {
         let error = config.validate().expect_err("allocation should fail");
 
         assert!(error.to_string().contains("allocation"));
+    }
+
+    #[test]
+    fn rejects_history_shorter_than_configured_minimum() {
+        let mut config = config();
+        config.minimum_common_sessions = 2_000;
+
+        let error =
+            validate_common_session_count(&config, 1_999).expect_err("short history should fail");
+
+        assert!(error.to_string().contains("at least 2000 common sessions"));
+    }
+
+    #[test]
+    fn parses_proxy_validation_config() {
+        let config = load_config(std::path::Path::new(
+            "config/equity-portfolio-proxy.example.toml",
+        ))
+        .expect("proxy config should parse");
+
+        assert_eq!(config.minimum_common_sessions, 2_000);
+        assert_eq!(config.walk_forward.minimum_windows, 5);
+        assert_eq!(config.walk_forward.allocations_bps.len(), 5);
+        assert!(config.allow_fractional_shares);
+        assert!(config.prices_are_adjusted);
     }
 
     #[test]

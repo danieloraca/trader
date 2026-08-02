@@ -79,6 +79,16 @@ target/release/trader \
 
 Configure allocation vectors under `[equity_portfolio.walk_forward]`; every vector must match the asset order and total `10000` basis points. If omitted, a two-asset portfolio automatically tests weights in 10% steps. Each held-out window starts with the configured cash balance. The report ranks combinations by average held-out Sharpe and also shows average and worst return, worst drawdown, turnover, and return versus holding the first configured asset alone.
 
+For independent proxy validation, download the complete historical-price spreadsheets for Vanguard's [FTSE Global All Cap Index Fund GBP Acc](https://www.vanguard.co.uk/professional/product/fund/equity/8617/ftse-global-all-cap-index-fund-gbp-acc) and [Global Bond Index Fund GBP Hedged Acc](https://www.vanguard.co.uk/professional/product/fund/bond/9142/global-bond-index-fund-hedged-acc). Save them as `global-equity-proxy-hist.xlsx` and `global-bond-proxy-hist.xlsx` in the repository root, then run:
+
+```sh
+target/release/trader \
+  --config config/equity-portfolio-proxy.example.toml \
+  --walk-forward-equity-portfolio
+```
+
+The proxy configuration requires at least 2,000 common sessions and five held-out windows. It uses accumulation-fund NAVs and fractional units to avoid proxy unit-price differences distorting the allocation test. These proxies validate the allocation concept over a longer, different history; they do not represent directly executable ETF prices.
+
 ## Safe Modes
 
 Use these modes in order:
