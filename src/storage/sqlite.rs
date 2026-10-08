@@ -106,6 +106,19 @@ impl SqliteStore {
                     updated_at_ms INTEGER NOT NULL,
                     run_id TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS signal_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at_ms INTEGER NOT NULL,
+                    run_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    quantity_base_micro_units INTEGER NOT NULL,
+                    price_micro_units INTEGER NOT NULL,
+                    signal_reason TEXT NOT NULL,
+                    rejection_reason TEXT
+                );
                 ",
             )
             .map_err(|error| BotError::Storage(format!("failed to migrate sqlite: {error}")))?;
@@ -906,19 +919,52 @@ impl Store for SqliteStore {
         Ok(orders)
     }
 
-    fn record_market_event(&mut self, event: &MarketEvent) -> Result<()> {
+    fn record_market_event(&mut self, event: &MarketEvent) -> Result<i64> {
+        let recorded_at_ms = Self::now_ms()?;
         self.connection
             .execute(
                 "
                 INSERT INTO market_events (recorded_at_ms, symbol, price_micro_units)
                 VALUES (?1, ?2, ?3)
                 ",
-                params![Self::now_ms()?, event.symbol(), event.price().micro_units()],
+                params![recorded_at_ms, event.symbol(), event.price().micro_units()],
             )
             .map_err(|error| {
                 BotError::Storage(format!("failed to record market event: {error}"))
             })?;
 
+        Ok(recorded_at_ms)
+    }
+
+    fn record_signal_decision(
+        &mut self,
+        run_id: &str,
+        signal: &crate::strategy::Signal,
+        rejection: Option<&str>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "
+                INSERT INTO signal_decisions (
+                    recorded_at_ms, run_id, symbol, side, intent,
+                    quantity_base_micro_units, price_micro_units, signal_reason, rejection_reason
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    Self::now_ms()?,
+                    run_id,
+                    signal.symbol.as_str(),
+                    side_name(signal.side),
+                    format!("{:?}", signal.intent),
+                    signal.quantity_base.micro_units(),
+                    signal.price.micro_units(),
+                    signal.reason.as_str(),
+                    rejection,
+                ],
+            )
+            .map_err(|error| {
+                BotError::Storage(format!("failed to record signal decision: {error}"))
+            })?;
         Ok(())
     }
 
@@ -986,6 +1032,7 @@ mod tests {
     use crate::orders::{Order, OrderRequest, OrderStatus, Side};
     use crate::portfolio::Portfolio;
     use crate::storage::Store;
+    use crate::strategy::{Signal, SignalIntent};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1070,6 +1117,44 @@ mod tests {
             1
         );
         assert_eq!(store.count_rows("orders").expect("count should work"), 1);
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn records_approved_and_rejected_strategy_signals() {
+        let path = db_path("signal-decisions");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+        let signal = Signal {
+            symbol: "BTC-USD".to_string(),
+            side: Side::Buy,
+            intent: SignalIntent::IncreaseLong,
+            quantity_base: decimal(0.002),
+            price: decimal(82_000.0),
+            reason: "RSI below 25".to_string(),
+        };
+
+        store
+            .record_signal_decision("run-1", &signal, None)
+            .expect("approval should record");
+        store
+            .record_signal_decision("run-1", &signal, Some("order value exceeds cap"))
+            .expect("rejection should record");
+
+        let decisions: Vec<(String, i64, Option<String>)> = store.connection
+            .prepare("SELECT signal_reason, price_micro_units, rejection_reason FROM signal_decisions ORDER BY id")
+            .expect("query should prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query should run")
+            .map(|row| row.expect("row should decode"))
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(
+            decisions[0],
+            ("RSI below 25".to_string(), 82_000_000_000, None)
+        );
+        assert_eq!(decisions[1].2.as_deref(), Some("order value exceeds cap"));
 
         drop(store);
         fs::remove_file(path).expect("test database should be removed");

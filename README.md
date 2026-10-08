@@ -184,19 +184,40 @@ The report includes net P/L, buy-and-hold benchmark, max drawdown, total fees, t
 
 ## Raspberry Pi Deployment
 
-To update the existing trader service, run from the checkout on the Pi:
+The Pi paper trial in `config/pi-paper-live.toml` uses RSI (21, 25/65) on
+completed five-minute candles. It requests 0.002 BTC paper orders, subject to
+the existing $500 order cap. Real Kraken order placement stays disabled. The
+strategy starts with an empty candle history after each restart, so allow
+roughly two hours before expecting its first possible signal. A market-data
+gap that skips a candle restarts that warmup.
+
+Paper fills now deduct the configured 26 bps fee and 5 bps slippage per side.
+These are modeling assumptions from `[backtest]`, not a guarantee of actual
+Kraken costs. A signal from a completed candle uses the first tick of the next
+candle as its paper order price; the historical candle sweep fills at the
+signal candle close, so those results remain more optimistic about timing.
+The dashboard displays cumulative strategy signals, risk rejections, and the
+latest decisions. A zero signal count during warmup is expected; the trader
+journal logs each `completed strategy candle` about every five minutes when
+the ticker feed is healthy.
+
+After syncing the updated code and config to the Pi, run from its checkout:
 
 ```sh
 cd ~/Development/trader
 make deploy
+make deploy-dashboard
 ```
 
-The command builds the release binary, updates the executable used by the
-installed `trader.service`, restarts the service, and checks that it is active.
-It supports units that run the binary from this checkout or from
+`make deploy` builds the trader release binary, updates the executable used by
+the installed `trader.service`, restarts the service, and checks that it is
+active. It supports units that run the binary from this checkout or from
 `/opt/trader/trader`. For a service running from this checkout, the first
 deployment builds a separate release cache in `target/deploy` so the running
-binary can be replaced safely.
+binary can be replaced safely. `make deploy-dashboard` similarly updates and
+restarts an installed `trader-dashboard.service` when its executable is
+`~/Development/trader/target/release/dashboard`. It checks the unit path
+before replacing anything.
 
 For a first-time installation on a new Pi, run from the repository checkout:
 
@@ -233,7 +254,7 @@ The systemd unit sends `SIGTERM`; the app handles it by flushing portfolio state
 
 ## Dashboard
 
-The dashboard is a separate read-only binary. It does not control trading and only reads SQLite.
+The dashboard is a separate read-only binary. It does not control trading and only reads SQLite. To update an existing checkout-based dashboard service after `make deploy`, run `make deploy-dashboard` as shown above.
 
 Build it on the Pi:
 

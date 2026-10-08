@@ -1,7 +1,10 @@
+use crate::candles::{LiveCandleCloses, LiveCandleUpdate};
 use crate::config::{Config, ExchangeKind, MarketDataKind};
 use crate::error::{BotError, Result};
 use crate::exchange::{Exchange, KrakenExchange, PaperExchange, PaperFuturesExchange};
-use crate::market::{KrakenTickerMarketDataSource, MarketDataSource, ReplayMarketDataSource};
+use crate::market::{
+    KrakenTickerMarketDataSource, MarketDataSource, MarketEvent, PriceTick, ReplayMarketDataSource,
+};
 use crate::orders::{OrderManager, OrderRequest, OrderStatus};
 use crate::portfolio::Portfolio;
 use crate::risk::RiskManager;
@@ -16,6 +19,7 @@ pub struct App {
     config: Config,
     exchange: Box<dyn Exchange>,
     market_data: Box<dyn MarketDataSource>,
+    candle_closes: Option<LiveCandleCloses>,
     order_manager: OrderManager,
     risk: RiskManager,
     run_id: String,
@@ -45,7 +49,11 @@ impl App {
         };
 
         let mut exchange: Box<dyn Exchange> = match config.exchange.kind {
-            ExchangeKind::Paper => Box::new(PaperExchange::new(portfolio)),
+            ExchangeKind::Paper => Box::new(PaperExchange::new_with_costs(
+                portfolio,
+                config.backtest.fee_bps,
+                config.backtest.slippage_bps,
+            )),
             ExchangeKind::PaperFutures => Box::new(PaperFuturesExchange::new(
                 portfolio,
                 config.exchange.paper_futures.leverage,
@@ -68,6 +76,10 @@ impl App {
         Ok(Self {
             exchange,
             market_data,
+            candle_closes: config
+                .strategy
+                .candle_interval_seconds
+                .map(LiveCandleCloses::new),
             order_manager: OrderManager::new_at(next_order_id),
             risk: RiskManager::new(config.risk.clone()),
             run_id,
@@ -100,6 +112,9 @@ impl App {
                     "order outcome is unresolved; new trades are paused"
                 );
                 logged_pending_order = true;
+                if self.candle_closes.is_some() {
+                    self.strategy = strategy::from_config(&self.config.strategy);
+                }
             }
 
             let event = match self.market_data.next_event() {
@@ -145,26 +160,59 @@ impl App {
                 replay_cursor = ?self.market_data.replay_cursor(),
                 "market event received"
             );
-            self.store.record_market_event(&event)?;
+            let recorded_at_ms = self.store.record_market_event(&event)?;
+            let strategy_event = match self.candle_closes.as_mut() {
+                None => Some(event.clone()),
+                Some(closes) => match closes.observe(recorded_at_ms, event.price()) {
+                    LiveCandleUpdate::Pending => None,
+                    LiveCandleUpdate::Closed(close) => {
+                        info!(run_id = %self.run_id, close = %close, "completed strategy candle");
+                        Some(MarketEvent::PriceTick(PriceTick::new(
+                            event.symbol(),
+                            close,
+                        )))
+                    }
+                    LiveCandleUpdate::Gap => {
+                        warn!(run_id = %self.run_id, "market data gap reset strategy warmup");
+                        self.strategy = strategy::from_config(&self.config.strategy);
+                        None
+                    }
+                },
+            };
             if !orders_resolved {
                 self.save_progress()?;
                 continue;
             }
 
+            let Some(strategy_event) = strategy_event else {
+                self.save_progress()?;
+                continue;
+            };
+
             let signals = self
                 .strategy
-                .on_market_event_with_portfolio(&event, self.exchange.portfolio());
+                .on_market_event_with_portfolio(&strategy_event, self.exchange.portfolio());
             debug!(
                 run_id = %self.run_id,
                 signal_count = signals.len(),
                 "strategy evaluated market event"
             );
 
-            for signal in signals {
+            for mut signal in signals {
+                // The completed candle provides the signal; the next live tick sets the paper fill price.
+                if self.candle_closes.is_some() {
+                    signal.price = event.price();
+                }
                 let portfolio = self.exchange.portfolio();
                 let order_request: OrderRequest = match self.risk.approve(&signal, portfolio) {
-                    Ok(order_request) => order_request,
+                    Ok(order_request) => {
+                        self.store
+                            .record_signal_decision(&self.run_id, &signal, None)?;
+                        order_request
+                    }
                     Err(BotError::Risk(message)) => {
+                        self.store
+                            .record_signal_decision(&self.run_id, &signal, Some(&message))?;
                         warn!(
                             run_id = %self.run_id,
                             symbol = %signal.symbol,
@@ -584,6 +632,7 @@ mod tests {
                 sent: false,
                 shutdown: shutdown.clone(),
             }),
+            candle_closes: None,
             order_manager: OrderManager::new_at(2),
             run_id: "test".to_string(),
             strategy: Box::new(AlwaysBuy),

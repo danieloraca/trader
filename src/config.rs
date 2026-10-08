@@ -218,6 +218,8 @@ pub struct StrategyConfig {
     #[serde(default)]
     pub kind: StrategyKind,
     #[serde(default)]
+    pub candle_interval_seconds: Option<u64>,
+    #[serde(default)]
     pub simple_momentum: SimpleMomentumConfig,
     #[serde(default)]
     pub moving_average_crossover: MovingAverageCrossoverConfig,
@@ -235,6 +237,7 @@ impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
             kind: StrategyKind::SimpleMomentum,
+            candle_interval_seconds: None,
             simple_momentum: SimpleMomentumConfig::default(),
             moving_average_crossover: MovingAverageCrossoverConfig::default(),
             rsi_mean_reversion: RsiMeanReversionConfig::default(),
@@ -558,6 +561,14 @@ impl Config {
             ));
         }
 
+        if self.exchange.kind == ExchangeKind::Paper
+            && (self.backtest.fee_bps >= 10_000 || self.backtest.slippage_bps >= 10_000)
+        {
+            return Err(BotError::Config(
+                "paper execution fee and slippage must be below 10000 bps".to_string(),
+            ));
+        }
+
         if self.backtest.futures_fee_bps < 0
             || self.backtest.futures_slippage_bps < 0
             || self.backtest.futures_stress_fee_bps < 0
@@ -643,6 +654,22 @@ impl Config {
             if self.market_data.kraken.poll_interval_ms == 0 {
                 return Err(BotError::Config(
                     "kraken market data poll interval must be positive".to_string(),
+                ));
+            }
+        }
+
+        if let Some(interval) = self.strategy.candle_interval_seconds {
+            if interval == 0 || interval > i64::MAX as u64 / 1_000 {
+                return Err(BotError::Config(
+                    "strategy candle interval must be a positive number of seconds".to_string(),
+                ));
+            }
+            if self.exchange.kind != ExchangeKind::Paper
+                || self.market_data.kind != MarketDataKind::KrakenTicker
+            {
+                return Err(BotError::Config(
+                    "live candle strategy requires paper exchange and Kraken ticker market data"
+                        .to_string(),
                 ));
             }
         }
@@ -1241,6 +1268,51 @@ verbose = true
 
         assert_eq!(costs.execution_costs(ExchangeKind::Paper), (26, 5));
         assert_eq!(costs.execution_costs(ExchangeKind::PaperFutures), (5, 5));
+    }
+
+    #[test]
+    fn pi_paper_trial_uses_completed_candles_and_keeps_live_orders_disabled() {
+        let config = Config::from_toml_str(include_str!("../config/pi-paper-live.toml"))
+            .expect("Pi trial config should load");
+
+        assert_eq!(config.exchange.kind, ExchangeKind::Paper);
+        assert!(!config.exchange.kraken.enable_order_placement);
+        assert_eq!(config.strategy.candle_interval_seconds, Some(300));
+        assert_eq!(config.strategy.kind, super::StrategyKind::RsiMeanReversion);
+        assert_eq!(config.strategy.rsi_mean_reversion.window, 21);
+        assert_eq!(
+            (config.backtest.fee_bps, config.backtest.slippage_bps),
+            (26, 5)
+        );
+        assert_eq!(
+            config.strategy.rsi_mean_reversion.quantity_base.to_string(),
+            "0.002"
+        );
+    }
+
+    #[test]
+    fn rejects_live_candle_mode_on_a_real_exchange_or_replay_feed() {
+        let candle_config = VALID_CONFIG.replace(
+            "kind = \"simple_momentum\"",
+            "kind = \"simple_momentum\"\ncandle_interval_seconds = 300",
+        );
+        let replay_error = Config::from_toml_str(&candle_config).expect_err("replay should fail");
+        assert!(
+            replay_error
+                .to_string()
+                .contains("requires paper exchange and Kraken ticker")
+        );
+
+        let kraken_config = candle_config
+            .replace("kind = \"replay\"", "kind = \"kraken_ticker\"")
+            .replace("kind = \"paper\"", "kind = \"kraken\"");
+        let exchange_error =
+            Config::from_toml_str(&kraken_config).expect_err("real exchange should fail");
+        assert!(
+            exchange_error
+                .to_string()
+                .contains("requires paper exchange and Kraken ticker")
+        );
     }
 
     #[test]

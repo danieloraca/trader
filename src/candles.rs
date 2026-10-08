@@ -17,6 +17,58 @@ pub struct Candle {
     pub tick_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveCandleUpdate {
+    Pending,
+    Closed(Decimal),
+    Gap,
+}
+
+pub struct LiveCandleCloses {
+    interval_ms: i64,
+    bucket_start_ms: Option<i64>,
+    close: Decimal,
+}
+
+impl LiveCandleCloses {
+    pub fn new(interval_seconds: u64) -> Self {
+        Self {
+            interval_ms: i64::try_from(interval_seconds * 1_000)
+                .expect("validated candle interval should fit in i64"),
+            bucket_start_ms: None,
+            close: Decimal::ZERO,
+        }
+    }
+
+    pub fn observe(&mut self, recorded_at_ms: i64, price: Decimal) -> LiveCandleUpdate {
+        let bucket = recorded_at_ms.div_euclid(self.interval_ms) * self.interval_ms;
+        let previous = self.bucket_start_ms.replace(bucket);
+        match previous {
+            None => {
+                self.close = price;
+                LiveCandleUpdate::Pending
+            }
+            Some(previous) if bucket == previous => {
+                self.close = price;
+                LiveCandleUpdate::Pending
+            }
+            Some(previous) if previous.checked_add(self.interval_ms) == Some(bucket) => {
+                let closed = self.close;
+                self.close = price;
+                LiveCandleUpdate::Closed(closed)
+            }
+            Some(previous) if bucket > previous => {
+                self.close = price;
+                LiveCandleUpdate::Gap
+            }
+            Some(previous) => {
+                self.bucket_start_ms = Some(previous);
+                LiveCandleUpdate::Pending
+            }
+        }
+    }
+}
+
 pub fn aggregate_prices_to_candles(
     prices: &[RecordedPrice],
     interval_ms: i64,
@@ -72,7 +124,7 @@ fn new_candle(start_ms: i64, price: Decimal) -> Candle {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecordedPrice, aggregate_prices_to_candles};
+    use super::{LiveCandleCloses, LiveCandleUpdate, RecordedPrice, aggregate_prices_to_candles};
     use crate::decimal::Decimal;
 
     fn decimal(value: &str) -> Decimal {
@@ -113,5 +165,38 @@ mod tests {
         assert_eq!(candles[0].tick_count, 3);
         assert_eq!(candles[1].start_ms, 60_000);
         assert_eq!(candles[1].close.to_string(), "101");
+    }
+
+    #[test]
+    fn emits_only_completed_live_candles_and_resets_after_gap() {
+        let mut closes = LiveCandleCloses::new(300);
+        assert_eq!(
+            closes.observe(1_000, decimal("100")),
+            LiveCandleUpdate::Pending
+        );
+        assert_eq!(
+            closes.observe(299_000, decimal("101")),
+            LiveCandleUpdate::Pending
+        );
+        assert_eq!(
+            closes.observe(300_000, decimal("102")),
+            LiveCandleUpdate::Closed(decimal("101"))
+        );
+        assert_eq!(
+            closes.observe(250_000, decimal("999")),
+            LiveCandleUpdate::Pending
+        );
+        assert_eq!(
+            closes.observe(600_000, decimal("102.5")),
+            LiveCandleUpdate::Closed(decimal("102"))
+        );
+        assert_eq!(
+            closes.observe(1_200_000, decimal("103")),
+            LiveCandleUpdate::Gap
+        );
+        assert_eq!(
+            closes.observe(1_500_000, decimal("104")),
+            LiveCandleUpdate::Closed(decimal("103"))
+        );
     }
 }

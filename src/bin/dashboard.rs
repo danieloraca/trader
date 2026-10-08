@@ -20,12 +20,15 @@ struct Snapshot {
     market_event_count: i64,
     market_events_last_hour: i64,
     order_count: i64,
+    signal_count: i64,
+    risk_rejection_count: i64,
     db_size_bytes: u64,
     latest_market_event: Option<MarketEventRow>,
     heartbeat: Option<HeartbeatRow>,
     portfolio: Option<PortfolioRow>,
     recent_prices: Vec<MarketEventRow>,
     latest_orders: Vec<OrderRow>,
+    latest_signal_decisions: Vec<SignalDecisionRow>,
     strategy_research_run: Option<StrategyResearchRunRow>,
     strategy_research_results: Vec<StrategyResearchResultRow>,
     strategy_research_matched_results: Vec<StrategyResearchResultRow>,
@@ -72,6 +75,17 @@ struct OrderRow {
     quote_value_micro_units: i64,
     status: String,
     status_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct SignalDecisionRow {
+    recorded_at_ms: i64,
+    side: String,
+    intent: String,
+    quantity_base_micro_units: i64,
+    price_micro_units: i64,
+    signal_reason: String,
+    rejection_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -198,16 +212,21 @@ impl Dashboard {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
 
+        let (signal_count, risk_rejection_count, latest_signal_decisions) =
+            signal_decisions(&connection)?;
         Ok(Snapshot {
             market_event_count: count_rows(&connection, "market_events")?,
             market_events_last_hour: recent_market_event_count(&connection, now_ms()?)?,
             order_count: count_rows(&connection, "orders")?,
+            signal_count,
+            risk_rejection_count,
             db_size_bytes: sqlite_file_size(&self.db_path),
             latest_market_event: latest_market_event(&connection)?,
             heartbeat: heartbeat(&connection)?,
             portfolio: portfolio(&connection)?,
             recent_prices: recent_prices(&connection)?,
             latest_orders: latest_orders(&connection)?,
+            latest_signal_decisions,
             strategy_research_run: latest_strategy_research_run(&connection)?,
             strategy_research_results: latest_strategy_research_results(&connection)?,
             strategy_research_matched_results: latest_strategy_research_matched_results(
@@ -215,6 +234,41 @@ impl Dashboard {
             )?,
         })
     }
+}
+
+fn signal_decisions(
+    connection: &Connection,
+) -> rusqlite::Result<(i64, i64, Vec<SignalDecisionRow>)> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signal_decisions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok((0, 0, Vec::new()));
+    }
+    let (count, rejected) = connection.query_row(
+        "SELECT COUNT(*), COUNT(rejection_reason) FROM signal_decisions",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT recorded_at_ms, side, intent, quantity_base_micro_units, price_micro_units, signal_reason, rejection_reason FROM signal_decisions ORDER BY id DESC LIMIT 20",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SignalDecisionRow {
+                recorded_at_ms: row.get(0)?,
+                side: row.get(1)?,
+                intent: row.get(2)?,
+                quantity_base_micro_units: row.get(3)?,
+                price_micro_units: row.get(4)?,
+                signal_reason: row.get(5)?,
+                rejection_reason: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((count, rejected, rows))
 }
 
 fn count_rows(connection: &Connection, table: &str) -> rusqlite::Result<i64> {
@@ -700,6 +754,7 @@ window.addEventListener("DOMContentLoaded", formatTimes);
         &snapshot.strategy_research_matched_results,
     );
     render_orders(&mut html, &snapshot.latest_orders);
+    render_signal_decisions(&mut html, &snapshot.latest_signal_decisions);
 
     html.push_str("</main></body></html>");
     html
@@ -795,6 +850,8 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
 <div class="tile"><div class="label">Market Events</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Events Last Hour</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Orders</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Signals</div><div class="value">{}</div></div>
+<div class="tile"><div class="label">Risk Rejections</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">DB Size</div><div class="value">{}</div></div>
 <div class="tile"><div class="label">Latest Price</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
 <div class="tile {}"><div class="label">Heartbeat</div><div class="value">{}</div><div class="muted" data-ms="{}">{}</div></div>
@@ -814,6 +871,8 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
         snapshot.market_event_count,
         snapshot.market_events_last_hour,
         snapshot.order_count,
+        snapshot.signal_count,
+        snapshot.risk_rejection_count,
         escape_html(&format_bytes(snapshot.db_size_bytes)),
         escape_html(&latest_price),
         latest_price_time_ms.unwrap_or_default(),
@@ -1072,6 +1131,41 @@ fn render_orders(html: &mut String, orders: &[OrderRow]) {
         }
     }
 
+    html.push_str("</tbody></table>");
+}
+
+fn render_signal_decisions(html: &mut String, decisions: &[SignalDecisionRow]) {
+    html.push_str(
+        r#"<h2>Latest Strategy Signals</h2>
+<table><thead><tr><th>Time</th><th>Decision</th><th>Side</th><th>Intent</th><th>Qty</th><th>Price</th><th>Reason</th></tr></thead><tbody>"#,
+    );
+    if decisions.is_empty() {
+        html.push_str(r#"<tr><td colspan="7" class="muted">No strategy signals yet.</td></tr>"#);
+    } else {
+        for decision in decisions {
+            let (status, class) = match decision.rejection_reason.as_deref() {
+                Some(_) => ("Risk rejected", "status thin"),
+                None => ("Risk approved", "status"),
+            };
+            let reason = match decision.rejection_reason.as_deref() {
+                Some(rejection) => format!("{}: {}", decision.signal_reason, rejection),
+                None => decision.signal_reason.clone(),
+            };
+            let _ = write!(
+                html,
+                r#"<tr><td data-ms="{}">{}</td><td><span class="{}">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                decision.recorded_at_ms,
+                escape_html(&time_fallback(Some(decision.recorded_at_ms))),
+                class,
+                status,
+                escape_html(&decision.side),
+                escape_html(&decision.intent),
+                escape_html(&format_micro_units(decision.quantity_base_micro_units)),
+                escape_html(&format_micro_units(decision.price_micro_units)),
+                escape_html(&reason),
+            );
+        }
+    }
     html.push_str("</tbody></table>");
 }
 
@@ -1410,7 +1504,8 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_micro_units, render_html};
+    use super::{format_micro_units, render_html, render_signal_decisions, signal_decisions};
+    use rusqlite::Connection;
 
     #[test]
     fn formats_micro_units_like_decimal_values() {
@@ -1425,5 +1520,39 @@ mod tests {
 
         assert!(html.contains("Trader Dashboard"));
         assert!(html.contains("No order events yet."));
+    }
+
+    #[test]
+    fn reads_signal_counts_and_escapes_rejection_text() {
+        let connection = Connection::open_in_memory().expect("database should open");
+        assert_eq!(
+            signal_decisions(&connection)
+                .expect("missing table should be supported")
+                .0,
+            0
+        );
+        connection.execute_batch(
+            "CREATE TABLE signal_decisions (
+                id INTEGER PRIMARY KEY,
+                recorded_at_ms INTEGER NOT NULL,
+                side TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                quantity_base_micro_units INTEGER NOT NULL,
+                price_micro_units INTEGER NOT NULL,
+                signal_reason TEXT NOT NULL,
+                rejection_reason TEXT
+            );
+            INSERT INTO signal_decisions VALUES (1, 1000, 'Buy', 'IncreaseLong', 2000, 82000000000, 'RSI low', NULL);
+            INSERT INTO signal_decisions VALUES (2, 2000, 'Buy', 'IncreaseLong', 2000, 82000000000, 'RSI low', '<over cap>');",
+        ).expect("rows should insert");
+
+        let (count, rejected, rows) = signal_decisions(&connection).expect("signals should load");
+        assert_eq!((count, rejected, rows.len()), (2, 1, 2));
+        assert_eq!(rows[0].rejection_reason.as_deref(), Some("<over cap>"));
+
+        let mut html = String::new();
+        render_signal_decisions(&mut html, &rows);
+        assert!(html.contains("&lt;over cap&gt;"));
+        assert!(!html.contains("<over cap>"));
     }
 }

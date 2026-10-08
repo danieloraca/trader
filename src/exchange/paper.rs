@@ -8,14 +8,23 @@ pub struct PaperExchange {
     portfolio: Portfolio,
     orders: HashMap<String, ExchangeOrder>,
     next_order_id: u64,
+    fee_bps: i64,
+    slippage_bps: i64,
 }
 
 impl PaperExchange {
+    #[cfg(test)]
     pub fn new(portfolio: Portfolio) -> Self {
+        Self::new_with_costs(portfolio, 0, 0)
+    }
+
+    pub fn new_with_costs(portfolio: Portfolio, fee_bps: i64, slippage_bps: i64) -> Self {
         Self {
             portfolio,
             orders: HashMap::new(),
             next_order_id: 1,
+            fee_bps,
+            slippage_bps,
         }
     }
 
@@ -36,15 +45,40 @@ impl Exchange for PaperExchange {
     }
 
     fn place_order(&mut self, request: OrderRequest) -> Result<ExchangeOrder> {
-        let quote_value = request.quote_value();
         let client_order_id = request.client_order_id.clone().ok_or_else(|| {
             BotError::Exchange("order request missing client order id".to_string())
         })?;
+        let slippage = bps_value(request.limit_price, self.slippage_bps)?;
+        let fill_price = match request.side {
+            Side::Buy => checked_add(request.limit_price, slippage)?,
+            Side::Sell => checked_sub(request.limit_price, slippage)?,
+        };
+        if fill_price <= crate::decimal::Decimal::ZERO {
+            return Err(BotError::Exchange(
+                "paper fill price must be positive".to_string(),
+            ));
+        }
+        let gross_quote_value = request
+            .quantity_base
+            .checked_mul(fill_price)
+            .ok_or_else(|| {
+                BotError::Exchange("paper order value is outside the supported range".to_string())
+            })?;
+        let fee = bps_value(gross_quote_value, self.fee_bps)?;
+        let quote_change = match request.side {
+            Side::Buy => checked_add(gross_quote_value, fee)?,
+            Side::Sell => checked_sub(gross_quote_value, fee)?,
+        };
+        if quote_change <= crate::decimal::Decimal::ZERO {
+            return Err(BotError::Exchange(
+                "paper order proceeds must be positive".to_string(),
+            ));
+        }
 
         match request.side {
-            Side::Buy if self.portfolio.quote_balance < quote_value => {
+            Side::Buy if self.portfolio.quote_balance < quote_change => {
                 return Err(BotError::Exchange(format!(
-                    "insufficient quote balance for order value {quote_value:.2}"
+                    "insufficient quote balance for order cost {quote_change}"
                 )));
             }
             Side::Sell if self.portfolio.base_balance < request.quantity_base => {
@@ -58,12 +92,12 @@ impl Exchange for PaperExchange {
 
         match request.side {
             Side::Buy => {
-                self.portfolio.quote_balance -= quote_value;
+                self.portfolio.quote_balance -= quote_change;
                 self.portfolio.base_balance += request.quantity_base;
             }
             Side::Sell => {
                 self.portfolio.base_balance -= request.quantity_base;
-                self.portfolio.quote_balance += quote_value;
+                self.portfolio.quote_balance += quote_change;
             }
         }
 
@@ -117,6 +151,38 @@ impl Exchange for PaperExchange {
             ))),
         }
     }
+}
+
+fn bps_value(value: crate::decimal::Decimal, bps: i64) -> Result<crate::decimal::Decimal> {
+    let units = (value.micro_units() as i128 * bps as i128) / 10_000;
+    let units = i64::try_from(units).map_err(|_| {
+        BotError::Exchange("paper execution cost is outside the supported range".to_string())
+    })?;
+    Ok(crate::decimal::Decimal::from_micro_units(units))
+}
+
+fn checked_add(
+    lhs: crate::decimal::Decimal,
+    rhs: crate::decimal::Decimal,
+) -> Result<crate::decimal::Decimal> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        BotError::Exchange("paper balance calculation is outside the supported range".to_string())
+    })
+}
+
+fn checked_sub(
+    lhs: crate::decimal::Decimal,
+    rhs: crate::decimal::Decimal,
+) -> Result<crate::decimal::Decimal> {
+    let units = lhs
+        .micro_units()
+        .checked_sub(rhs.micro_units())
+        .ok_or_else(|| {
+            BotError::Exchange(
+                "paper balance calculation is outside the supported range".to_string(),
+            )
+        })?;
+    Ok(crate::decimal::Decimal::from_micro_units(units))
 }
 
 #[cfg(test)]
@@ -312,5 +378,21 @@ mod tests {
             .expect_err("filled order cannot cancel");
 
         assert!(error.to_string().contains("cannot cancel filled order"));
+    }
+
+    #[test]
+    fn paper_fills_charge_the_same_fee_and_slippage_model_as_backtests() {
+        let portfolio = Portfolio::new("BTC", "USD", decimal(100.0));
+        let mut exchange = PaperExchange::new_with_costs(portfolio, 26, 5);
+        exchange
+            .place_order(buy_request(0.1, 100.0))
+            .expect("buy should fill");
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "89.968987");
+        assert_eq!(exchange.portfolio().base_balance.to_string(), "0.1");
+        exchange
+            .place_order(sell_request(0.1, 100.0))
+            .expect("sell should fill");
+        assert_eq!(exchange.portfolio().quote_balance.to_string(), "99.938");
+        assert_eq!(exchange.portfolio().base_balance.to_string(), "0");
     }
 }
