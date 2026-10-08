@@ -187,13 +187,16 @@ The report includes net P/L, buy-and-hold benchmark, max drawdown, total fees, t
 To update the existing trader service, run from the checkout on the Pi:
 
 ```sh
-cd /Development/trader
+cd ~/Development/trader
 make deploy
 ```
 
-The command builds the release binary, confirms that `trader.service` runs
-`/opt/trader/trader`, replaces that binary, restarts the service, and checks
-that it is active.
+The command builds the release binary, updates the executable used by the
+installed `trader.service`, restarts the service, and checks that it is active.
+It supports units that run the binary from this checkout or from
+`/opt/trader/trader`. For a service running from this checkout, the first
+deployment builds a separate release cache in `target/deploy` so the running
+binary can be replaced safely.
 
 For a first-time installation on a new Pi, run from the repository checkout:
 
