@@ -182,9 +182,20 @@ The futures defaults model Kraken Tier 1 taker fees rather than assuming maker e
 
 The report includes net P/L, buy-and-hold benchmark, max drawdown, total fees, total slippage, exposure, realized sell win/loss counts, and final balances. When `trade_log_csv_path` is set, each simulated fill is written to CSV.
 
-## Raspberry Pi Install
+## Raspberry Pi Deployment
 
-Build a release binary on the Pi:
+To update the existing trader service, run from the checkout on the Pi:
+
+```sh
+cd /Development/trader
+make deploy
+```
+
+The command builds the release binary, confirms that `trader.service` runs
+`/opt/trader/trader`, replaces that binary, restarts the service, and checks
+that it is active.
+
+For a first-time installation on a new Pi, run from the repository checkout:
 
 ```sh
 sudo useradd --system --home /var/lib/trader --shell /usr/sbin/nologin trader
