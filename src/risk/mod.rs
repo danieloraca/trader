@@ -23,16 +23,28 @@ impl RiskManager {
             limit_price: signal.price,
             client_order_id: None,
         };
+        let quote_value = request.checked_quote_value().ok_or_else(|| {
+            BotError::Risk(
+                "signal rejected: order value is outside the supported range".to_string(),
+            )
+        })?;
+        if request.quantity_base <= Decimal::ZERO
+            || request.limit_price <= Decimal::ZERO
+            || quote_value <= Decimal::ZERO
+        {
+            return Err(BotError::Risk(
+                "signal rejected: order quantity, price, and value must be positive".to_string(),
+            ));
+        }
 
         if matches!(
             signal.intent,
             SignalIntent::IncreaseLong | SignalIntent::IncreaseShort
-        ) && request.quote_value() > self.config.max_order_quote_value
+        ) && quote_value > self.config.max_order_quote_value
         {
             return Err(BotError::Risk(format!(
                 "signal rejected: order value {} exceeds max {}",
-                request.quote_value(),
-                self.config.max_order_quote_value
+                quote_value, self.config.max_order_quote_value
             )));
         }
 
@@ -66,12 +78,12 @@ impl RiskManager {
             ));
         }
 
+        let projected_position = portfolio.base_balance.checked_add(request.quantity_base);
         if signal.intent == SignalIntent::IncreaseLong
-            && portfolio.base_balance + request.quantity_base > self.config.max_position_base
+            && projected_position.is_none_or(|value| value > self.config.max_position_base)
         {
             return Err(BotError::Risk(format!(
-                "signal rejected: resulting position {} exceeds max {}",
-                portfolio.base_balance + request.quantity_base,
+                "signal rejected: resulting position exceeds max {} or supported range",
                 self.config.max_position_base
             )));
         }
@@ -98,7 +110,15 @@ impl RiskManager {
             SignalIntent::IncreaseLong => {
                 let projected_long = match portfolio.futures_position_side {
                     FuturesPositionSide::Long => {
-                        portfolio.futures_position_base + request.quantity_base
+                        portfolio
+                            .futures_position_base
+                            .checked_add(request.quantity_base)
+                            .ok_or_else(|| {
+                                BotError::Risk(
+                                    "signal rejected: resulting long position is outside the supported range"
+                                        .to_string(),
+                                )
+                            })?
                     }
                     FuturesPositionSide::Short => {
                         if request.quantity_base > portfolio.futures_position_base {
@@ -140,7 +160,15 @@ impl RiskManager {
 
                 let projected_short = match portfolio.futures_position_side {
                     FuturesPositionSide::Short => {
-                        portfolio.futures_position_base + request.quantity_base
+                        portfolio
+                            .futures_position_base
+                            .checked_add(request.quantity_base)
+                            .ok_or_else(|| {
+                                BotError::Risk(
+                                    "signal rejected: resulting short position is outside the supported range"
+                                        .to_string(),
+                                )
+                            })?
                     }
                     FuturesPositionSide::Long => {
                         if request.quantity_base > portfolio.futures_position_base {
@@ -290,6 +318,29 @@ mod tests {
             .expect_err("signal should be rejected");
 
         assert!(error.to_string().contains("order value 501 exceeds max"));
+    }
+
+    #[test]
+    fn rejects_order_value_that_overflows_fixed_point_range() {
+        let mut oversized = signal(Side::Buy, 1_000_000.0, 10_000_000.0);
+        oversized.intent = SignalIntent::IncreaseLong;
+
+        let error = risk_manager()
+            .approve(&oversized, &portfolio(0.0))
+            .expect_err("overflowing order should be rejected");
+
+        assert!(error.to_string().contains("outside the supported range"));
+    }
+
+    #[test]
+    fn rejects_order_value_rounded_down_to_zero() {
+        let tiny = signal(Side::Buy, 0.000001, 0.000001);
+
+        let error = risk_manager()
+            .approve(&tiny, &portfolio(0.0))
+            .expect_err("zero-value order should be rejected");
+
+        assert!(error.to_string().contains("must be positive"));
     }
 
     #[test]

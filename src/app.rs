@@ -55,7 +55,7 @@ impl App {
         let synced_portfolio = exchange.sync_portfolio()?;
         store.save_portfolio(&synced_portfolio)?;
         let run_id = telemetry::new_run_id();
-        reconcile_unresolved_orders(&run_id, &mut store, exchange.as_ref())?;
+        reconcile_unresolved_orders(&run_id, &mut store, exchange.as_mut())?;
 
         info!(
             run_id = %run_id,
@@ -87,8 +87,21 @@ impl App {
 
         let idle_sleep = Duration::from_millis(self.config.market_data.idle_sleep_ms);
         let mut logged_idle = false;
+        let mut logged_pending_order = false;
 
         while !shutdown.is_requested() {
+            let orders_resolved =
+                reconcile_unresolved_orders(&self.run_id, &mut self.store, self.exchange.as_mut())?;
+            if orders_resolved {
+                logged_pending_order = false;
+            } else if !logged_pending_order {
+                warn!(
+                    run_id = %self.run_id,
+                    "order outcome is unresolved; new trades are paused"
+                );
+                logged_pending_order = true;
+            }
+
             let event = match self.market_data.next_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => {
@@ -133,6 +146,10 @@ impl App {
                 "market event received"
             );
             self.store.record_market_event(&event)?;
+            if !orders_resolved {
+                self.save_progress()?;
+                continue;
+            }
 
             let signals = self
                 .strategy
@@ -167,26 +184,25 @@ impl App {
                 self.store.record_order(&submitted_order)?;
                 self.store
                     .save_next_order_id(self.order_manager.next_order_id())?;
-                self.log_order_transition(&submitted_order, None);
+                self.log_order_transition(&submitted_order);
 
-                let terminal_order = self
+                let updated_order = self
                     .order_manager
                     .submit_prepared_order(self.exchange.as_mut(), &submitted_order)?;
-                self.store.record_order(&terminal_order)?;
-                let exchange_status =
-                    if let Some(exchange_order_id) = terminal_order.exchange_order_id.as_deref() {
-                        Some(self.exchange.order_status(exchange_order_id)?.status)
-                    } else {
-                        None
-                    };
-                self.log_order_transition(&terminal_order, exchange_status);
+                self.store.record_order(&updated_order)?;
+                self.log_order_transition(&updated_order);
+                if updated_order.status == OrderStatus::Submitted
+                    && !reconcile_unresolved_orders(
+                        &self.run_id,
+                        &mut self.store,
+                        self.exchange.as_mut(),
+                    )?
+                {
+                    break;
+                }
             }
 
-            self.store.save_portfolio(self.exchange.portfolio())?;
-            if let Some(replay_cursor) = self.market_data.replay_cursor() {
-                self.store.save_replay_cursor(replay_cursor)?;
-            }
-            self.store.save_heartbeat(&self.run_id)?;
+            self.save_progress()?;
         }
 
         self.flush_state_for_shutdown()?;
@@ -200,6 +216,10 @@ impl App {
     }
 
     fn flush_state_for_shutdown(&mut self) -> Result<()> {
+        self.save_progress()
+    }
+
+    fn save_progress(&mut self) -> Result<()> {
         self.store.save_portfolio(self.exchange.portfolio())?;
         if let Some(replay_cursor) = self.market_data.replay_cursor() {
             self.store.save_replay_cursor(replay_cursor)?;
@@ -207,18 +227,13 @@ impl App {
         self.store.save_heartbeat(&self.run_id)
     }
 
-    fn log_order_transition(
-        &self,
-        order: &crate::orders::Order,
-        exchange_status: Option<OrderStatus>,
-    ) {
+    fn log_order_transition(&self, order: &crate::orders::Order) {
         match order.status {
             OrderStatus::Filled => {
                 info!(
                     run_id = %self.run_id,
                     bot_order_id = order.id,
                     exchange_order_id = ?order.exchange_order_id,
-                    exchange_status = ?exchange_status,
                     symbol = %order.request.symbol,
                     side = ?order.request.side,
                     quantity_base = %order.request.quantity_base,
@@ -255,20 +270,22 @@ impl App {
 fn reconcile_unresolved_orders(
     run_id: &str,
     store: &mut impl Store,
-    exchange: &(impl Exchange + ?Sized),
-) -> Result<()> {
+    exchange: &mut (impl Exchange + ?Sized),
+) -> Result<bool> {
     let unresolved_orders = store.load_unresolved_submitted_orders()?;
 
     if unresolved_orders.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
-    info!(
+    debug!(
         run_id,
         unresolved_order_count = unresolved_orders.len(),
         "reconciling unresolved submitted orders"
     );
 
+    let mut still_open = false;
+    let mut found_terminal_order = false;
     for submitted_order in unresolved_orders {
         let Some(client_order_id) = submitted_order.request.client_order_id.as_deref() else {
             warn!(
@@ -276,22 +293,30 @@ fn reconcile_unresolved_orders(
                 bot_order_id = submitted_order.id,
                 "unresolved submitted order missing client order id"
             );
+            still_open = true;
             continue;
         };
 
-        match exchange.order_status_by_client_id(client_order_id)? {
+        let exchange_order =
+            if let Some(exchange_order_id) = submitted_order.exchange_order_id.as_deref() {
+                Some(exchange.order_status(exchange_order_id)?)
+            } else {
+                exchange.order_status_by_client_id(client_order_id)?
+            };
+        match exchange_order {
             Some(exchange_order) => {
                 let reconciled_order = match exchange_order.status {
                     OrderStatus::Filled => OrderStatus::Filled,
                     OrderStatus::Rejected => OrderStatus::Rejected,
                     OrderStatus::Cancelled => OrderStatus::Cancelled,
                     OrderStatus::Submitted => {
-                        warn!(
+                        debug!(
                             run_id,
                             bot_order_id = submitted_order.id,
                             client_order_id,
                             "exchange still reports submitted order as open"
                         );
+                        still_open = true;
                         continue;
                     }
                 };
@@ -318,6 +343,7 @@ fn reconcile_unresolved_orders(
                 };
 
                 store.record_order(&order)?;
+                found_terminal_order = true;
                 info!(
                     run_id,
                     bot_order_id = order.id,
@@ -328,15 +354,252 @@ fn reconcile_unresolved_orders(
                 );
             }
             None => {
-                warn!(
+                debug!(
                     run_id,
                     bot_order_id = submitted_order.id,
                     client_order_id,
                     "unresolved submitted order not found on exchange"
                 );
+                still_open = true;
             }
         }
     }
 
-    Ok(())
+    if found_terminal_order {
+        let portfolio = exchange.sync_portfolio()?;
+        store.save_portfolio(&portfolio)?;
+    }
+
+    Ok(!still_open)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, reconcile_unresolved_orders};
+    use crate::config::Config;
+    use crate::decimal::Decimal;
+    use crate::error::{BotError, Result};
+    use crate::exchange::Exchange;
+    use crate::market::{MarketDataSource, MarketEvent, PriceTick};
+    use crate::orders::OrderManager;
+    use crate::orders::{ExchangeOrder, Order, OrderRequest, OrderStatus, Side};
+    use crate::portfolio::Portfolio;
+    use crate::risk::RiskManager;
+    use crate::shutdown::Shutdown;
+    use crate::storage::{SqliteStore, Store};
+    use crate::strategy::{Signal, SignalIntent, Strategy};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestExchange {
+        portfolio: Portfolio,
+        order: Option<ExchangeOrder>,
+        sync_count: usize,
+    }
+
+    struct AlwaysBuy;
+
+    impl Strategy for AlwaysBuy {
+        fn on_market_event(&mut self, event: &MarketEvent) -> Vec<Signal> {
+            vec![Signal {
+                symbol: event.symbol().to_string(),
+                side: Side::Buy,
+                intent: SignalIntent::IncreaseLong,
+                quantity_base: Decimal::from_micro_units(10_000),
+                price: event.price(),
+                reason: "test entry".to_string(),
+            }]
+        }
+    }
+
+    struct SingleEventSource {
+        sent: bool,
+        shutdown: Shutdown,
+    }
+
+    impl MarketDataSource for SingleEventSource {
+        fn next_event(&mut self) -> Result<Option<MarketEvent>> {
+            if self.sent {
+                self.shutdown.request();
+                Ok(None)
+            } else {
+                self.sent = true;
+                Ok(Some(MarketEvent::PriceTick(PriceTick::new(
+                    "BTC-USD",
+                    Decimal::from_micro_units(100_000_000),
+                ))))
+            }
+        }
+    }
+
+    impl Exchange for TestExchange {
+        fn portfolio(&self) -> &Portfolio {
+            &self.portfolio
+        }
+
+        fn sync_portfolio(&mut self) -> Result<Portfolio> {
+            self.sync_count += 1;
+            Ok(self.portfolio.clone())
+        }
+
+        fn place_order(&mut self, _request: OrderRequest) -> Result<ExchangeOrder> {
+            unreachable!()
+        }
+
+        fn order_status(&self, exchange_order_id: &str) -> Result<ExchangeOrder> {
+            self.order
+                .as_ref()
+                .filter(|order| order.exchange_order_id == exchange_order_id)
+                .cloned()
+                .ok_or_else(|| BotError::Exchange("order not found".to_string()))
+        }
+
+        fn order_status_by_client_id(
+            &self,
+            client_order_id: &str,
+        ) -> Result<Option<ExchangeOrder>> {
+            Ok(self
+                .order
+                .as_ref()
+                .filter(|order| order.client_order_id == client_order_id)
+                .cloned())
+        }
+
+        fn cancel_order(&mut self, _exchange_order_id: &str) -> Result<ExchangeOrder> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn keeps_trading_paused_until_an_uncertain_order_resolves_and_syncs_balances() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trader-order-reconciliation-{}-{nonce}.sqlite",
+            std::process::id()
+        ));
+        let mut store = SqliteStore::open(&path).expect("store should open");
+        store
+            .record_order(&Order::submitted(
+                1,
+                OrderRequest {
+                    symbol: "BTC-USD".to_string(),
+                    side: Side::Buy,
+                    quantity_base: Decimal::from_micro_units(100_000),
+                    limit_price: Decimal::from_micro_units(100_000_000),
+                    client_order_id: Some("trd-1".to_string()),
+                },
+            ))
+            .expect("pending order should record");
+        let mut portfolio = Portfolio::new("BTC", "USD", Decimal::from_micro_units(900_000_000));
+        portfolio.base_balance = Decimal::from_micro_units(100_000);
+        let mut exchange = TestExchange {
+            portfolio: portfolio.clone(),
+            order: None,
+            sync_count: 0,
+        };
+
+        assert!(
+            !reconcile_unresolved_orders("test", &mut store, &mut exchange)
+                .expect("missing order lookup should remain unresolved")
+        );
+        exchange.order = Some(ExchangeOrder {
+            exchange_order_id: "exchange-1".to_string(),
+            client_order_id: "trd-1".to_string(),
+            status: OrderStatus::Submitted,
+        });
+        assert!(
+            !reconcile_unresolved_orders("test", &mut store, &mut exchange)
+                .expect("open order should remain unresolved")
+        );
+        assert_eq!(exchange.sync_count, 0);
+        exchange.order.as_mut().expect("order should exist").status = OrderStatus::Filled;
+
+        assert!(
+            reconcile_unresolved_orders("test", &mut store, &mut exchange)
+                .expect("filled order should reconcile")
+        );
+        assert!(
+            store
+                .load_unresolved_submitted_orders()
+                .expect("pending orders should load")
+                .is_empty()
+        );
+        assert_eq!(exchange.sync_count, 1);
+        assert_eq!(
+            store
+                .load_portfolio()
+                .expect("portfolio should load")
+                .expect("portfolio should exist")
+                .base_balance,
+            portfolio.base_balance
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn run_does_not_submit_new_signals_while_an_order_is_pending() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trader-pending-order-pause-{}-{nonce}.sqlite",
+            std::process::id()
+        ));
+        let mut store = SqliteStore::open(&path).expect("store should open");
+        store
+            .record_order(&Order::submitted(
+                1,
+                OrderRequest {
+                    symbol: "BTC-USD".to_string(),
+                    side: Side::Buy,
+                    quantity_base: Decimal::from_micro_units(100_000),
+                    limit_price: Decimal::from_micro_units(100_000_000),
+                    client_order_id: Some("trd-1".to_string()),
+                },
+            ))
+            .expect("pending order should record");
+        let config = Config::load_from_path("config/trader.example.toml")
+            .expect("example config should load");
+        let shutdown = Shutdown::new_for_test();
+        let exchange = TestExchange {
+            portfolio: Portfolio::new("BTC", "USD", Decimal::from_micro_units(900_000_000)),
+            order: Some(ExchangeOrder {
+                exchange_order_id: "exchange-1".to_string(),
+                client_order_id: "trd-1".to_string(),
+                status: OrderStatus::Submitted,
+            }),
+            sync_count: 0,
+        };
+        let mut app = App {
+            risk: RiskManager::new(config.risk.clone()),
+            config,
+            exchange: Box::new(exchange),
+            market_data: Box::new(SingleEventSource {
+                sent: false,
+                shutdown: shutdown.clone(),
+            }),
+            order_manager: OrderManager::new_at(2),
+            run_id: "test".to_string(),
+            strategy: Box::new(AlwaysBuy),
+            store,
+        };
+
+        app.run(&shutdown).expect("run should stop after one event");
+        assert_eq!(
+            app.store
+                .load_unresolved_submitted_orders()
+                .expect("pending orders should load")
+                .len(),
+            1
+        );
+
+        drop(app);
+        fs::remove_file(path).expect("test database should be removed");
+    }
 }

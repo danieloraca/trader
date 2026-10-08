@@ -31,10 +31,14 @@ impl PaperFuturesExchange {
     }
 
     fn apply_order(&mut self, request: &OrderRequest) -> Result<()> {
+        let reduces_exposure = matches!(
+            (self.portfolio.futures_position_side, request.side),
+            (FuturesPositionSide::Long, Side::Sell) | (FuturesPositionSide::Short, Side::Buy)
+        ) && request.quantity_base <= self.portfolio.futures_position_base;
         let mut candidate = self.portfolio.clone();
         apply_futures_fill(&mut candidate, request, self.leverage)?;
 
-        if candidate.futures_margin_used_quote > candidate.quote_balance {
+        if !reduces_exposure && candidate.futures_margin_used_quote > candidate.quote_balance {
             return Err(BotError::Exchange(format!(
                 "insufficient futures equity: margin {} exceeds cash equity {}",
                 candidate.futures_margin_used_quote, candidate.quote_balance
@@ -320,5 +324,30 @@ mod tests {
         );
         assert_eq!(exchange.portfolio().futures_position_base, decimal("0.05"));
         assert_eq!(exchange.portfolio().quote_balance, decimal("10100"));
+    }
+
+    #[test]
+    fn allows_closing_a_losing_position_with_negative_cash_equity() {
+        let mut exchange = PaperFuturesExchange::new(
+            Portfolio::paper_futures("BTC", "USD", decimal("600")),
+            decimal("2"),
+        );
+        exchange
+            .place_order(request(Side::Buy, "0.1", "10000"))
+            .expect("entry should fill");
+
+        exchange
+            .place_order(request(Side::Sell, "0.1", "1000"))
+            .expect("risk-reducing close should fill");
+
+        assert_eq!(
+            exchange.portfolio().futures_position_side,
+            FuturesPositionSide::Flat
+        );
+        assert_eq!(
+            exchange.portfolio().futures_margin_used_quote,
+            Decimal::ZERO
+        );
+        assert_eq!(exchange.portfolio().quote_balance, decimal("-300"));
     }
 }

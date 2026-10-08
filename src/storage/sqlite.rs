@@ -739,12 +739,6 @@ impl Store for SqliteStore {
             .optional()
             .map_err(|error| BotError::Storage(format!("failed to load next order id: {error}")))?;
 
-        if let Some(value) = explicit_next_order_id {
-            return u64::try_from(value).map(Some).map_err(|_| {
-                BotError::Storage(format!("stored next order id is invalid: {value}"))
-            });
-        }
-
         let max_seen_id = self
             .connection
             .query_row("SELECT MAX(bot_order_id) FROM orders", [], |row| {
@@ -754,7 +748,7 @@ impl Store for SqliteStore {
                 BotError::Storage(format!("failed to infer next order id: {error}"))
             })?;
 
-        max_seen_id
+        let inferred_next_order_id = max_seen_id
             .map(|value| {
                 let value = u64::try_from(value).map_err(|_| {
                     BotError::Storage(format!("stored bot order id is invalid: {value}"))
@@ -764,7 +758,21 @@ impl Store for SqliteStore {
                     .checked_add(1)
                     .ok_or_else(|| BotError::Storage("next order id overflowed u64".to_string()))
             })
-            .transpose()
+            .transpose()?;
+        let explicit_next_order_id = explicit_next_order_id
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    BotError::Storage(format!("stored next order id is invalid: {value}"))
+                })
+            })
+            .transpose()?;
+
+        Ok(match (explicit_next_order_id, inferred_next_order_id) {
+            (Some(explicit), Some(inferred)) => Some(explicit.max(inferred)),
+            (Some(explicit), None) => Some(explicit),
+            (None, Some(inferred)) => Some(inferred),
+            (None, None) => None,
+        })
     }
 
     fn save_next_order_id(&mut self, next_order_id: u64) -> Result<()> {
@@ -1315,6 +1323,26 @@ mod tests {
             store
                 .load_next_order_id()
                 .expect("next order id load should work"),
+            Some(8)
+        );
+
+        drop(store);
+        fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn never_reuses_an_order_id_when_saved_counter_lags_history() {
+        let path = db_path("next-order-id-stale-counter");
+        let mut store = SqliteStore::open(&path).expect("store should open");
+        store.save_next_order_id(7).expect("counter should save");
+        store
+            .record_order(&submitted_order(7))
+            .expect("order should record");
+
+        assert_eq!(
+            store
+                .load_next_order_id()
+                .expect("next order id should load"),
             Some(8)
         );
 

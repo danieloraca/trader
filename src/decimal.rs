@@ -27,7 +27,7 @@ impl Decimal {
         }
 
         let scaled = value * SCALE as f64;
-        if scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
+        if scaled >= i64::MAX as f64 || scaled < i64::MIN as f64 {
             return Err("decimal value is outside supported range".to_string());
         }
 
@@ -104,14 +104,25 @@ impl Decimal {
     pub fn ratio_to(self, denominator: Self) -> f64 {
         self.micro_units as f64 / denominator.micro_units as f64
     }
+
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.micro_units
+            .checked_add(rhs.micro_units)
+            .map(Self::from_micro_units)
+    }
+
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        let scaled = (self.micro_units as i128 * rhs.micro_units as i128) / SCALE as i128;
+        i64::try_from(scaled).ok().map(Self::from_micro_units)
+    }
 }
 
 impl Display for Decimal {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let sign = if self.micro_units < 0 { "-" } else { "" };
-        let absolute = self.micro_units.abs();
-        let whole = absolute / SCALE;
-        let fractional = absolute % SCALE;
+        let absolute = self.micro_units.unsigned_abs();
+        let whole = absolute / SCALE as u64;
+        let fractional = absolute % SCALE as u64;
 
         if fractional == 0 {
             write!(f, "{sign}{whole}")
@@ -129,13 +140,13 @@ impl Add for Decimal {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        Self::from_micro_units(self.micro_units + rhs.micro_units)
+        self.checked_add(rhs).expect("decimal addition overflowed")
     }
 }
 
 impl AddAssign for Decimal {
     fn add_assign(&mut self, rhs: Self) {
-        self.micro_units += rhs.micro_units;
+        *self = self.checked_add(rhs).expect("decimal addition overflowed");
     }
 }
 
@@ -143,13 +154,17 @@ impl Sub for Decimal {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        Self::from_micro_units(self.micro_units - rhs.micro_units)
+        Self::from_micro_units(
+            self.micro_units
+                .checked_sub(rhs.micro_units)
+                .expect("decimal subtraction overflowed"),
+        )
     }
 }
 
 impl SubAssign for Decimal {
     fn sub_assign(&mut self, rhs: Self) {
-        self.micro_units -= rhs.micro_units;
+        *self = *self - rhs;
     }
 }
 
@@ -157,8 +172,8 @@ impl Mul for Decimal {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        let scaled = (self.micro_units as i128 * rhs.micro_units as i128) / SCALE as i128;
-        Self::from_micro_units(scaled as i64)
+        self.checked_mul(rhs)
+            .expect("decimal multiplication overflowed")
     }
 }
 
@@ -166,8 +181,9 @@ impl Div for Decimal {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
+        assert_ne!(rhs.micro_units, 0, "decimal division by zero");
         let scaled = (self.micro_units as i128 * SCALE as i128) / rhs.micro_units as i128;
-        Self::from_micro_units(scaled as i64)
+        Self::from_micro_units(i64::try_from(scaled).expect("decimal division overflowed"))
     }
 }
 
@@ -259,6 +275,18 @@ mod tests {
                 .expect("decimal should parse")
                 .to_string(),
             "0.25"
+        );
+    }
+
+    #[test]
+    fn rejects_products_outside_the_fixed_point_range() {
+        let quantity = Decimal::from_decimal_str("1000000").expect("quantity should parse");
+        let price = Decimal::from_decimal_str("10000000").expect("price should parse");
+
+        assert!(quantity.checked_mul(price).is_none());
+        assert_eq!(
+            Decimal::from_micro_units(i64::MIN).to_string(),
+            "-9223372036854.775808"
         );
     }
 }

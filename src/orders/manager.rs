@@ -58,10 +58,12 @@ impl OrderManager {
                     "exchange returned unsupported order status: {status:?}"
                 ))),
             },
+            // A request/response failure may conceal an accepted order, so only explicit
+            // exchange rejections can become terminal here.
             Err(BotError::Exchange(message)) => {
                 Ok(Order::rejected(submitted_order.id, request, message))
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -80,8 +82,9 @@ fn client_order_id(order_id: u64) -> String {
 mod tests {
     use super::OrderManager;
     use crate::decimal::Decimal;
+    use crate::error::{BotError, Result};
     use crate::exchange::{Exchange, PaperExchange};
-    use crate::orders::{OrderRequest, OrderStatus, Side};
+    use crate::orders::{ExchangeOrder, OrderRequest, OrderStatus, Side};
     use crate::portfolio::Portfolio;
 
     fn buy_request(quantity_base: f64, limit_price: f64) -> OrderRequest {
@@ -148,5 +151,56 @@ mod tests {
         );
         assert_eq!(exchange.portfolio().base_balance, Decimal::ZERO);
         assert_eq!(exchange.portfolio().quote_balance.to_string(), "10");
+    }
+
+    #[test]
+    fn leaves_ambiguous_exchange_outcome_unresolved() {
+        struct IndeterminateExchange(Portfolio);
+
+        impl Exchange for IndeterminateExchange {
+            fn portfolio(&self) -> &Portfolio {
+                &self.0
+            }
+
+            fn sync_portfolio(&mut self) -> Result<Portfolio> {
+                Ok(self.0.clone())
+            }
+
+            fn place_order(&mut self, _request: OrderRequest) -> Result<ExchangeOrder> {
+                Err(BotError::ExchangeIndeterminate(
+                    "response was lost".to_string(),
+                ))
+            }
+
+            fn order_status(&self, _exchange_order_id: &str) -> Result<ExchangeOrder> {
+                unreachable!()
+            }
+
+            fn order_status_by_client_id(
+                &self,
+                _client_order_id: &str,
+            ) -> Result<Option<ExchangeOrder>> {
+                unreachable!()
+            }
+
+            fn cancel_order(&mut self, _exchange_order_id: &str) -> Result<ExchangeOrder> {
+                unreachable!()
+            }
+        }
+
+        let mut exchange = IndeterminateExchange(Portfolio::new(
+            "BTC",
+            "USD",
+            Decimal::from_micro_units(1_000_000_000),
+        ));
+        let mut manager = OrderManager::new_at(1);
+        let submitted = manager.prepare_order(buy_request(0.5, 100.0));
+
+        let error = manager
+            .submit_prepared_order(&mut exchange, &submitted)
+            .expect_err("an uncertain outcome must stop order processing");
+
+        assert!(matches!(error, BotError::ExchangeIndeterminate(_)));
+        assert_eq!(submitted.status, OrderStatus::Submitted);
     }
 }

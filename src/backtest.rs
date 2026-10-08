@@ -449,10 +449,15 @@ fn fill_futures_order(
     slippage_quote: Decimal,
     futures_leverage: Decimal,
 ) -> Result<TradeRecord> {
-    let realized_pnl_quote = match (portfolio.futures_position_side, request.side) {
+    let reduces_exposure = matches!(
+        (portfolio.futures_position_side, request.side),
+        (FuturesPositionSide::Long, Side::Sell) | (FuturesPositionSide::Short, Side::Buy)
+    ) && request.quantity_base <= portfolio.futures_position_base;
+    let mut candidate = portfolio.clone();
+    let realized_pnl_quote = match (candidate.futures_position_side, request.side) {
         (FuturesPositionSide::Flat, Side::Buy) => {
             open_futures_position(
-                portfolio,
+                &mut candidate,
                 FuturesPositionSide::Long,
                 request.quantity_base,
                 fill_price,
@@ -461,7 +466,7 @@ fn fill_futures_order(
         }
         (FuturesPositionSide::Flat, Side::Sell) => {
             open_futures_position(
-                portfolio,
+                &mut candidate,
                 FuturesPositionSide::Short,
                 request.quantity_base,
                 fill_price,
@@ -469,27 +474,28 @@ fn fill_futures_order(
             Decimal::ZERO
         }
         (FuturesPositionSide::Long, Side::Buy) | (FuturesPositionSide::Short, Side::Sell) => {
-            increase_futures_position(portfolio, request.quantity_base, fill_price);
+            increase_futures_position(&mut candidate, request.quantity_base, fill_price);
             Decimal::ZERO
         }
         (FuturesPositionSide::Long, Side::Sell) => {
-            reduce_or_flip_long(portfolio, request.quantity_base, fill_price)
+            reduce_or_flip_long(&mut candidate, request.quantity_base, fill_price)
         }
         (FuturesPositionSide::Short, Side::Buy) => {
-            reduce_or_flip_short(portfolio, request.quantity_base, fill_price)
+            reduce_or_flip_short(&mut candidate, request.quantity_base, fill_price)
         }
     };
 
-    portfolio.quote_balance -= fee_quote;
-    portfolio.futures_realized_pnl_quote += realized_pnl_quote - fee_quote;
-    portfolio.futures_margin_used_quote = futures_margin_used(portfolio, futures_leverage);
+    candidate.quote_balance -= fee_quote;
+    candidate.futures_realized_pnl_quote += realized_pnl_quote - fee_quote;
+    candidate.futures_margin_used_quote = futures_margin_used(&candidate, futures_leverage);
 
-    if portfolio.futures_margin_used_quote > portfolio.quote_balance {
+    if !reduces_exposure && candidate.futures_margin_used_quote > candidate.quote_balance {
         return Err(BotError::Risk(format!(
             "backtest rejected: futures margin {} exceeds equity {}",
-            portfolio.futures_margin_used_quote, portfolio.quote_balance
+            candidate.futures_margin_used_quote, candidate.quote_balance
         )));
     }
+    *portfolio = candidate;
 
     Ok(TradeRecord {
         event_index: 0,
@@ -728,12 +734,14 @@ impl Display for BacktestReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{run, run_from_sqlite};
+    use super::{SimulatedPortfolio, fill_futures_order, run, run_from_sqlite};
     use crate::config::{
         BacktestConfig, BotConfig, Config, ExchangeConfig, ExchangeKind, MarketDataConfig,
         RiskConfig, StorageConfig, StrategyConfig, StrategyDirection, TelemetryConfig,
     };
     use crate::decimal::Decimal;
+    use crate::orders::{OrderRequest, Side};
+    use crate::portfolio::FuturesPositionSide;
     use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
@@ -741,6 +749,83 @@ mod tests {
 
     fn decimal(value: &str) -> Decimal {
         Decimal::from_decimal_str(value).expect("decimal should parse")
+    }
+
+    fn futures_portfolio(cash: &str) -> SimulatedPortfolio {
+        SimulatedPortfolio {
+            base_balance: Decimal::ZERO,
+            quote_balance: decimal(cash),
+            cost_basis_quote: Decimal::ZERO,
+            futures_enabled: true,
+            futures_position_side: FuturesPositionSide::Flat,
+            futures_position_base: Decimal::ZERO,
+            futures_entry_price: Decimal::ZERO,
+            futures_margin_used_quote: Decimal::ZERO,
+            futures_realized_pnl_quote: Decimal::ZERO,
+        }
+    }
+
+    fn futures_request(side: Side, quantity: &str, price: &str) -> OrderRequest {
+        OrderRequest {
+            symbol: "BTC-USD".to_string(),
+            side,
+            quantity_base: decimal(quantity),
+            limit_price: decimal(price),
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn rejected_futures_entry_does_not_change_backtest_portfolio() {
+        let mut portfolio = futures_portfolio("600");
+        let request = futures_request(Side::Buy, "1", "10000");
+
+        fill_futures_order(
+            &mut portfolio,
+            &request,
+            decimal("10000"),
+            decimal("10000"),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            decimal("2"),
+        )
+        .expect_err("entry should exceed available margin");
+
+        assert_eq!(portfolio.futures_position_side, FuturesPositionSide::Flat);
+        assert_eq!(portfolio.futures_position_base, Decimal::ZERO);
+        assert_eq!(portfolio.futures_margin_used_quote, Decimal::ZERO);
+        assert_eq!(portfolio.quote_balance, decimal("600"));
+    }
+
+    #[test]
+    fn backtest_allows_risk_reducing_close_after_large_loss() {
+        let mut portfolio = futures_portfolio("600");
+        let entry = futures_request(Side::Buy, "0.1", "10000");
+        fill_futures_order(
+            &mut portfolio,
+            &entry,
+            decimal("10000"),
+            decimal("1000"),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            decimal("2"),
+        )
+        .expect("entry should fit margin");
+        let close = futures_request(Side::Sell, "0.1", "1000");
+        fill_futures_order(
+            &mut portfolio,
+            &close,
+            decimal("1000"),
+            decimal("100"),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            decimal("2"),
+        )
+        .expect("close should reduce exposure");
+
+        assert_eq!(portfolio.futures_position_side, FuturesPositionSide::Flat);
+        assert_eq!(portfolio.futures_margin_used_quote, Decimal::ZERO);
+        assert_eq!(portfolio.quote_balance, decimal("-300"));
     }
 
     fn config() -> Config {

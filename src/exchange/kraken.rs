@@ -12,9 +12,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha512 = Hmac<Sha512>;
+static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct KrakenExchange {
     client: Client,
@@ -49,7 +51,12 @@ impl KrakenExchange {
         })?;
 
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|error| {
+                    BotError::Exchange(format!("failed to create kraken client: {error}"))
+                })?,
             base_url: kraken.base_url.trim_end_matches('/').to_string(),
             api_key,
             api_secret,
@@ -75,12 +82,18 @@ impl KrakenExchange {
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
             .send()
-            .map_err(|error| BotError::Exchange(format!("kraken request failed: {error}")))?
+            .map_err(|error| {
+                BotError::ExchangeIndeterminate(format!("kraken request failed: {error}"))
+            })?
             .error_for_status()
-            .map_err(|error| BotError::Exchange(format!("kraken returned http error: {error}")))?
+            .map_err(|error| {
+                BotError::ExchangeIndeterminate(format!("kraken returned http error: {error}"))
+            })?
             .json::<KrakenEnvelope>()
             .map_err(|error| {
-                BotError::Exchange(format!("failed to decode kraken response: {error}"))
+                BotError::ExchangeIndeterminate(format!(
+                    "failed to decode kraken response: {error}"
+                ))
             })?;
 
         if !response.error.is_empty() {
@@ -104,8 +117,12 @@ impl KrakenExchange {
         let status = value
             .get("status")
             .and_then(Value::as_str)
-            .map(kraken_status)
-            .unwrap_or(OrderStatus::Submitted);
+            .ok_or_else(|| {
+                BotError::ExchangeIndeterminate(format!(
+                    "kraken order {exchange_order_id} response missing status"
+                ))
+            })
+            .and_then(kraken_status)?;
         let client_order_id = value
             .get("cl_ord_id")
             .and_then(Value::as_str)
@@ -125,7 +142,7 @@ impl KrakenExchange {
         root: &str,
         client_order_id: &str,
     ) -> Result<Option<ExchangeOrder>> {
-        let result = self.private_post(path, &[])?;
+        let result = self.private_post(path, &[("cl_ord_id", client_order_id.to_string())])?;
         let Some(orders) = result.get(root).and_then(Value::as_object) else {
             return Ok(None);
         };
@@ -213,7 +230,7 @@ impl Exchange for KrakenExchange {
             .and_then(|txids| txids.first())
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                BotError::Exchange("kraken AddOrder response missing txid".to_string())
+                BotError::ExchangeIndeterminate("kraken AddOrder response missing txid".to_string())
             })?;
 
         Ok(ExchangeOrder {
@@ -255,12 +272,14 @@ impl Exchange for KrakenExchange {
     }
 }
 
-fn kraken_status(status: &str) -> OrderStatus {
+fn kraken_status(status: &str) -> Result<OrderStatus> {
     match status {
-        "closed" => OrderStatus::Filled,
-        "canceled" | "cancelled" | "expired" => OrderStatus::Cancelled,
-        "open" | "pending" => OrderStatus::Submitted,
-        _ => OrderStatus::Rejected,
+        "closed" => Ok(OrderStatus::Filled),
+        "canceled" | "cancelled" | "expired" => Ok(OrderStatus::Cancelled),
+        "open" | "pending" => Ok(OrderStatus::Submitted),
+        status => Err(BotError::ExchangeIndeterminate(format!(
+            "unrecognized kraken order status: {status}"
+        ))),
     }
 }
 
@@ -282,7 +301,20 @@ fn nonce() -> Result<String> {
             BotError::Exchange(format!("system clock is before unix epoch: {error}"))
         })?;
 
-    Ok(duration.as_millis().to_string())
+    let now = u64::try_from(duration.as_millis())
+        .map_err(|_| BotError::Exchange("system clock is outside nonce range".to_string()))?;
+    loop {
+        let last = LAST_NONCE.load(Ordering::SeqCst);
+        let next = now.max(last.checked_add(1).ok_or_else(|| {
+            BotError::Exchange("kraken nonce exhausted its supported range".to_string())
+        })?);
+        if LAST_NONCE
+            .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Ok(next.to_string());
+        }
+    }
 }
 
 fn kraken_signature(path: &str, body: &str, nonce: &str, secret: &str) -> Result<String> {
@@ -320,14 +352,33 @@ fn percent_encode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{form_encode, kraken_signature, kraken_status};
+    use super::{form_encode, kraken_signature, kraken_status, nonce};
+    use crate::error::BotError;
     use crate::orders::OrderStatus;
 
     #[test]
     fn maps_kraken_statuses_to_order_lifecycle() {
-        assert_eq!(kraken_status("open"), OrderStatus::Submitted);
-        assert_eq!(kraken_status("closed"), OrderStatus::Filled);
-        assert_eq!(kraken_status("canceled"), OrderStatus::Cancelled);
+        assert_eq!(kraken_status("open").unwrap(), OrderStatus::Submitted);
+        assert_eq!(kraken_status("closed").unwrap(), OrderStatus::Filled);
+        assert_eq!(kraken_status("canceled").unwrap(), OrderStatus::Cancelled);
+        assert!(matches!(
+            kraken_status("unknown"),
+            Err(BotError::ExchangeIndeterminate(_))
+        ));
+    }
+
+    #[test]
+    fn generates_strictly_increasing_nonces() {
+        let first = nonce()
+            .expect("first nonce should generate")
+            .parse::<u64>()
+            .unwrap();
+        let second = nonce()
+            .expect("second nonce should generate")
+            .parse::<u64>()
+            .unwrap();
+
+        assert!(second > first);
     }
 
     #[test]

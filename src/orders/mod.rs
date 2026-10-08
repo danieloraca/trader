@@ -33,6 +33,10 @@ impl OrderRequest {
     pub fn quote_value(&self) -> Decimal {
         self.quantity_base * self.limit_price
     }
+
+    pub fn checked_quote_value(&self) -> Option<Decimal> {
+        self.quantity_base.checked_mul(self.limit_price)
+    }
 }
 
 #[derive(Debug, Clone)]
