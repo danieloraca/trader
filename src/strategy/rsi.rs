@@ -77,7 +77,7 @@ impl RsiMeanReversionStrategy {
             _ => None,
         }
         .and_then(|signal| self.apply_regime_filter(signal, event.price()))
-        .and_then(|signal| self.apply_position_cap(signal, portfolio));
+        .and_then(|signal| self.apply_position_limits(signal, portfolio));
 
         self.previous_zone = zone;
         signal.into_iter().collect()
@@ -121,12 +121,26 @@ impl RsiMeanReversionStrategy {
         Some(signal)
     }
 
-    fn apply_position_cap(
+    fn apply_position_limits(
         &self,
         mut signal: Signal,
         portfolio: Option<&Portfolio>,
     ) -> Option<Signal> {
-        let (Some(max_tranches), Some(portfolio)) = (self.config.max_tranches, portfolio) else {
+        let Some(portfolio) = portfolio else {
+            return Some(signal);
+        };
+
+        if !portfolio.futures_enabled {
+            if signal.intent == SignalIntent::DecreaseLong {
+                if portfolio.base_balance <= Decimal::ZERO {
+                    return None;
+                }
+                signal.quantity_base = signal.quantity_base.min(portfolio.base_balance);
+            }
+            return Some(signal);
+        }
+
+        let Some(max_tranches) = self.config.max_tranches else {
             return Some(signal);
         };
 
@@ -286,6 +300,44 @@ mod tests {
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].side, Side::Sell);
         assert!(signals[0].reason.contains("overbought"));
+    }
+
+    #[test]
+    fn spot_rsi_does_not_propose_a_sell_without_btc() {
+        let mut strategy = strategy();
+        let portfolio = Portfolio::new("BTC", "USD", decimal("10000"));
+        for price in ["100", "101", "102"] {
+            assert!(
+                strategy
+                    .on_market_event_with_portfolio(&tick(price), &portfolio)
+                    .is_empty()
+            );
+        }
+
+        assert!(
+            strategy
+                .on_market_event_with_portfolio(&tick("103"), &portfolio)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn spot_rsi_lowers_sell_quantity_to_available_btc() {
+        let mut strategy = strategy();
+        let mut portfolio = Portfolio::new("BTC", "USD", decimal("10000"));
+        portfolio.base_balance = decimal("0.0004");
+        for price in ["100", "101", "102"] {
+            assert!(
+                strategy
+                    .on_market_event_with_portfolio(&tick(price), &portfolio)
+                    .is_empty()
+            );
+        }
+
+        let signals = strategy.on_market_event_with_portfolio(&tick("103"), &portfolio);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].intent, SignalIntent::DecreaseLong);
+        assert_eq!(signals[0].quantity_base, decimal("0.0004"));
     }
 
     #[test]
