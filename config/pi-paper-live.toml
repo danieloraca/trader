@@ -5,7 +5,8 @@ quote_currency = "USD"
 paper_starting_quote_balance = 10000.0
 
 [backtest]
-fee_bps = 26
+# Kraken Pro spot Tier 1 taker assumption. Use your account's actual fee tier.
+fee_bps = 80
 slippage_bps = 5
 
 [exchange]

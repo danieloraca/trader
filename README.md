@@ -154,6 +154,12 @@ cargo run -- --config config/pi-paper-live.toml --sweep-candles-sqlite /var/lib/
 The candle sweep uses a chronological 70/30 train/test split, ranks rows with at least 3 test fills first, and saves its latest ranked results into SQLite. It includes MA crossover, RSI mean reversion, regime-filtered RSI, breakout, all-in hold, fixed-size hold, DCA, and trend-filtered DCA research rows. The dashboard reads those cached rows in the Strategy Research section; it does not recompute sweeps on each page refresh.
 Sweep alpha means strategy P/L minus full-account buy-and-hold P/L over the same train or test slice. Match alpha means strategy P/L minus a capital-matched passive benchmark: buy-only rows deploy the same total capital at the first buy, while active rows hold their own buy lots to the end of the slice.
 A candidate row requires at least 3 test fills, positive test P/L, positive test alpha, positive match alpha, and train P/L no worse than -10 quote units.
+The sweep ranks many parameter choices using that same test slice, so a
+candidate is only a historical screen hit. Reserve a later period that was not
+used to choose the rule before treating it as evidence for deployment. The
+dashboard labels these rows as sweep hits for this reason. See [the October
+2026 spot review](research/2026-10-10-spot-review.md) for an example using older
+Kraken candles and a later Pi recording.
 
 Validate active strategies across rolling train/test windows before treating a single split as meaningful:
 
@@ -169,7 +175,7 @@ Configure cost assumptions and optional CSV output:
 
 ```toml
 [backtest]
-fee_bps = 26
+fee_bps = 80
 slippage_bps = 5
 futures_fee_bps = 5
 futures_slippage_bps = 5
@@ -191,11 +197,14 @@ strategy starts with an empty candle history after each restart, so allow
 roughly two hours before expecting its first possible signal. A market-data
 gap that skips a candle restarts that warmup.
 
-Paper fills now deduct the configured 26 bps fee and 5 bps slippage per side.
-These are modeling assumptions from `[backtest]`, not a guarantee of actual
-Kraken costs. A signal from a completed candle uses the first tick of the next
-candle as its paper order price; the historical candle sweep fills at the
-signal candle close, so those results remain more optimistic about timing.
+Paper fills now deduct the configured 80 bps fee and 5 bps slippage per side.
+The 80 bps fee models [Kraken Pro's published Tier 1 spot taker
+rate](https://www.kraken.com/features/fee-schedule). Replace it with the fee
+shown for your account if your tier differs. Slippage remains a modeling
+assumption, not a guarantee of actual costs. A signal from a completed candle
+uses the first tick of the next candle as its paper order price; the historical
+candle sweep fills at the signal candle close, so those results remain more
+optimistic about timing.
 The dashboard displays cumulative strategy signals, risk rejections, and the
 latest decisions. A zero signal count during warmup is expected; the trader
 journal logs each `completed strategy candle` about every five minutes when

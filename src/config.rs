@@ -1282,7 +1282,7 @@ verbose = true
         assert_eq!(config.strategy.rsi_mean_reversion.window, 21);
         assert_eq!(
             (config.backtest.fee_bps, config.backtest.slippage_bps),
-            (26, 5)
+            (80, 5)
         );
         assert_eq!(
             config.strategy.rsi_mean_reversion.quantity_base.to_string(),

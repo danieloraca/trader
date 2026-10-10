@@ -721,7 +721,7 @@ th, td {{ border-bottom: 1px solid #30363d; padding: 10px; text-align: left; fon
 th {{ color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
 tr:last-child td {{ border-bottom: 0; }}
 .status {{ display: inline-block; padding: 3px 7px; border-radius: 999px; background: #243b2a; color: #9ee493; font-size: 12px; }}
-.status.candidate {{ background: #123f2a; color: #6ee7a8; }}
+.status.candidate {{ background: #4a351d; color: #f0c36a; }}
 .status.thin {{ background: #4a351d; color: #f0c36a; }}
 @media (max-width: 720px) {{ main {{ padding: 16px; }} table {{ display: block; overflow-x: auto; }} .subgrid {{ grid-template-columns: 1fr; }} }}
 </style>
@@ -844,7 +844,7 @@ fn render_summary(html: &mut String, snapshot: &Snapshot) {
     let _ = write!(
         html,
         r#"<section class="grid">
-<div class="tile {}"><div class="label">Research Signal</div><div class="value">{}</div><div class="muted">{}</div></div>
+<div class="tile {}"><div class="label">Research Screen</div><div class="value">{}</div><div class="muted">{}</div></div>
 <div class="tile"><div class="label">Best Strict</div><div class="value">{}</div><div class="muted">{}</div></div>
 <div class="tile"><div class="label">Best Match</div><div class="value">{}</div><div class="muted">{}</div></div>
 <div class="tile"><div class="label">Market Events</div><div class="value">{}</div></div>
@@ -955,10 +955,11 @@ fn research_summary(
         .find(|result| is_research_candidate(result, run.min_test_fills));
     let (signal_class, signal_value, signal_detail) = if let Some(result) = candidate {
         (
-            "ok",
-            "Candidate".to_string(),
+            "warn",
+            "Sweep hit".to_string(),
             format!(
-                "{} {} P/L {}, alpha {}, match {}",
+                "Historical screen {}: {} {} P/L {}, alpha {}, match {}; validate on later data",
+                time_fallback(Some(run.recorded_at_ms)),
                 result.strategy_kind,
                 result.parameter_summary,
                 format_micro_units(result.test_pnl_micro_units),
@@ -969,9 +970,9 @@ fn research_summary(
     } else {
         (
             "warn",
-            "No candidate".to_string(),
+            "No sweep hit".to_string(),
             format!(
-                "Latest sweep {}; min fills {}; needs P/L, alpha, match > 0",
+                "Historical screen {}; min fills {}; needs P/L, alpha, match > 0",
                 time_fallback(Some(run.recorded_at_ms)),
                 run.min_test_fills
             ),
@@ -1248,7 +1249,7 @@ fn render_strategy_research(
                 "status thin"
             };
             let quality_label = if is_candidate {
-                "candidate"
+                "screen hit"
             } else if result.test_filled_order_count >= run.min_test_fills {
                 "ok"
             } else {
@@ -1357,7 +1358,7 @@ fn render_strategy_research(
                 "status thin"
             };
             let quality_label = if is_candidate {
-                "candidate"
+                "screen hit"
             } else if result.test_filled_order_count >= run.min_test_fills {
                 "ok"
             } else {
