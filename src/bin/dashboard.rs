@@ -958,8 +958,7 @@ fn research_summary(
             "warn",
             "Sweep hit".to_string(),
             format!(
-                "Historical screen {}: {} {} P/L {}, alpha {}, match {}; validate on later data",
-                time_fallback(Some(run.recorded_at_ms)),
+                "Historical screen: {} {} P/L {}, alpha {}, match {}; check Latest Sweep date and validate on later data",
                 result.strategy_kind,
                 result.parameter_summary,
                 format_micro_units(result.test_pnl_micro_units),
@@ -972,8 +971,7 @@ fn research_summary(
             "warn",
             "No sweep hit".to_string(),
             format!(
-                "Historical screen {}; min fills {}; needs P/L, alpha, match > 0",
-                time_fallback(Some(run.recorded_at_ms)),
+                "Historical screen; min fills {}; needs P/L, alpha, match > 0; check Latest Sweep date",
                 run.min_test_fills
             ),
         )
