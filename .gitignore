@@ -2,3 +2,4 @@
 /data
 config/trader.toml
 Cargo.lock
+__pycache__/
