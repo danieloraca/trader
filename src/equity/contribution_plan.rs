@@ -1,6 +1,7 @@
 use super::portfolio::{PortfolioPlanningContext, load_planning_context};
 use crate::decimal::Decimal;
 use crate::error::{BotError, Result};
+use chrono::{Local, NaiveDate};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
@@ -10,6 +11,7 @@ use std::path::Path;
 const BPS_DENOMINATOR: i128 = 10_000;
 const DECIMAL_SCALE: i64 = 1_000_000;
 const MAX_PLANNED_SHARES: usize = 100_000;
+const MAX_PRICE_AGE_DAYS: i64 = 7;
 
 #[derive(Debug, Deserialize)]
 struct HoldingsFile {
@@ -59,9 +61,40 @@ pub fn run(
     portfolio_config_path: impl AsRef<Path>,
     holdings_path: impl AsRef<Path>,
 ) -> Result<ContributionPlanReport> {
+    run_at(
+        portfolio_config_path,
+        holdings_path,
+        Local::now().date_naive(),
+    )
+}
+
+fn run_at(
+    portfolio_config_path: impl AsRef<Path>,
+    holdings_path: impl AsRef<Path>,
+    today: NaiveDate,
+) -> Result<ContributionPlanReport> {
     let context = load_planning_context(portfolio_config_path)?;
+    ensure_recent_prices(&context, today)?;
     let holdings = load_holdings(holdings_path.as_ref(), &context)?;
     plan(&context, holdings)
+}
+
+fn ensure_recent_prices(context: &PortfolioPlanningContext, today: NaiveDate) -> Result<()> {
+    let date = context.price_date_value;
+    let price_date = NaiveDate::from_ymd_opt(date.year, date.month, date.day).ok_or_else(|| {
+        BotError::MarketData(format!(
+            "invalid latest portfolio price date: {}",
+            context.price_date
+        ))
+    })?;
+    let age_days = today.signed_duration_since(price_date).num_days();
+    if !(0..=MAX_PRICE_AGE_DAYS).contains(&age_days) {
+        return Err(BotError::MarketData(format!(
+            "latest common portfolio price is {} ({} days from today); contribution planning requires prices from the last {} calendar days. Refresh every asset's price history before planning a purchase",
+            context.price_date, age_days, MAX_PRICE_AGE_DAYS
+        )));
+    }
+    Ok(())
 }
 
 fn load_holdings(path: &Path, context: &PortfolioPlanningContext) -> Result<HoldingsConfig> {
@@ -342,9 +375,11 @@ impl Display for ContributionPlanReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{HoldingAsset, HoldingsConfig, plan, run};
+    use super::{HoldingAsset, HoldingsConfig, ensure_recent_prices, plan, run_at};
     use crate::decimal::Decimal;
     use crate::equity::portfolio::{PortfolioPlanningAsset, PortfolioPlanningContext};
+    use crate::equity::price_data::TradingDate;
+    use chrono::NaiveDate;
 
     fn decimal(value: &str) -> Decimal {
         Decimal::from_decimal_str(value).expect("decimal should parse")
@@ -356,6 +391,11 @@ mod tests {
             name: "test".to_string(),
             currency: "GBP".to_string(),
             price_date: "2026-08-01".to_string(),
+            price_date_value: TradingDate {
+                year: 2026,
+                month: 8,
+                day: 1,
+            },
             commission_per_order: Decimal::ZERO,
             commission_bps: 0,
             assets: vec![
@@ -401,6 +441,11 @@ mod tests {
             name: "test".to_string(),
             currency: "GBP".to_string(),
             price_date: "2026-08-01".to_string(),
+            price_date_value: TradingDate {
+                year: 2026,
+                month: 8,
+                day: 1,
+            },
             commission_per_order: decimal("3"),
             commission_bps: 0,
             assets: vec![PortfolioPlanningAsset {
@@ -447,13 +492,47 @@ shares = 20
         )
         .expect("holdings fixture should write");
 
-        let report = run("config/equity-portfolio.example.toml", &path)
-            .expect("contribution plan should run");
+        let report = run_at(
+            "config/equity-portfolio.example.toml",
+            &path,
+            NaiveDate::from_ymd_opt(2025, 3, 8).unwrap(),
+        )
+        .expect("contribution plan should run");
         let output = report.to_string();
 
         assert!(output.contains("Monthly portfolio contribution plan"));
         assert!(output.contains("GLOBAL_EQUITY"));
         assert!(output.contains("no orders were placed"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_stale_and_future_prices_before_suggesting_purchases() {
+        let context = PortfolioPlanningContext {
+            name: "test".to_string(),
+            currency: "GBP".to_string(),
+            price_date: "2026-07-31".to_string(),
+            price_date_value: TradingDate {
+                year: 2026,
+                month: 7,
+                day: 31,
+            },
+            commission_per_order: Decimal::ZERO,
+            commission_bps: 0,
+            assets: Vec::new(),
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        let error = ensure_recent_prices(&context, today).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Refresh every asset's price history")
+        );
+        assert!(
+            ensure_recent_prices(&context, NaiveDate::from_ymd_opt(2026, 8, 7).unwrap()).is_ok()
+        );
+        assert!(
+            ensure_recent_prices(&context, NaiveDate::from_ymd_opt(2026, 7, 30).unwrap()).is_err()
+        );
     }
 }

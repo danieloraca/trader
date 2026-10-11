@@ -97,7 +97,7 @@ target/release/trader \
   --plan-equity-portfolio-contribution config/equity-portfolio-holdings.toml
 ```
 
-Start from `config/equity-portfolio-holdings.example.toml`, set the cash currently available and the whole-share quantity held for every configured asset, and keep the symbols identical to the portfolio config. The planner recommends buys only, includes configured commissions and execution friction, and stops when another affordable whole share would not improve total allocation drift. It uses historical closing prices for planning and never places orders.
+Start from `config/equity-portfolio-holdings.example.toml`, set the cash currently available and the whole-share quantity held for every configured asset, and keep the symbols identical to the portfolio config. The checked-in `config/equity-portfolio-holdings.toml` contains placeholder holdings, not an account snapshot. The planner suggests buys only, includes configured commissions and execution friction, and stops when another affordable whole share would not improve total allocation drift. It refuses to produce a plan when the latest common price is more than seven calendar days old or dated in the future. Refresh every asset's history before using the command. It uses historical closing prices, not executable quotes, and never places orders.
 
 ## Safe Modes
 

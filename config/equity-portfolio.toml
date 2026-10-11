@@ -1,5 +1,5 @@
 [equity_portfolio]
-name = "VWRP/VAGS 70/30"
+name = "VWRP/VAGS 80/20"
 currency = "GBP"
 initial_cash = 10000.0
 monthly_contribution = 500.0
