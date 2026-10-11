@@ -2,7 +2,7 @@
 
 ## Decision
 
-Keep real order placement disabled. The defensible spot trading rule from this review is **stay in cash** until a fixed rule earns a positive result after realistic costs on a later period that was not used to choose it. The current five-minute RSI rule lost money in all three historical periods tested. None of the slower MA, RSI, breakout, or simple trend-filter grids produced a repeatable positive result across the two older quarters and the later Pi period. This is a finding about the tested rules and data, not proof that no profitable rule exists.
+Keep real order placement disabled. The defensible spot trading rule from this review is **stay in cash** until a fixed rule earns a positive result after realistic costs on a later period that was not used to choose it. The current five-minute RSI rule lost money in all three historical periods tested. None of the slower MA, RSI, breakout, or simple trend-filter grids produced a repeatable positive result across the two older quarters and the later Pi period. The later daily trend-band and BTC/ETH rotation ideas also fail as convincing money-making rules at the intended small position size. This is a finding about the tested rules and data, not proof that no profitable rule exists.
 
 ## Data and costs
 
@@ -70,6 +70,26 @@ The band reduced churning, but it still lost money in 2025 and trails a passive 
 **Decision:** retain this as a documented research hypothesis, not a Pi trading change. It is not a reliable money-making result at the intended position size. The Pi service can remain stopped; restarting the existing five-minute RSI would reactivate a rule that lost in every tested historical period. Implementing this daily rule in the daemon would also require a 200-day historical warmup on startup and a daily OHLC source, neither of which the current ticker-based candle path provides. A new deployment should be justified by materially stronger evidence, not another month of ticker collection.
 
 The saved inputs and [reproduction script](daily_trend.py) are in `research/data/` and `research/daily_trend.py`. Run `python3 research/daily_trend.py` from the repository root to reproduce the table and cost check. The script asserts that the archive and API overlap agree, and that the test period has no missing days.
+
+## Monthly BTC/ETH/cash rotation idea
+
+I also tested a fixed cross-asset rule using daily BTC/USD and ETH/USD candles from the same [Kraken historical archive](https://support.kraken.com/articles/360047124832-downloadable-historical-ohlcvt-open-high-low-close-volume-trades-data) and saved [OHLC API](https://docs.kraken.com/api-reference/market-data/get-ohlc-data) responses. On the first UTC day of each month, it compares the **trailing 365-day close-to-close price return** of BTC and ETH as of the *previous* day. It buys the stronger asset at that day's open if its return is positive; otherwise it holds USD. It trades only when the choice changes. Every new entry uses at most $200 and prior gains remain in cash. One absent ETH daily candle on 12 January 2018 is carried forward as a no-trade day; no rotation occurs that day.
+
+The same 80 bps fee and 5 bps slippage apply to each buy and sale, including switching assets. Each period starts with $200 cash and ends with a modeled sale at its final daily close. USD P/L after modeled costs:
+
+| Period | Hold BTC | Hold ETH | Hold 50/50 | Rotate or cash | Rotation fills | Rotation max drawdown |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2017–2019 | +$1,254.96 | +$2,921.54 | +$2,088.25 | +$2,174.09 | 10 | 71.6% |
+| 2020–2022 | +$253.37 | +$1,626.30 | +$939.83 | +$1,396.40 | 4 | 56.1% |
+| 2023–2024 | +$910.76 | +$348.47 | +$629.61 | +$392.63 | 4 | 26.2% |
+| 2025 | −$15.73 | −$24.97 | −$20.35 | **−$9.68** | 2 | 32.1% |
+| Jan–Jun 2026 | −$68.47 | −$95.96 | −$82.22 | **−$12.64** | 2 | 17.9% |
+| Jul–9 Oct 2026 | +$77.35 | +$111.31 | +$94.33 | **$0** | 0 | 0% |
+| Jan 2025–9 Oct 2026, uninterrupted | −$26.14 | −$53.39 | −$39.77 | **−$21.71** | 4 | 32.7% |
+
+The rotation sometimes reduced losses in falling periods, but it **lost $21.71 in the recent combined period**, missed the July–October rally completely, and had very large historical drawdowns. It still lost **$15.55 with zero modeled fees and slippage**, so costs are not the sole cause. Positive older periods do not establish a current edge. This is another reason to keep the Pi trader stopped rather than continue trying variants of daily OHLC rules against the same already-inspected periods.
+
+Run `python3 research/monthly_rotation.py` from the repository root to reproduce this table. Its saved BTC and ETH source files are under `research/data/`; the script checks archive/API overlap before evaluating signals.
 
 ## Practical implication
 
